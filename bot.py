@@ -10,7 +10,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# กำหนดค่า LINE Access Token และ Secret
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'YOUR_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', 'YOUR_CHANNEL_SECRET')
 
@@ -29,7 +28,6 @@ def save_portfolio(data):
     with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# เพิ่มหน้านี้เพื่อให้ UptimeRobot เข้ามาเช็กแล้วเจอสถานะปกติ (แก้ปัญหา Error 404)
 @app.route("/", methods=['GET'])
 def home():
     return "Line Trading Bot is running!"
@@ -58,12 +56,14 @@ def handle_message(event):
     if text == "ดูพอร์ต":
         cash = portfolio.get("cash", 100000)
         stocks = portfolio.get("stocks", {})
-        reply_text = f"💰 เงินสด: {cash:,.2f} บาท\n📦 หุ้นในพอร์ต:\n"
+        reply_text = f"เงินสด: {cash:,.2f} บาท\nหุ้นในพอร์ต:\n"
         if not stocks:
             reply_text += "ไม่มีหุ้นในพอร์ต"
         else:
             for symbol, info in stocks.items():
-                reply_text += f"- {symbol}: {info['shares']} หุ้น (ซื้อที่ {info['buy_price']:.2f} ฿)\n"
+                # ป้องกัน Error กรณีคีย์ข้อมูลไม่ตรงกัน
+                bp = info.get('buy_price', info.get('cost', 0))
+                reply_text += f"- {symbol}: {info['shares']} หุ้น (ซื้อที่ {bp:.2f} ฿)\n"
 
     elif text.startswith("ซื้อ"):
         parts = text.split()
@@ -84,27 +84,29 @@ def handle_message(event):
                             portfolio['stocks'][symbol] = {"shares": 0, "buy_price": 0}
                         
                         old_shares = portfolio['stocks'][symbol]['shares']
-                        old_price = portfolio['stocks'][symbol]['buy_price']
+                        old_price = portfolio['stocks'][symbol].get('buy_price', portfolio['stocks'][symbol].get('cost', price))
                         new_shares = old_shares + shares
                         new_avg_price = ((old_shares * old_price) + (shares * price)) / new_shares if new_shares > 0 else price
                         
                         portfolio['stocks'][symbol]['shares'] = new_shares
                         portfolio['stocks'][symbol]['buy_price'] = new_avg_price
+                        if 'cost' in portfolio['stocks'][symbol]:
+                            del portfolio['stocks'][symbol]['cost']
                         save_portfolio(portfolio)
                         
                         tp = price * 1.10
                         sl = price * 0.97
-                        reply_text = (f"✅ ซื้อสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares} หุ้น\n"
+                        reply_text = (f"ซื้อสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares} หุ้น\n"
                                       f"- ราคาซื้อ: {price:.2f} ฿\n- ยอดรวม: {total_cost:.2f} ฿\n"
-                                      f"🎯 เป้า TP: {tp:.2f} ฿ (+10%)\n🛡️ จุด SL: {sl:.2f} ฿ (-3%)")
+                                      f"เป้า TP: {tp:.2f} ฿ (+10%)\nจุด SL: {sl:.2f} ฿ (-3%)")
                     else:
-                        reply_text = "❌ เงินสดในพอร์ตไม่พอซื้อ"
+                        reply_text = "เงินสดในพอร์ตไม่พอซื้อ"
                 else:
-                    reply_text = f"❌ ไม่พบข้อมูลราคาหุ้น {symbol}"
+                    reply_text = f"ไม่พบข้อมูลราคาหุ้น {symbol}"
             except Exception as e:
-                reply_text = f"❌ เกิดข้อผิดพลาด: {str(e)}"
+                reply_text = f"เกิดข้อผิดพลาด: {str(e)}"
         else:
-            reply_text = "⚠️ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10)"
+            reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10)"
     else:
         reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต' หรือ 'ซื้อ [หุ้น] [จำนวน]')"
 
@@ -128,7 +130,7 @@ def automated_background_task():
                 if not df.empty and len(df) >= 2:
                     change = (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
                     if change > 1.0:
-                        scan_alerts.append(f"🔥 [Auto Screener] สัญญาณซื้อ {sym} บวก +{change:.2f}%")
+                        scan_alerts.append(f"[Auto Screener] สัญญาณซื้อ {sym} บวก +{change:.2f}%")
             except:
                 pass
 
@@ -139,11 +141,11 @@ def automated_background_task():
         for sym, info in stocks.items():
             try:
                 current_price = yf.Ticker(sym).history(period='1d')['Close'].iloc[-1]
-                buy_price = info['buy_price']
+                buy_price = info.get('buy_price', info.get('cost', current_price))
                 if current_price >= buy_price * 1.10:
-                    line_bot_api.push_message(user_id, TextSendMessage(text=f"🎯 [Auto Alert] หุ้น {sym} ถึงเป้า Take Profit แล้ว! ราคาปัจจุบัน: {current_price:.2f} ฿"))
+                    line_bot_api.push_message(user_id, TextSendMessage(text=f"[Auto Alert] หุ้น {sym} ถึงเป้า Take Profit แล้ว! ราคาปัจจุบัน: {current_price:.2f} ฿"))
                 elif current_price <= buy_price * 0.97:
-                    line_bot_api.push_message(user_id, TextSendMessage(text=f"🛡️ [Auto Alert] หุ้น {sym} หลุดจุด Stop Loss! ราคาปัจจุบัน: {current_price:.2f} ฿"))
+                    line_bot_api.push_message(user_id, TextSendMessage(text=f"[Auto Alert] หุ้น {sym} หลุดจุด Stop Loss! ราคาปัจจุบัน: {current_price:.2f} ฿"))
             except:
                 pass
 
