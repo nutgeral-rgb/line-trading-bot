@@ -3,3 +3,4 @@ line-bot-sdk
 pandas
 yfinance
 gunicorn
+APScheduler
