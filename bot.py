@@ -21,8 +21,16 @@ PORTFOLIO_FILE = 'portfolio.json'
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"cash": 100000, "stocks": {}, "last_user_id": None}
+            data = json.load(f)
+            if "watchlist" not in data:
+                data["watchlist"] = ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"]
+            return data
+    return {
+        "cash": 100000, 
+        "stocks": {}, 
+        "watchlist": ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"],
+        "last_user_id": None
+    }
 
 def save_portfolio(data):
     with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
@@ -61,9 +69,59 @@ def handle_message(event):
             reply_text += "ไม่มีหุ้นในพอร์ต"
         else:
             for symbol, info in stocks.items():
-                # ป้องกัน Error กรณีคีย์ข้อมูลไม่ตรงกัน
                 bp = info.get('buy_price', info.get('cost', 0))
                 reply_text += f"- {symbol}: {info['shares']} หุ้น (ซื้อที่ {bp:.2f} ฿)\n"
+
+    elif text == "รายการติดตาม":
+        watchlist = portfolio.get("watchlist", [])
+        reply_text = "รายชื่อหุ้นในระบบติดตาม:\n" + ", ".join(watchlist) if watchlist else "ยังไม่มีหุ้นในรายการติดตาม"
+
+    elif text == "สแกนหุ้น":
+        watchlist = portfolio.get("watchlist", ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"])
+        scan_results = []
+        for sym in watchlist:
+            try:
+                df = yf.Ticker(sym).history(period='5d')
+                if not df.empty and len(df) >= 2:
+                    latest = df['Close'].iloc[-1]
+                    prev = df['Close'].iloc[-2]
+                    change = (latest - prev) / prev * 100
+                    scan_results.append(f"- {sym}: {latest:.2f} ฿ ({change:+.2f}%)")
+                else:
+                    scan_results.append(f"- {sym}: ไม่พบข้อมูลราคา")
+            except:
+                scan_results.append(f"- {sym}: ดึงข้อมูลผิดพลาด")
+        reply_text = "ผลการสแกนหุ้น Watchlist:\n" + "\n".join(scan_results)
+
+    elif text.startswith("ติดตาม "):
+        parts = text.split()
+        if len(parts) >= 2:
+            symbol = parts[1].upper() + ".BK"
+            watchlist = portfolio.get("watchlist", [])
+            if symbol not in watchlist:
+                watchlist.append(symbol)
+                portfolio['watchlist'] = watchlist
+                save_portfolio(portfolio)
+                reply_text = f"เพิ่ม {symbol} เข้าสู่ระบบติดตามเรียบร้อยแล้ว"
+            else:
+                reply_text = f"หุ้น {symbol} มีอยู่ในรายการติดตามอยู่แล้ว"
+        else:
+            reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ติดตาม PTT)"
+
+    elif text.startswith("เลิกติดตาม "):
+        parts = text.split()
+        if len(parts) >= 2:
+            symbol = parts[1].upper() + ".BK"
+            watchlist = portfolio.get("watchlist", [])
+            if symbol in watchlist:
+                watchlist.remove(symbol)
+                portfolio['watchlist'] = watchlist
+                save_portfolio(portfolio)
+                reply_text = f"ลบ {symbol} ออกจากระบบติดตามแล้ว"
+            else:
+                reply_text = f"ไม่พบหุ้น {symbol} ในรายการติดตาม"
+        else:
+            reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: เลิกติดตาม PTT)"
 
     elif text.startswith("ซื้อ"):
         parts = text.split()
@@ -108,7 +166,7 @@ def handle_message(event):
         else:
             reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10)"
     else:
-        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต' หรือ 'ซื้อ [หุ้น] [จำนวน]')"
+        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต', 'สแกนหุ้น', 'รายการติดตาม', 'ติดตาม [หุ้น]', หรือ 'ซื้อ [หุ้น] [จำนวน]')"
 
     line_bot_api.reply_message(
         event.reply_token,
@@ -122,7 +180,7 @@ def automated_background_task():
         if not user_id:
             return
         
-        watchlist = ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"]
+        watchlist = portfolio.get("watchlist", ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"])
         scan_alerts = []
         for sym in watchlist:
             try:
