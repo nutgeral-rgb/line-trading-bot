@@ -64,13 +64,41 @@ def handle_message(event):
     if text == "ดูพอร์ต":
         cash = portfolio.get("cash", 100000)
         stocks = portfolio.get("stocks", {})
+        total_stock_value = 0
+        
         reply_text = f"เงินสด: {cash:,.2f} บาท\nหุ้นในพอร์ต:\n"
         if not stocks:
-            reply_text += "ไม่มีหุ้นในพอร์ต"
+            reply_text += "ไม่มีหุ้นในพอร์ต\n"
         else:
             for symbol, info in stocks.items():
                 bp = info.get('buy_price', info.get('cost', 0))
-                reply_text += f"- {symbol}: {info['shares']} หุ้น (ซื้อที่ {bp:.2f} ฿)\n"
+                shares = info['shares']
+                try:
+                    cur_price = yf.Ticker(symbol).history(period='1d')['Close'].iloc[-1]
+                except:
+                    cur_price = bp
+                
+                market_value = shares * cur_price
+                total_stock_value += market_value
+                pl = market_value - (shares * bp)
+                pl_pct = ((cur_price - bp) / bp * 100) if bp > 0 else 0
+                
+                reply_text += f"- {symbol}: {shares} หุ้น\n  ทุน: {bp:.2f} | ปัจจุบัน: {cur_price:.2f}\n  กำไร/ขาดทุน: {pl:+,.2f} ฿ ({pl_pct:+.2f}%)\n"
+            
+            total_portfolio = cash + total_stock_value
+            reply_text += f"\nมูลค่าพอร์ตวม: {total_portfolio:,.2f} บาท"
+
+    elif text in ["ช่วยเหลือ", "help", "คำสั่ง"]:
+        reply_text = (
+            "คู่มือการใช้งานบอตเทรด:\n"
+            "1. ดูพอร์ต -> ตรวจสอบเงินสดและหุ้นพร้อมกำไร/ขาดทุน\n"
+            "2. ซื้อ [หุ้น] [จำนวน] -> ซื้อหุ้น (เช่น ซื้อ PTT 10)\n"
+            "3. ขาย [หุ้น] [จำนวน] -> ขายหุ้น (เช่น ขาย PTT 10)\n"
+            "4. สแกนหุ้น -> สแกนราคาหุ้นใน Watchlist\n"
+            "5. รายการติดตาม -> ดูรายชื่อหุ้น Watchlist\n"
+            "6. ติดตาม [หุ้น] -> เพิ่มหุ้นเข้า Watchlist\n"
+            "7. เลิกติดตาม [หุ้น] -> ลบหุ้นออกจาก Watchlist"
+        )
 
     elif text == "รายการติดตาม":
         watchlist = portfolio.get("watchlist", [])
@@ -165,8 +193,48 @@ def handle_message(event):
                 reply_text = f"เกิดข้อผิดพลาด: {str(e)}"
         else:
             reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10)"
+
+    elif text.startswith("ขาย"):
+        parts = text.split()
+        if len(parts) >= 3:
+            symbol = parts[1].upper() + ".BK"
+            try:
+                shares_to_sell = int(parts[2])
+                stocks = portfolio.get("stocks", {})
+                if symbol in stocks and stocks[symbol]['shares'] >= shares_to_sell:
+                    ticker = yf.Ticker(symbol)
+                    todays_data = ticker.history(period='1d')
+                    if not todays_data.empty:
+                        price = todays_data['Close'].iloc[-1]
+                        total_income = price * shares_to_sell
+                        
+                        portfolio['cash'] += total_income
+                        old_shares = stocks[symbol]['shares']
+                        bp = stocks[symbol].get('buy_price', 0)
+                        
+                        if old_shares == shares_to_sell:
+                            del stocks[symbol]
+                        else:
+                            stocks[symbol]['shares'] = old_shares - shares_to_sell
+                            
+                        save_portfolio(portfolio)
+                        
+                        profit = (price - bp) * shares_to_sell
+                        profit_pct = ((price - bp) / bp * 100) if bp > 0 else 0
+                        
+                        reply_text = (f"ขายสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares_to_sell} หุ้น\n"
+                                      f"- ราคาขาย: {price:.2f} ฿\n- ยอดรับเงิน: {total_income:,.2f} ฿\n"
+                                      f"กำไร/ขาดทุน: {profit:+,.2f} ฿ ({profit_pct:+.2f}%)")
+                    else:
+                        reply_text = f"ไม่พบข้อมูลราคาหุ้น {symbol}"
+                else:
+                    reply_text = f"หุ้น {symbol} ในพอร์ตมีไม่พอขาย หรือไม่มีหุ้นนี้ในพอร์ต"
+            except Exception as e:
+                reply_text = f"เกิดข้อผิดพลาด: {str(e)}"
+        else:
+            reply_text = "รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ขาย PTT 10)"
     else:
-        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต', 'สแกนหุ้น', 'รายการติดตาม', 'ติดตาม [หุ้น]', หรือ 'ซื้อ [หุ้น] [จำนวน]')"
+        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ช่วยเหลือ' เพื่อดูรายการคำสั่งทั้งหมด)"
 
     line_bot_api.reply_message(
         event.reply_token,
