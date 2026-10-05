@@ -10,7 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# กำหนดค่า LINE Access Token และ Secret (สามารถใส่ตรงนี้หรือดึงจาก Environment Variables)
+# กำหนดค่า LINE Access Token และ Secret
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'YOUR_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', 'YOUR_CHANNEL_SECRET')
 
@@ -29,6 +29,11 @@ def save_portfolio(data):
     with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+# เพิ่มหน้านี้เพื่อให้ UptimeRobot เข้ามาเช็กแล้วเจอสถานะปกติ (แก้ปัญหา Error 404)
+@app.route("/", methods=['GET'])
+def home():
+    return "Line Trading Bot is running!"
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
@@ -44,7 +49,6 @@ def handle_message(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
     
-    # บันทึก User ID ล่าสุด เพื่อให้ระบบส่งข้อความแจ้งเตือนอัตโนมัติถูกคน
     portfolio = load_portfolio()
     portfolio['last_user_id'] = user_id
     save_portfolio(portfolio)
@@ -102,22 +106,20 @@ def handle_message(event):
         else:
             reply_text = "⚠️ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10)"
     else:
-        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต' หรือ 'ซื้อ [หุ้น] [จำนวน]')ระบบอัตโนมัติเปิดทำงานแล้วครับ"
+        reply_text = f"รับทราบคำสั่ง: {text}\n(พิมพ์ 'ดูพอร์ต' หรือ 'ซื้อ [หุ้น] [จำนวน]')"
 
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
 
-# ระบบทำงานเบื้องหลังอัตโนมัติ (รันทุกๆ 30 นาที)
 def automated_background_task():
     with app.app_context():
         portfolio = load_portfolio()
         user_id = portfolio.get('last_user_id')
         if not user_id:
-            return  # ถ้ายังไม่มีผู้ใช้ทักมา จะยังไม่มีเป้าหมายส่งข้อความ
+            return
         
-        # 1 & 2. สแกนหุ้นอัตโนมัติ และเตือนเข้าซื้อ
         watchlist = ["PTT.BK", "AOT.BK", "CPALL.BK", "KBANK.BK", "SCC.BK"]
         scan_alerts = []
         for sym in watchlist:
@@ -125,7 +127,7 @@ def automated_background_task():
                 df = yf.Ticker(sym).history(period='5d')
                 if not df.empty and len(df) >= 2:
                     change = (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
-                    if change > 1.0:  # เงื่อนไขตัวอย่าง: ราคาบวกมากกว่า 1.0%
+                    if change > 1.0:
                         scan_alerts.append(f"🔥 [Auto Screener] สัญญาณซื้อ {sym} บวก +{change:.2f}%")
             except:
                 pass
@@ -133,7 +135,6 @@ def automated_background_task():
         if scan_alerts:
             line_bot_api.push_message(user_id, TextSendMessage(text="\n".join(scan_alerts)))
 
-        # 3. เตือนขายอัตโนมัติ (เช็ค Take Profit / Stop Loss)
         stocks = portfolio.get("stocks", {})
         for sym, info in stocks.items():
             try:
@@ -146,7 +147,6 @@ def automated_background_task():
             except:
                 pass
 
-# ตั้งเวลาให้ BackgroundScheduler ทำงานทุกๆ 30 นาที
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=automated_background_task, trigger="interval", minutes=30)
 scheduler.start()
