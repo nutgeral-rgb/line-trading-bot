@@ -115,7 +115,52 @@ def check_volume_spike(df, window=20, mult=1.5):
     cur_vol = df['Volume'].iloc[-1]
     return cur_vol >= (avg_vol * mult)
 
-def analyze_stock_deep(symbol):
+def calculate_dynamic_position_size(portfolio, price, stop_loss):
+    cash = portfolio.get("cash", 10000.0)
+    stocks = portfolio.get("stocks", {})
+    
+    # คำนวณมูลค่าหุ้นรวมในพอร์ตปัจจุบันแบบคร่าวๆ
+    total_stock_val = 0
+    for sym, info in stocks.items():
+        try:
+            df_s = yf.Ticker(sym).history(period='5d')
+            cp = df_s['Close'].iloc[-1] if not df_s.empty else info.get('average_cost', price)
+            total_stock_val += info['shares'] * cp
+        except:
+            total_stock_val += info['shares'] * info.get('average_cost', price)
+            
+    total_portfolio = cash + total_stock_val
+    if total_portfolio <= 0:
+        total_portfolio = 10000.0
+        
+    # 1. คำนวณจากความเสี่ยงที่รับได้ (Risk 2% ต่อไม้)
+    risk_budget = total_portfolio * 0.02
+    risk_per_share = max(price - stop_loss, price * 0.03) # อย่างน้อย 3%
+    shares_by_risk = risk_budget / risk_per_share if risk_per_share > 0 else 10
+    
+    # 2. คำนวณจากสัดส่วนสูงสุดต่อหุ้น (Max 25% ของพอร์ต)
+    max_weight_budget = total_portfolio * 0.25
+    shares_by_weight = max_weight_budget / price if price > 0 else 10
+    
+    # 3. คำนวณจากเงินสดที่มี (ใช้ไม่เกิน 40% ของเงินสดคงเหลือ)
+    cash_budget = cash * 0.40
+    shares_by_cash = cash_budget / price if price > 0 else 10
+    
+    # เลือกค่าที่ต่ำที่สุดเพื่อให้ปลอดภัยตามหลักการบริหารความเสี่ยง
+    recommended_shares = int(min(shares_by_risk, shares_by_weight, shares_by_cash))
+    
+    # ปัดให้เข้ากับลักษณะหุ้นไทย (ถ้ามากกว่า 100 หุ้น ให้ปัดลงเป็นหลักสิบ/หลักร้อย หรือขั้นต่ำ 10 หุ้น)
+    if recommended_shares < 10:
+        recommended_shares = max(recommended_shares, 1)
+    else:
+        # ปัดลงให้เป็นเลขกลมๆ เช่น หลักสิบ
+        recommended_shares = (recommended_shares // 10) * 10
+        if recommended_shares < 10:
+            recommended_shares = 10
+            
+    return recommended_shares
+
+def analyze_stock_deep(portfolio, symbol):
     formatted_sym = format_symbol(symbol)
     try:
         df = yf.Ticker(formatted_sym).history(period='60d')
@@ -130,8 +175,11 @@ def analyze_stock_deep(symbol):
         vol_spike = check_volume_spike(df)
         
         suggested_buy_price = round(lower, 2) if cur_price > lower else round(cur_price, 2)
-        suggested_stop_loss = round(cur_price * 0.95, 2)
-        suggested_take_profit = round(cur_price * 1.10, 2)
+        suggested_stop_loss = round(suggested_buy_price * 0.95, 2)
+        suggested_take_profit = round(suggested_buy_price * 1.10, 2)
+
+        # คำนวณจำนวนหุ้นที่เหมาะสมตามพอร์ตและความเสี่ยงจริง
+        rec_shares = calculate_dynamic_position_size(portfolio, suggested_buy_price, suggested_stop_loss)
 
         reasons = []
         action = "HOLD"
@@ -172,7 +220,8 @@ def analyze_stock_deep(symbol):
             "reasons": reasons,
             "buy_price": suggested_buy_price,
             "stop_loss": suggested_stop_loss,
-            "take_profit": suggested_take_profit
+            "take_profit": suggested_take_profit,
+            "rec_shares": rec_shares
         }
     except:
         return None
@@ -181,7 +230,7 @@ def generate_top5_summary_text(portfolio):
     watchlist = portfolio.get("watchlist", ["ADVANC.BK", "PTT.BK", "AOT.BK", "KBANK.BK", "CPALL.BK"])
     scanned_stocks = []
     for sym in watchlist:
-        res = analyze_stock_deep(sym)
+        res = analyze_stock_deep(portfolio, sym)
         if res:
             scanned_stocks.append((clean_symbol_display(sym), res))
     
@@ -194,7 +243,7 @@ def generate_top5_summary_text(portfolio):
     msg = ["🌅 สรุป 5 หุ้นน่าซื้อประจำวัน\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
     for rank, (sym, res) in enumerate(top5, 1):
         vol_text = " 🔥[Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
-        cost_10 = res['buy_price'] * 10
+        est_cost = res['buy_price'] * res['rec_shares']
         msg.append(
             f"🏆 อันดับ {rank}: {sym} (คะแนน: {res['score']}/100)\n"
             f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
@@ -202,7 +251,8 @@ def generate_top5_summary_text(portfolio):
             f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
             f"  - 🔴 จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
             f"  - 🎯 เป้าหมายทำกำไร (Take Profit): {res['take_profit']:.2f} ฿\n"
-            f"  - 🛒 **แนะนำสั่งซื้อ: 10 หุ้น** (ใช้วงเงินประมาณ {cost_10:,.2f} ฿)\n"
+            f"  - 🛒 **แนะนำคำนวณตามแผน: ซื้อ {res['rec_shares']} หุ้น**\n"
+            f"    (ใช้วงเงินประมาณ {est_cost:,.2f} ฿)\n"
         )
     return "\n".join(msg)
 
@@ -224,7 +274,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (No .BK required) is running!"
+    return "Financial Advisor Trading Bot (Smart Position Sizing) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -311,7 +361,7 @@ def handle_message(event):
             avg_cost = info.get('average_cost', 0)
             sl = info.get('stop_loss', avg_cost * 0.95)
             
-            res = analyze_stock_deep(symbol)
+            res = analyze_stock_deep(portfolio, symbol)
             if not res:
                 analysis_reports.append(f"• {display_sym}: ดึงข้อมูลไม่ได้")
                 continue
@@ -348,7 +398,7 @@ def handle_message(event):
         watchlist = portfolio.get("watchlist", [])
         scanned_stocks = []
         for sym in watchlist:
-            res = analyze_stock_deep(sym)
+            res = analyze_stock_deep(portfolio, sym)
             if res:
                 scanned_stocks.append((clean_symbol_display(sym), res))
         
@@ -358,7 +408,7 @@ def handle_message(event):
         for rank, (sym, res) in enumerate(scanned_stocks, 1):
             vol_text = " 🔥 [Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
             reasons_formatted = "\n    - ".join(res['reasons'])
-            cost_10_shares = res['buy_price'] * 10
+            est_cost = res['buy_price'] * res['rec_shares']
             
             scan_results.append(
                 f"🏆 อันดับที่ {rank}: {sym} (คะแนนความน่าสนใจ: {res['score']}/100)\n"
@@ -369,8 +419,8 @@ def handle_message(event):
                 f"    * โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
                 f"    * จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
                 f"    * เป้าหมายทำกำไร (Take Profit): {res['take_profit']:.2f} ฿\n"
-                f"  - 🛒 **คำแนะนำการลงทุน: สั่งซื้อ 10 หุ้น**\n"
-                f"    (ใช้วงเงินประมาณ {cost_10_shares:,.2f} ฿)"
+                f"  - 🛒 **คำแนะนำตามแผน: ซื้อ {res['rec_shares']} หุ้น**\n"
+                f"    (ใช้วงเงินประมาณ {est_cost:,.2f} ฿)"
             )
         
         reply_text = (
@@ -386,11 +436,11 @@ def handle_message(event):
         if len(parts) >= 2:
             symbol = format_symbol(parts[1])
             display_sym = clean_symbol_display(symbol)
-            res = analyze_stock_deep(symbol)
+            res = analyze_stock_deep(portfolio, symbol)
             if res:
                 vol_text = "มี (วอลุ่มหนาแน่นผิดปกติ ⚡)" if res['vol_spike'] else "ปกติ"
                 reasons_formatted = "\n  - ".join(res['reasons'])
-                cost_10_shares = res['buy_price'] * 10
+                est_cost = res['buy_price'] * res['rec_shares']
                 reply_text = (
                     f"🔎 แผนวิเคราะห์เจาะลึก [{display_sym}]\n"
                     f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
@@ -402,8 +452,8 @@ def handle_message(event):
                     f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
                     f"  - 🔴 จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
                     f"  - 🎯 เป้าหมายทำกำไร: {res['take_profit']:.2f} ฿\n\n"
-                    f"🛒 **คำแนะนำการลงทุน: สั่งซื้อ 10 หุ้น**\n"
-                    f"  (ใช้วงเงินประมาณ {cost_10_shares:,.2f} ฿)\n\n"
+                    f"🛒 **คำแนะนำตามแผน: ซื้อ {res['rec_shares']} หุ้น**\n"
+                    f"  (ใช้วงเงินประมาณ {est_cost:,.2f} ฿)\n\n"
                     f"📌 ข้อมูลตัวชี้วัด:\n"
                     f"  - RSI: {res['rsi']:.1f} | MACD Hist: {res['macd_hist']:.2f}\n"
                     f"  - Volume Surge: {vol_text}"
@@ -418,7 +468,7 @@ def handle_message(event):
             "📋 คู่มือคำสั่งบอตวางแผนการลงทุน:\n"
             "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
             "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต\n"
-            "3. สแกนหุ้น -> จัดอันดับ Watchlist พร้อมเหตุผลและสั่ง 10 หุ้น\n"
+            "3. สแกนหุ้น -> จัดอันดับ Watchlist พร้อมคำนวณจำนวนหุ้นตามความเสี่ยง\n"
             "4. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป 5 อันดับแรกประจำวันตามเวลาจริง\n"
             "5. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
             "6. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
