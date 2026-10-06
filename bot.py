@@ -41,6 +41,39 @@ def format_symbol(symbol):
 def clean_symbol_display(symbol):
     return symbol.replace(".BK", "")
 
+def get_stock_sector(symbol):
+    try:
+        info = yf.Ticker(symbol).info
+        sector = info.get('sector', None)
+        if not sector:
+            # Fallback ฐานข้อมูลอุตสาหกรรมหุ้นไทยยอดนิยม
+            sector_map = {
+                "PTT.BK": "Energy (พลังงาน)", "PTTEP.BK": "Energy (พลังงาน)", "TOP.BK": "Energy (พลังงาน)", "BCP.BK": "Energy (พลังงาน)",
+                "ADVANC.BK": "Communication (สื่อสาร)", "TRUE.BK": "Communication (สื่อสาร)",
+                "AOT.BK": "Transportation (ขนส่ง)", "AAV.BK": "Transportation (ขนส่ง)", "BEM.BK": "Transportation (ขนส่ง)",
+                "KBANK.BK": "Banking (ธนาคาร)", "SCB.BK": "Banking (ธนาคาร)", "BBL.BK": "Banking (ธนาคาร)", "KTB.BK": "Banking (ธนาคาร)",
+                "CPALL.BK": "Commerce (ค้าปลีก)", "CPAXT.BK": "Commerce (ค้าปลีก)", "CRC.BK": "Commerce (ค้าปลีก)", "HMPRO.BK": "Commerce (ค้าปลีก)",
+                "BDMS.BK": "Healthcare (การแพทย์)", "BCH.BK": "Healthcare (การแพทย์)",
+                "GULF.BK": "Energy & Utilities (พลังงานและสาธารณูปโภค)", "GPSC.BK": "Energy & Utilities (พลังงานและสาธารณูปโภค)"
+            }
+            sector = sector_map.get(symbol, "General / Others (ทั่วไป)")
+        else:
+            # แปลงชื่อ Sector สากลให้เข้าใจง่ายขึ้น
+            sector_translations = {
+                "Energy": "Energy (พลังงาน)",
+                "Financial Services": "Financial Services (การเงิน/ธนาคาร)",
+                "Communication Services": "Communication (สื่อสาร)",
+                "Industrials": "Industrials (อุตสาหกรรม/ขนส่ง)",
+                "Consumer Defensive": "Consumer Defensive (สินค้าอุปโภคบริโภค)",
+                "Consumer Cyclical": "Consumer Cyclical (สินค้าฟุ่มเฟือย)",
+                "Healthcare": "Healthcare (การแพทย์)",
+                "Utilities": "Utilities (สาธารณูปโภค)"
+            }
+            sector = sector_translations.get(sector, f"{sector} (สากล)")
+        return sector
+    except:
+        return "General / Others (ทั่วไป)"
+
 def get_user_portfolio(user_id):
     data = load_data()
     if user_id not in data:
@@ -175,6 +208,7 @@ def analyze_stock_deep(portfolio, symbol):
         suggested_take_profit = round(suggested_buy_price * 1.10, 2)
 
         rec_shares = calculate_dynamic_position_size(portfolio, suggested_buy_price, suggested_stop_loss)
+        sector = get_stock_sector(formatted_sym)
 
         reasons = []
         action = "HOLD"
@@ -186,10 +220,10 @@ def analyze_stock_deep(portfolio, symbol):
             reasons.append("❌ ผิดกฎเหล็กข้อ 1: ราคาต่ำกว่า EMA 50 และ MACD ติดลบ (แนวโน้มขาลง ห้ามรับมีด)")
         if rsi > 75:
             is_forbidden = True
-            reasons.append(f"❌ ผิดกฎเหล็กข้อ 2: ค่า RSI สูงถึง {rsi:.1f} (Overbought จัด เสี่ยงโดนเทขาย)")
+            reasons.append(f"❌ ผิดกฎเหล็กข้อ 2: ค่า RSI สูงถึง {rsi:.1f} (Overbought จัด เสี่ยงโดนเทขายสูงมาก)")
         if cur_vol < avg_vol_20 * 0.5:
             is_forbidden = True
-            reasons.append("❌ ผิดกฎเหล็กข้อ 3: ปริมาณซื้อขายแห้งเกินไป ขาดสภาพคล่อง")
+            reasons.append("❌ ผิดกฎเหล็กข้อ 3: ปริมาณซื้อขายแห้งเกินไป ขาดสภาพคล่องในการเข้าออก")
 
         if is_forbidden:
             action = "❌ ห้ามซื้อเด็ดขาด"
@@ -198,24 +232,24 @@ def analyze_stock_deep(portfolio, symbol):
             if rsi < 38 or cur_price <= lower * 1.02:
                 action = "BUY"
                 score += 35
-                reasons.append(f"RSI อยู่ที่ {rsi:.1f} (Oversold) และราคาเทสแนวรับกรอบล่าง Bollinger Bands")
+                reasons.append(f"RSI อยู่ที่ {rsi:.1f} (Oversold) และราคาเทสแนวรับกรอบล่าง Bollinger Bands โอกาสฟื้นตัวสูง")
                 if vol_spike:
                     score += 15
-                    reasons.append("พบปริมาณซื้อขายหนาแน่นผิดปกติ (Volume Spike) มีแรงซื้อสะสม")
+                    reasons.append("พบปริมาณซื้อขายหนาแน่นผิดปกติ (Volume Spike) มีแรงซื้อสะสมจากผู้เล่นรายใหญ่")
             elif hist > 0 and cur_price > ema50:
                 action = "ADD/HOLD"
                 score += 25
-                reasons.append(f"โครงสร้างราคายืนเหนือเส้น EMA 50 และ MACD เป็นบวก ({hist:.2f}) ขาขึ้นแข็งแกร่ง")
+                reasons.append(f"โครงสร้างราคายืนเหนือเส้น EMA 50 และ MACD Histogram เป็นบวก ({hist:.2f}) ขาขึ้นแข็งแกร่ง")
                 if vol_spike:
                     score += 10
-                    reasons.append("มี Volume สนับสนุนต่อเนื่อง")
+                    reasons.append("มี Volume สนับสนุนการปรับตัวขึ้นต่อเนื่อง")
             elif rsi > 68 or cur_price >= upper * 0.98:
                 action = "SELL"
                 score -= 20
-                reasons.append(f"RSI สูงถึง {rsi:.1f} (Overbought) ชนแนวต้านกรอบบน")
+                reasons.append(f"RSI สูงถึง {rsi:.1f} (Overbought) ราคาชนแนวต้านกรอบบน ระวังแรงขาย")
             else:
                 action = "HOLD"
-                reasons.append("ราคาเคลื่อนไหวออกข้าง (Sideway) รอดูทิศทาง")
+                reasons.append("ราคาเคลื่อนไหวออกข้าง (Sideway) รอดูความชัดเจนของทิศทางตลาด")
 
         return {
             "price": cur_price,
@@ -227,6 +261,7 @@ def analyze_stock_deep(portfolio, symbol):
             "vol_spike": vol_spike,
             "action": action,
             "score": min(max(score, 0), 100),
+            "sector": sector,
             "reasons": reasons,
             "buy_price": suggested_buy_price,
             "stop_loss": suggested_stop_loss,
@@ -236,6 +271,38 @@ def analyze_stock_deep(portfolio, symbol):
     except Exception as e:
         print(f"Error analyzing {symbol}: {e}")
         return None
+
+def generate_sector_analysis_text(portfolio):
+    watchlist = portfolio.get("watchlist", ["ADVANC.BK", "PTT.BK", "AOT.BK", "KBANK.BK", "CPALL.BK"])
+    sectors_dict = {}
+    
+    for sym in watchlist:
+        res = analyze_stock_deep(portfolio, sym)
+        if res:
+            sec = res['sector']
+            if sec not in sectors_dict:
+                sectors_dict[sec] = []
+            sectors_dict[sec].append((clean_symbol_display(sym), res))
+            
+    if not sectors_dict:
+        return "❌ ไม่พบข้อมูลหุ้นใน Watchlist สำหรับจัดหมวดหมู่อุตสาหกรรม"
+        
+    msg = ["🏭 รายงานวิเคราะห์รายอุตสาหกรรม (Sector Analysis)\n⏱️ (อ้างอิงข้อมูล Watchlist ปัจจุบัน):\n"]
+    
+    for sector_name, stocks in sectors_dict.items():
+        msg.append(f"📂 **หมวด: {sector_name}**")
+        # เรียงลำดับหุ้นในหมวดตามคะแนน
+        stocks.sort(key=lambda x: x[1]['score'], reverse=True)
+        for sym, res in stocks:
+            vol_icon = "🔥" if res['vol_spike'] else ""
+            msg.append(
+                f"  - **{sym}** | ราคา: {res['price']:.2f} ฿ {vol_icon}\n"
+                f"    สถานะ: [{res['action']}] (คะแนน: {res['score']}/100)\n"
+                f"    โซนซื้อ: {res['buy_price']:.2f} ฿ | เป้าขาย: {res['take_profit']:.2f} ฿"
+            )
+        msg.append("") # เว้นบรรทัด
+        
+    return "\n".join(msg)
 
 def generate_top5_summary_text(portfolio):
     watchlist = portfolio.get("watchlist", ["ADVANC.BK", "PTT.BK", "AOT.BK", "KBANK.BK", "CPALL.BK"])
@@ -256,7 +323,7 @@ def generate_top5_summary_text(portfolio):
         vol_text = " 🔥[Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
         est_cost = res['buy_price'] * res['rec_shares']
         msg.append(
-            f"🏆 อันดับ {rank}: {sym} (คะแนน: {res['score']}/100)\n"
+            f"🏆 อันดับ {rank}: {sym} [{res['sector']}] (คะแนน: {res['score']}/100)\n"
             f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
             f"  - สถานะ: [{res['action']}]\n"
             f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
@@ -285,7 +352,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Safe Error Handled) is running!"
+    return "Financial Advisor Trading Bot (Sector Analysis Active) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -303,7 +370,6 @@ def handle_message(event):
     user_id = event.source.user_id
     
     portfolio = get_user_portfolio(user_id)
-    # อัปเดต last_user_id เสมอเพื่อให้ระบบ push ถูกคน
     portfolio['last_user_id'] = user_id
     
     reply_text = ""
@@ -387,14 +453,16 @@ def handle_message(event):
                 
                 if res['price'] <= sl or res['action'] == "SELL":
                     analysis_reports.append(
-                        f"🚨 [{display_sym}] แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
+                        f"🚨 [{display_sym}] ({res['sector']})\n"
+                        f"  - แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
                         f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
                         f"  - จุดตัดขาดทุน: {sl:.2f} ฿\n"
                         f"  - เหตุผล:\n    - {reason_text}"
                     )
                 else:
                     analysis_reports.append(
-                        f"✅ [{display_sym}] แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
+                        f"✅ [{display_sym}] ({res['sector']})\n"
+                        f"  - แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
                         f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
                         f"  - โซนซื้อเพิ่ม: {res['buy_price']:.2f} ฿ | เป้าทำกำไร: {res['take_profit']:.2f} ฿\n"
                         f"  - เหตุผล:\n    - {reason_text}"
@@ -426,7 +494,7 @@ def handle_message(event):
                 est_cost = res['buy_price'] * res['rec_shares']
                 
                 scan_results.append(
-                    f"🏆 อันดับที่ {rank}: {sym} (คะแนน: {res['score']}/100)\n"
+                    f"🏆 อันดับที่ {rank}: {sym} [{res['sector']}] (คะแนน: {res['score']}/100)\n"
                     f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
                     f"  - สถานะ: [{res['action']}]\n"
                     f"  - 💡 เหตุผลประกอบ:\n    - {reasons_formatted}\n"
@@ -444,6 +512,9 @@ def handle_message(event):
                 + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
             )
 
+        elif text == "วิเคราะห์อุตสาหกรรม":
+            reply_text = generate_sector_analysis_text(portfolio)
+
         elif text == "สรุปหุ้นที่น่าซื้อวันนี้":
             reply_text = generate_top5_summary_text(portfolio)
 
@@ -457,7 +528,7 @@ def handle_message(event):
                     reasons_formatted = "\n  - ".join(res['reasons'])
                     est_cost = res['buy_price'] * res['rec_shares']
                     reply_text = (
-                        f"🔎 แผนวิเคราะห์เจาะลึก [{display_sym}]\n"
+                        f"🔎 แผนวิเคราะห์เจาะลึก [{display_sym}] ({res['sector']})\n"
                         f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
                         f"- คะแนนความปลอดภัย: {res['score']}/100\n"
                         f"- ราคาปัจจุบัน: {res['price']:.2f} ฿\n"
@@ -482,13 +553,14 @@ def handle_message(event):
             reply_text = (
                 "📋 คู่มือคำสั่งบอตวางแผนการลงทุน:\n"
                 "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
-                "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต\n"
+                "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต (พร้อมบอกหมวดอุตสาหกรรม)\n"
                 "3. สแกนหุ้น -> สแกน Watchlist พร้อมตรวจ 4 กฎเหล็ก\n"
-                "4. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป Top 5 เฉพาะตัวที่ผ่านกฎเหล็ก\n"
-                "5. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
-                "6. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
-                "7. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
-                "8. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
+                "4. วิเคราะห์อุตสาหกรรม -> จัดกลุ่มหุ้นใน Watchlist แยกตามหมวด Sector\n"
+                "5. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป Top 5 เฉพาะตัวที่ผ่านกฎเหล็ก\n"
+                "6. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
+                "7. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
+                "8. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
+                "9. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
             )
 
         elif text == "รายการติดตาม":
