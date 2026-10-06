@@ -1,43 +1,12 @@
-{
-    "cash": 4495.0,
-    "stocks": {
-        "ADVANC": {
-            "shares": 10,
-            "cost": 343.5,
-            "tp": 378.40000000000003,
-            "sl": 333.68,
-            "peak_price": 344.0,
-            "trailing_stop": 333.68
-        },
-        "PTT": {
-            "shares": 50,
-            "cost": 41.25,
-            "tp": 45.37500000000001,
-            "sl": 40.012499999999996,
-            "peak_price": 41.5,
-            "trailing_stop": 40.254999999999995
-        }
-    },
-    "initial_capital": 10000.0,
-    "max_loss_limit": 2000.0,
-    "history": [
-        {
-            "symbol": "ADVANC",
-            "shares": 10,
-            "buy_price": 343.5,
-            "sell_price": 344.0,
-            "realized_pnl": 5.0,
-            "return_pct": 0.1455604075691412,
-            "date": "2026-10-05 15:42"
-        },
-        {
-            "symbol": "PTT",
-            "shares": 50,
-            "buy_price": 41.25,
-            "sell_price": 41.5,
-            "realized_pnl": 12.5,
-            "return_pct": 0.6060606060606061,
-            "date": "2026-10-05 15:50"
-        }
-    ]
+"financial_plan": {
+    "target_value": 20000.0,
+    "target_months": 3,
+    "monthly_contribution": 1000.0,
+    "risk_level": "high",
+    "max_portfolio_drawdown_pct": 0.20,
+    "trading_paused_at_value": 8000.0,
+    "risk_per_trade_pct": 0.02,
+    "max_stock_weight_pct": 0.25,
+    "default_stop_loss_pct": 0.05,
+    "risk_reward_ratio": 2.0
 }
