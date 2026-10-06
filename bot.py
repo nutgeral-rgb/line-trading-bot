@@ -32,6 +32,15 @@ def save_data(data):
     with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+def format_symbol(symbol):
+    symbol = symbol.upper().strip()
+    if not symbol.endswith(".BK"):
+        symbol += ".BK"
+    return symbol
+
+def clean_symbol_display(symbol):
+    return symbol.replace(".BK", "")
+
 def get_user_portfolio(user_id):
     data = load_data()
     if user_id not in data:
@@ -107,8 +116,9 @@ def check_volume_spike(df, window=20, mult=1.5):
     return cur_vol >= (avg_vol * mult)
 
 def analyze_stock_deep(symbol):
+    formatted_sym = format_symbol(symbol)
     try:
-        df = yf.Ticker(symbol).history(period='60d')
+        df = yf.Ticker(formatted_sym).history(period='60d')
         if df.empty or len(df) < 20:
             return None
         
@@ -173,7 +183,7 @@ def generate_top5_summary_text(portfolio):
     for sym in watchlist:
         res = analyze_stock_deep(sym)
         if res:
-            scanned_stocks.append((sym, res))
+            scanned_stocks.append((clean_symbol_display(sym), res))
     
     if not scanned_stocks:
         return "❌ ไม่พบข้อมูลหุ้นใน Watchlist สำหรับจัดอันดับ"
@@ -214,7 +224,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Daily Top 5) is running!"
+    return "Financial Advisor Trading Bot (No .BK required) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -247,6 +257,7 @@ def handle_message(event):
             stock_summary = "ไม่มีหุ้นในพอร์ต\n"
         else:
             for symbol, info in stocks.items():
+                display_sym = clean_symbol_display(symbol)
                 shares = info['shares']
                 total_cost = info.get('total_cost', 0)
                 avg_cost = info.get('average_cost', 0)
@@ -263,7 +274,7 @@ def handle_message(event):
                 pl = market_value - total_cost
                 pl_pct = (pl / total_cost * 100) if total_cost > 0 else 0
                 
-                stock_summary += (f"- {symbol}: {shares} หุ้น\n  ทุนสุทธิ: {total_cost:,.2f} ฿ (เฉลี่ย {avg_cost:.2f})\n"
+                stock_summary += (f"- {display_sym}: {shares} หุ้น\n  ทุนสุทธิ: {total_cost:,.2f} ฿ (เฉลี่ย {avg_cost:.2f})\n"
                                   f"  ปัจจุบัน: {cur_price:.2f} ฿ | กำไร/ขาดทุน: {pl:+,.2f} ฿ ({pl_pct:+.2f}%)\n"
                                   f"  RSI: {rsi:.1f}\n\n")
         
@@ -294,6 +305,7 @@ def handle_message(event):
         analysis_reports = []
         
         for symbol, info in stocks.items():
+            display_sym = clean_symbol_display(symbol)
             shares = info['shares']
             total_cost = info.get('total_cost', 0)
             avg_cost = info.get('average_cost', 0)
@@ -301,7 +313,7 @@ def handle_message(event):
             
             res = analyze_stock_deep(symbol)
             if not res:
-                analysis_reports.append(f"• {symbol}: ดึงข้อมูลไม่ได้")
+                analysis_reports.append(f"• {display_sym}: ดึงข้อมูลไม่ได้")
                 continue
             
             total_stock_value += shares * res['price']
@@ -310,14 +322,14 @@ def handle_message(event):
             
             if res['price'] <= sl or res['action'] == "SELL":
                 analysis_reports.append(
-                    f"🚨 [{symbol}] แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
+                    f"🚨 [{display_sym}] แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
                     f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
                     f"  - จุดตัดขาดทุน: {sl:.2f} ฿\n"
                     f"  - เหตุผล:\n    - {reason_text}"
                 )
             else:
                 analysis_reports.append(
-                    f"✅ [{symbol}] แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
+                    f"✅ [{display_sym}] แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
                     f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
                     f"  - โซนซื้อเพิ่ม: {res['buy_price']:.2f} ฿ | เป้าทำกำไร: {res['take_profit']:.2f} ฿\n"
                     f"  - เหตุผล:\n    - {reason_text}"
@@ -338,7 +350,7 @@ def handle_message(event):
         for sym in watchlist:
             res = analyze_stock_deep(sym)
             if res:
-                scanned_stocks.append((sym, res))
+                scanned_stocks.append((clean_symbol_display(sym), res))
         
         scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
         
@@ -372,16 +384,15 @@ def handle_message(event):
 
     elif text.startswith("สแกน "):
         if len(parts) >= 2:
-            symbol = parts[1].upper()
-            if not symbol.endswith(".BK"):
-                symbol += ".BK"
+            symbol = format_symbol(parts[1])
+            display_sym = clean_symbol_display(symbol)
             res = analyze_stock_deep(symbol)
             if res:
                 vol_text = "มี (วอลุ่มหนาแน่นผิดปกติ ⚡)" if res['vol_spike'] else "ปกติ"
                 reasons_formatted = "\n  - ".join(res['reasons'])
                 cost_10_shares = res['buy_price'] * 10
                 reply_text = (
-                    f"🔎 แผนวิเคราะห์เจาะลึก [{symbol}]\n"
+                    f"🔎 แผนวิเคราะห์เจาะลึก [{display_sym}]\n"
                     f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
                     f"- คะแนนความน่าสนใจ: {res['score']}/100\n"
                     f"- ราคาปัจจุบัน: {res['price']:.2f} ฿\n"
@@ -398,7 +409,7 @@ def handle_message(event):
                     f"  - Volume Surge: {vol_text}"
                 )
             else:
-                reply_text = f"❌ ไม่สามารถดึงข้อมูลหุ้น {symbol} ได้ หรือชื่อหุ้นไม่ถูกต้อง"
+                reply_text = f"❌ ไม่สามารถดึงข้อมูลหุ้น {display_sym} ได้ หรือชื่อหุ้นไม่ถูกต้อง"
         else:
             reply_text = "❌ รูปแบบไม่ถูกต้อง (ตัวอย่าง: สแกน PTT)"
 
@@ -417,45 +428,43 @@ def handle_message(event):
 
     elif text == "รายการติดตาม":
         watchlist = portfolio.get("watchlist", [])
-        reply_text = "📋 รายชื่อหุ้นในระบบติดตาม:\n" + ", ".join(watchlist) if watchlist else "ยังไม่มีหุ้นในรายการติดตาม"
+        clean_watchlist = [clean_symbol_display(s) for s in watchlist]
+        reply_text = "📋 รายชื่อหุ้นในระบบติดตาม:\n" + ", ".join(clean_watchlist) if clean_watchlist else "ยังไม่มีหุ้นในรายการติดตาม"
 
     elif text.startswith("ติดตาม "):
         if len(parts) >= 2:
-            symbol = parts[1].upper()
-            if not symbol.endswith(".BK"):
-                symbol += ".BK"
+            symbol = format_symbol(parts[1])
+            display_sym = clean_symbol_display(symbol)
             watchlist = portfolio.get("watchlist", [])
             if symbol not in watchlist:
                 watchlist.append(symbol)
                 portfolio['watchlist'] = watchlist
                 update_user_portfolio(user_id, portfolio)
-                reply_text = f"✅ เพิ่ม {symbol} เรียบร้อยแล้ว"
+                reply_text = f"✅ เพิ่ม {display_sym} เรียบร้อยแล้ว"
             else:
-                reply_text = f"ℹ️ {symbol} มีในรายการอยู่แล้ว"
+                reply_text = f"ℹ️ {display_sym} มีในรายการอยู่แล้ว"
         else:
             reply_text = "❌ รูปแบบไม่ถูกต้อง (ตัวอย่าง: ติดตาม PTT)"
 
     elif text.startswith("เลิกติดตาม "):
         if len(parts) >= 2:
-            symbol = parts[1].upper()
-            if not symbol.endswith(".BK"):
-                symbol += ".BK"
+            symbol = format_symbol(parts[1])
+            display_sym = clean_symbol_display(symbol)
             watchlist = portfolio.get("watchlist", [])
             if symbol in watchlist:
                 watchlist.remove(symbol)
                 portfolio['watchlist'] = watchlist
                 update_user_portfolio(user_id, portfolio)
-                reply_text = f"🗑️ ลบ {symbol} ออกแล้ว"
+                reply_text = f"🗑️ ลบ {display_sym} ออกแล้ว"
             else:
-                reply_text = f"❌ ไม่พบ {symbol} ในรายการ"
+                reply_text = f"❌ ไม่พบ {display_sym} ในรายการ"
         else:
             reply_text = "❌ รูปแบบไม่ถูกต้อง (ตัวอย่าง: เลิกติดตาม PTT)"
 
     elif text.startswith("ซื้อ"):
         if len(parts) >= 4:
-            symbol = parts[1].upper()
-            if not symbol.endswith(".BK"):
-                symbol += ".BK"
+            symbol = format_symbol(parts[1])
+            display_sym = clean_symbol_display(symbol)
             try:
                 shares = int(parts[2])
                 price = float(parts[3])
@@ -502,7 +511,7 @@ def handle_message(event):
                     
                     update_user_portfolio(user_id, portfolio)
                     
-                    reply_text = (f"✅ บันทึกซื้อสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares} หุ้น\n"
+                    reply_text = (f"✅ บันทึกซื้อสำเร็จ:\n- หุ้น: {display_sym}\n- จำนวน: {shares} หุ้น\n"
                                   f"- ราคาซื้อ: {price:.2f} ฿ | ค่าธรรมเนียม: {fee:.2f} ฿\n"
                                   f"- จ่ายสุทธิ: {total_cost:,.2f} ฿\n"
                                   f"- ทุนเฉลี่ยใหม่: {new_avg_price:.2f} ฿/หุ้น\n"
@@ -512,13 +521,12 @@ def handle_message(event):
             except Exception as e:
                 reply_text = f"❌ เกิดข้อผิดพลาด: {str(e)}"
         else:
-            reply_text = "❌ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT.BK 10 35.0 20)"
+            reply_text = "❌ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ซื้อ PTT 10 35.0 20)"
 
     elif text.startswith("ขาย"):
         if len(parts) >= 4:
-            symbol = parts[1].upper()
-            if not symbol.endswith(".BK"):
-                symbol += ".BK"
+            symbol = format_symbol(parts[1])
+            display_sym = clean_symbol_display(symbol)
             try:
                 shares_to_sell = int(parts[2])
                 price = float(parts[3])
@@ -562,13 +570,16 @@ def handle_message(event):
                     
                     update_user_portfolio(user_id, portfolio)
                     
-                    reply_text = (f"✅ บันทึกขายสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares_to_sell} หุ้น\n- ราคาขาย: {price:.2f} ฿ | ค่าธรรมเนียม: {fee:.2f} ฿\n- รับเงินสุทธิ: {total_income:,.2f} ฿\n- กำไร/ขาดทุนสุทธิ: {profit:+,.2f} ฿ ({profit_pct:+.2f}%)")
+                    reply_text = (f"✅ บันทึกขายสำเร็จ:\n- หุ้น: {display_sym}\n- จำนวน: {shares_to_sell} หุ้น\n"
+                                  f"- ราคาขาย: {price:.2f} ฿ | ค่าธรรมเนียม: {fee:.2f} ฿\n"
+                                  f"- รับเงินสุทธิ: {total_income:,.2f} ฿\n"
+                                  f"- กำไร/ขาดทุนสุทธิ: {profit:+,.2f} ฿ ({profit_pct:+.2f}%)")
                 else:
-                    reply_text = f"❌ หุ้น {symbol} ในพอร์ตมีไม่พอขาย"
+                    reply_text = f"❌ หุ้น {display_sym} ในพอร์ตมีไม่พอขาย"
             except Exception as e:
                 reply_text = f"❌ เกิดข้อผิดพลาด: {str(e)}"
         else:
-            reply_text = "❌ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ขาย PTT.BK 10 38.0 20)"
+            reply_text = "❌ รูปแบบคำสั่งไม่ถูกต้อง (ตัวอย่าง: ขาย PTT 10 38.0 20)"
     else:
         reply_text = f"🤖 รับทราบคำสั่ง: {text}\n(พิมพ์ 'ช่วยเหลือ' เพื่อดูคำสั่งทั้งหมด)"
 
