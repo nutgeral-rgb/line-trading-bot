@@ -119,7 +119,6 @@ def calculate_dynamic_position_size(portfolio, price, stop_loss):
     cash = portfolio.get("cash", 10000.0)
     stocks = portfolio.get("stocks", {})
     
-    # คำนวณมูลค่าหุ้นรวมในพอร์ตปัจจุบันแบบคร่าวๆ
     total_stock_val = 0
     for sym, info in stocks.items():
         try:
@@ -133,27 +132,21 @@ def calculate_dynamic_position_size(portfolio, price, stop_loss):
     if total_portfolio <= 0:
         total_portfolio = 10000.0
         
-    # 1. คำนวณจากความเสี่ยงที่รับได้ (Risk 2% ต่อไม้)
     risk_budget = total_portfolio * 0.02
-    risk_per_share = max(price - stop_loss, price * 0.03) # อย่างน้อย 3%
+    risk_per_share = max(price - stop_loss, price * 0.03)
     shares_by_risk = risk_budget / risk_per_share if risk_per_share > 0 else 10
     
-    # 2. คำนวณจากสัดส่วนสูงสุดต่อหุ้น (Max 25% ของพอร์ต)
     max_weight_budget = total_portfolio * 0.25
     shares_by_weight = max_weight_budget / price if price > 0 else 10
     
-    # 3. คำนวณจากเงินสดที่มี (ใช้ไม่เกิน 40% ของเงินสดคงเหลือ)
     cash_budget = cash * 0.40
     shares_by_cash = cash_budget / price if price > 0 else 10
     
-    # เลือกค่าที่ต่ำที่สุดเพื่อให้ปลอดภัยตามหลักการบริหารความเสี่ยง
     recommended_shares = int(min(shares_by_risk, shares_by_weight, shares_by_cash))
     
-    # ปัดให้เข้ากับลักษณะหุ้นไทย (ถ้ามากกว่า 100 หุ้น ให้ปัดลงเป็นหลักสิบ/หลักร้อย หรือขั้นต่ำ 10 หุ้น)
     if recommended_shares < 10:
         recommended_shares = max(recommended_shares, 1)
     else:
-        # ปัดลงให้เป็นเลขกลมๆ เช่น หลักสิบ
         recommended_shares = (recommended_shares // 10) * 10
         if recommended_shares < 10:
             recommended_shares = 10
@@ -174,38 +167,62 @@ def analyze_stock_deep(portfolio, symbol):
         upper, sma, lower = calculate_bollinger_bands(df)
         vol_spike = check_volume_spike(df)
         
+        avg_vol_20 = df['Volume'].iloc[-20:].mean()
+        cur_vol = df['Volume'].iloc[-1]
+
         suggested_buy_price = round(lower, 2) if cur_price > lower else round(cur_price, 2)
         suggested_stop_loss = round(suggested_buy_price * 0.95, 2)
         suggested_take_profit = round(suggested_buy_price * 1.10, 2)
 
-        # คำนวณจำนวนหุ้นที่เหมาะสมตามพอร์ตและความเสี่ยงจริง
         rec_shares = calculate_dynamic_position_size(portfolio, suggested_buy_price, suggested_stop_loss)
 
         reasons = []
         action = "HOLD"
         score = 50
         
-        if rsi < 38 or cur_price <= lower * 1.02:
-            action = "BUY"
-            score += 35
-            reasons.append(f"RSI อยู่ที่ {rsi:.1f} (เข้าเขต Oversold) และราคาลงมาทดสอบแนวรับกรอบล่าง Bollinger Bands โอกาสฟื้นตัวสูง")
-            if vol_spike:
-                score += 15
-                reasons.append("พบปริมาณซื้อขายหนาแน่นผิดปกติ (Volume Spike) มีแรงซื้อสะสมจากผู้เล่นรายใหญ่")
-        elif hist > 0 and cur_price > ema50:
-            action = "ADD/HOLD"
-            score += 25
-            reasons.append(f"โครงสร้างราคายืนเหนือเส้น EMA 50 และ MACD Histogram เป็นบวก ({hist:.2f}) โมเมนตัมขาขึ้นแข็งแกร่ง")
-            if vol_spike:
-                score += 10
-                reasons.append("มี Volume สนับสนุนการปรับตัวขึ้นต่อเนื่อง")
-        elif rsi > 68 or cur_price >= upper * 0.98:
-            action = "SELL"
-            score -= 20
-            reasons.append(f"RSI สูงถึง {rsi:.1f} เข้าเขต Overbought และราคาชนแนวต้านกรอบบน เสี่ยงโดนเทขายทำกำไร")
+        # 🚨 ตรวจสอบ 4 กฎเหล็กห้ามซื้อเด็ดขาด
+        is_forbidden = False
+        
+        # กฎข้อ 1: ห้ามรับมีดขาลง (ต่ำกว่า EMA 50 และ MACD ติดลบ)
+        if cur_price < ema50 and hist < 0:
+            is_forbidden = True
+            reasons.append("❌ ผิดกฎเหล็กข้อ 1: ราคาต่ำกว่า EMA 50 และ MACD ติดลบ (อยู่ในแนวโน้มขาลงหลัก ห้ามรับมีด)")
+        
+        # กฎข้อ 2: ห้ามไล่ราคา Overbought (RSI > 75)
+        if rsi > 75:
+            is_forbidden = True
+            reasons.append(f"❌ ผิดกฎเหล็กข้อ 2: ค่า RSI สูงถึง {rsi:.1f} (Overbought จัด เสี่ยงโดนเทขายสูงมาก)")
+            
+        # กฎข้อ 3: ห้ามซื้อหุ้นสภาพคล่องแห้ง (Volume ต่ำกว่าค่าเฉลี่ย 50%)
+        if cur_vol < avg_vol_20 * 0.5:
+            is_forbidden = True
+            reasons.append("❌ ผิดกฎเหล็กข้อ 3: ปริมาณซื้อขายแห้งเกินไป ขาดสภาพคล่องในการเข้าออก")
+
+        if is_forbidden:
+            action = "❌ ห้ามซื้อเด็ดขาด"
+            score = 0
         else:
-            action = "HOLD"
-            reasons.append(f"ราคาเคลื่อนไหวออกข้าง (Sideway) รอดูความชัดเจนของทิศทางตลาด")
+            if rsi < 38 or cur_price <= lower * 1.02:
+                action = "BUY"
+                score += 35
+                reasons.append(f"RSI อยู่ที่ {rsi:.1f} (Oversold) และราคาเทสแนวรับกรอบล่าง Bollinger Bands โอกาสฟื้นตัวสูง")
+                if vol_spike:
+                    score += 15
+                    reasons.append("พบปริมาณซื้อขายหนาแน่นผิดปกติ (Volume Spike) มีแรงซื้อสะสมจากผู้เล่นรายใหญ่")
+            elif hist > 0 and cur_price > ema50:
+                action = "ADD/HOLD"
+                score += 25
+                reasons.append(f"โครงสร้างราคายืนเหนือเส้น EMA 50 และ MACD Histogram เป็นบวก ({hist:.2f}) ขาขึ้นแข็งแกร่ง")
+                if vol_spike:
+                    score += 10
+                    reasons.append("มี Volume สนับสนุนการปรับตัวขึ้นต่อเนื่อง")
+            elif rsi > 68 or cur_price >= upper * 0.98:
+                action = "SELL"
+                score -= 20
+                reasons.append(f"RSI สูงถึง {rsi:.1f} (Overbought) ราคาชนแนวต้านกรอบบน ระวังแรงขาย")
+            else:
+                action = "HOLD"
+                reasons.append("ราคาเคลื่อนไหวออกข้าง (Sideway) รอดูความชัดเจนของทิศทางตลาด")
 
         return {
             "price": cur_price,
@@ -231,16 +248,17 @@ def generate_top5_summary_text(portfolio):
     scanned_stocks = []
     for sym in watchlist:
         res = analyze_stock_deep(portfolio, sym)
-        if res:
+        # คัดกรองเฉพาะหุ้นที่ไม่ติดกฎเหล็กห้ามซื้อ
+        if res and res['action'] != "❌ ห้ามซื้อเด็ดขาด":
             scanned_stocks.append((clean_symbol_display(sym), res))
     
     if not scanned_stocks:
-        return "❌ ไม่พบข้อมูลหุ้นใน Watchlist สำหรับจัดอันดับ"
+        return "⚠️ วันนี้ไม่มีหุ้นใน Watchlist ที่ผ่านเกณฑ์ความปลอดภัย (ติดกฎเหล็กห้ามซื้อทั้งหมด)"
         
     scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
     top5 = scanned_stocks[:5]
     
-    msg = ["🌅 สรุป 5 หุ้นน่าซื้อประจำวัน\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
+    msg = ["🌅 สรุป 5 หุ้นน่าซื้อประจำวัน (ผ่านกฎเหล็กความปลอดภัย)\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
     for rank, (sym, res) in enumerate(top5, 1):
         vol_text = " 🔥[Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
         est_cost = res['buy_price'] * res['rec_shares']
@@ -274,7 +292,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Smart Position Sizing) is running!"
+    return "Financial Advisor Trading Bot (Golden Rules Active) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -411,10 +429,10 @@ def handle_message(event):
             est_cost = res['buy_price'] * res['rec_shares']
             
             scan_results.append(
-                f"🏆 อันดับที่ {rank}: {sym} (คะแนนความน่าสนใจ: {res['score']}/100)\n"
+                f"🏆 อันดับที่ {rank}: {sym} (คะแนน: {res['score']}/100)\n"
                 f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
-                f"  - สถานะทางเทคนิค: [{res['action']}]\n"
-                f"  - 💡 เหตุผลควรเข้าซื้อ:\n    - {reasons_formatted}\n"
+                f"  - สถานะ: [{res['action']}]\n"
+                f"  - 💡 เหตุผลประกอบ:\n    - {reasons_formatted}\n"
                 f"  - 📊 ระดับราคาตามกลยุทธ์:\n"
                 f"    * โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
                 f"    * จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
@@ -424,7 +442,7 @@ def handle_message(event):
             )
         
         reply_text = (
-            "📊 ผลสแกน Watchlist (จัดอันดับความน่าสนใจ)\n"
+            "📊 ผลสแกน Watchlist (ตรวจสอบ 4 กฎเหล็กความปลอดภัย)\n"
             "⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
             + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
         )
@@ -444,10 +462,10 @@ def handle_message(event):
                 reply_text = (
                     f"🔎 แผนวิเคราะห์เจาะลึก [{display_sym}]\n"
                     f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
-                    f"- คะแนนความน่าสนใจ: {res['score']}/100\n"
+                    f"- คะแนนความปลอดภัย: {res['score']}/100\n"
                     f"- ราคาปัจจุบัน: {res['price']:.2f} ฿\n"
                     f"- สถานะแนะนำ: [{res['action']}]\n\n"
-                    f"💡 เหตุผลการเข้าซื้อ:\n  - {reasons_formatted}\n\n"
+                    f"💡 เหตุผลการประเมิน:\n  - {reasons_formatted}\n\n"
                     f"📊 ระดับราคาตามกลยุทธ์:\n"
                     f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
                     f"  - 🔴 จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
@@ -468,8 +486,8 @@ def handle_message(event):
             "📋 คู่มือคำสั่งบอตวางแผนการลงทุน:\n"
             "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
             "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต\n"
-            "3. สแกนหุ้น -> จัดอันดับ Watchlist พร้อมคำนวณจำนวนหุ้นตามความเสี่ยง\n"
-            "4. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป 5 อันดับแรกประจำวันตามเวลาจริง\n"
+            "3. สแกนหุ้น -> สแกน Watchlist พร้อมตรวจ 4 กฎเหล็ก\n"
+            "4. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป Top 5 เฉพาะตัวที่ผ่านกฎเหล็ก\n"
             "5. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
             "6. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
             "7. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
