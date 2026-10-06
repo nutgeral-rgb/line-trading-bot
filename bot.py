@@ -7,6 +7,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
 
@@ -124,7 +125,7 @@ def analyze_stock_deep(symbol):
 
         reasons = []
         action = "HOLD"
-        score = 50  # คะแนนพื้นฐาน
+        score = 50
         
         if rsi < 38 or cur_price <= lower * 1.02:
             action = "BUY"
@@ -166,9 +167,54 @@ def analyze_stock_deep(symbol):
     except:
         return None
 
+def generate_top5_summary_text(portfolio):
+    watchlist = portfolio.get("watchlist", ["ADVANC.BK", "PTT.BK", "AOT.BK", "KBANK.BK", "CPALL.BK"])
+    scanned_stocks = []
+    for sym in watchlist:
+        res = analyze_stock_deep(sym)
+        if res:
+            scanned_stocks.append((sym, res))
+    
+    if not scanned_stocks:
+        return "❌ ไม่พบข้อมูลหุ้นใน Watchlist สำหรับจัดอันดับ"
+        
+    scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
+    top5 = scanned_stocks[:5]
+    
+    msg = ["🌅 สรุป 5 หุ้นน่าซื้อประจำวัน\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
+    for rank, (sym, res) in enumerate(top5, 1):
+        vol_text = " 🔥[Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
+        cost_10 = res['buy_price'] * 10
+        msg.append(
+            f"🏆 อันดับ {rank}: {sym} (คะแนน: {res['score']}/100)\n"
+            f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
+            f"  - สถานะ: [{res['action']}]\n"
+            f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
+            f"  - 🔴 จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
+            f"  - 🎯 เป้าหมายทำกำไร (Take Profit): {res['take_profit']:.2f} ฿\n"
+            f"  - 🛒 **แนะนำสั่งซื้อ: 10 หุ้น** (ใช้วงเงินประมาณ {cost_10:,.2f} ฿)\n"
+        )
+    return "\n".join(msg)
+
+def daily_morning_push_task():
+    with app.app_context():
+        data = load_data()
+        for user_id, portfolio in data.items():
+            if not user_id or not isinstance(portfolio, dict):
+                continue
+            summary_text = generate_top5_summary_text(portfolio)
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=summary_text))
+            except Exception as e:
+                print(f"Push error to {user_id}: {e}")
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=daily_morning_push_task, trigger=CronTrigger(hour=8, minute=30))
+scheduler.start()
+
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Ranked Scan) is running!"
+    return "Financial Advisor Trading Bot (Daily Top 5) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -294,7 +340,6 @@ def handle_message(event):
             if res:
                 scanned_stocks.append((sym, res))
         
-        # จัดอันดับตามคะแนนความน่าสนใจจากมากไปน้อย (Ranking)
         scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
         
         scan_results = []
@@ -316,7 +361,14 @@ def handle_message(event):
                 f"    (ใช้วงเงินประมาณ {cost_10_shares:,.2f} ฿)"
             )
         
-        reply_text = "📊 ผลสแกน Watchlist (จัดอันดับความน่าสนใจ):\n\n" + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
+        reply_text = (
+            "📊 ผลสแกน Watchlist (จัดอันดับความน่าสนใจ)\n"
+            "⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
+            + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
+        )
+
+    elif text == "สรุปหุ้นที่น่าซื้อวันนี้":
+        reply_text = generate_top5_summary_text(portfolio)
 
     elif text.startswith("สแกน "):
         if len(parts) >= 2:
@@ -329,7 +381,8 @@ def handle_message(event):
                 reasons_formatted = "\n  - ".join(res['reasons'])
                 cost_10_shares = res['buy_price'] * 10
                 reply_text = (
-                    f"🔎 แผนวิเคราะห์เจาะลึก [{symbol}]:\n"
+                    f"🔎 แผนวิเคราะห์เจาะลึก [{symbol}]\n"
+                    f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
                     f"- คะแนนความน่าสนใจ: {res['score']}/100\n"
                     f"- ราคาปัจจุบัน: {res['price']:.2f} ฿\n"
                     f"- สถานะแนะนำ: [{res['action']}]\n\n"
@@ -355,10 +408,11 @@ def handle_message(event):
             "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
             "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต\n"
             "3. สแกนหุ้น -> จัดอันดับ Watchlist พร้อมเหตุผลและสั่ง 10 หุ้น\n"
-            "4. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
-            "5. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
-            "6. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
-            "7. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
+            "4. สรุปหุ้นที่น่าซื้อวันนี้ -> สรุป 5 อันดับแรกประจำวันตามเวลาจริง\n"
+            "5. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
+            "6. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
+            "7. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
+            "8. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
         )
 
     elif text == "รายการติดตาม":
@@ -508,10 +562,7 @@ def handle_message(event):
                     
                     update_user_portfolio(user_id, portfolio)
                     
-                    reply_text = (f"✅ บันทึกขายสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares_to_sell} หุ้น\n"
-                                  f"- ราคาขาย: {price:.2f} ฿ | ค่าธรรมเนียม: {fee:.2f} ฿\n"
-                                  f"- รับเงินสุทธิ: {total_income:,.2f} ฿\n"
-                                  f"- กำไร/ขาดทุนสุทธิ: {profit:+,.2f} ฿ ({profit_pct:+.2f}%)")
+                    reply_text = (f"✅ บันทึกขายสำเร็จ:\n- หุ้น: {symbol}\n- จำนวน: {shares_to_sell} หุ้น\n- ราคาขาย: {price:.2f} ฿ | ค่าธรรมเนียม: {fee:.2f} ฿\n- รับเงินสุทธิ: {total_income:,.2f} ฿\n- กำไร/ขาดทุนสุทธิ: {profit:+,.2f} ฿ ({profit_pct:+.2f}%)")
                 else:
                     reply_text = f"❌ หุ้น {symbol} ในพอร์ตมีไม่พอขาย"
             except Exception as e:
