@@ -19,7 +19,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 PORTFOLIO_FILE = 'portfolio.json'
 
-# รายชื่อหุ้นกลุ่ม SET50 สภาพคล่องสูงสำหรับสแกนภาพรวมตลาด
 SET50_WATCHLIST = [
     "PTT.BK", "PTTEP.BK", "AOT.BK", "ADVANC.BK", "KBANK.BK", 
     "SCB.BK", "BBL.BK", "KTB.BK", "CPALL.BK", "BDMS.BK", 
@@ -64,6 +63,19 @@ def check_set_market_trend():
         return True, "🟢 ตลาดรวม: โครงสร้างปกติ"
 
 def get_stock_sector(symbol):
+    sector_map = {
+        "PTT.BK": "Energy (พลังงาน)", "PTTEP.BK": "Energy (พลังงาน)", "TOP.BK": "Energy (พลังงาน)", "BCP.BK": "Energy (พลังงาน)",
+        "ADVANC.BK": "Communication (สื่อสาร)", "TRUE.BK": "Communication (สื่อสาร)",
+        "AOT.BK": "Transportation (ขนส่ง)", "AAV.BK": "Transportation (ขนส่ง)", "BEM.BK": "Transportation (ขนส่ง)",
+        "KBANK.BK": "Banking (ธนาคาร)", "SCB.BK": "Banking (ธนาคาร)", "BBL.BK": "Banking (ธนาคาร)", "KTB.BK": "Banking (ธนาคาร)",
+        "CPALL.BK": "Commerce (ค้าปลีก)", "CPAXT.BK": "Commerce (ค้าปลีก)", "CRC.BK": "Commerce (ค้าปลีก)", "HMPRO.BK": "Commerce (ค้าปลีก)",
+        "BDMS.BK": "Healthcare (การแพทย์)", "BCH.BK": "Healthcare (การแพทย์)", "BH.BK": "Healthcare (การแพทย์)",
+        "GULF.BK": "Energy & Utilities (พลังงานและสาธารณูปโภค)", "GPSC.BK": "Energy & Utilities (พลังงานและสาธารณูปโภค)",
+        "SCC.BK": "Construction Materials (วัสดุก่อสร้าง)", "IVL.BK": "Petrochemicals (ปิโตรเคมี)", "CPN.BK": "Property Development (พัฒนาอสังหาริมทรัพย์)"
+    }
+    if symbol in sector_map:
+        return sector_map[symbol]
+    
     try:
         info = yf.Ticker(symbol).info
         sector = info.get('sector', None)
@@ -271,7 +283,8 @@ def generate_set50_scan_text(portfolio):
     scanned_stocks = []
     for sym in SET50_WATCHLIST:
         res = analyze_stock_deep(portfolio, sym)
-        if res and res['action'] != "❌ ห้ามซื้อเด็ดขาด":
+        # กรองเฉพาะหุ้นที่ไม่ติดกฎเหล็ก และไม่ใช่สถานะ SELL หรือคะแนนต่ำเกินไป
+        if res and res['action'] not in ["❌ ห้ามซื้อเด็ดขาด", "SELL"] and res['score'] >= 50:
             scanned_stocks.append((clean_symbol_display(sym), res))
             
     if not scanned_stocks:
@@ -281,7 +294,7 @@ def generate_set50_scan_text(portfolio):
     top10 = scanned_stocks[:10]
     
     set_ok, set_msg = check_set_market_trend()
-    msg = [f"📊 ผลสแกนหุ้นเด่น SET50 (Top 10 ผ่านกฎเหล็ก)\n{set_msg}\n"]
+    msg = [f"📊 ผลสแกนหุ้นเด่น SET50 (Top 10 ผ่านเกณฑ์)\n{set_msg}\n"]
     for rank, (sym, res) in enumerate(top10, 1):
         vol_text = " 🔥[Volume พุ่ง]" if res['vol_spike'] else ""
         est_cost = res['buy_price'] * res['rec_shares']
@@ -298,7 +311,7 @@ def generate_top5_summary_text(portfolio):
     scanned_stocks = []
     for sym in watchlist:
         res = analyze_stock_deep(portfolio, sym)
-        if res and res['action'] != "❌ ห้ามซื้อเด็ดขาด":
+        if res and res['action'] not in ["❌ ห้ามซื้อเด็ดขาด", "SELL"] and res['score'] >= 50:
             scanned_stocks.append((clean_symbol_display(sym), res))
     
     set_ok, set_msg = check_set_market_trend()
@@ -337,7 +350,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (SET50 Scan Active) is running!"
+    return "Financial Advisor Trading Bot (Fixed Sectors & Filter) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -403,7 +416,7 @@ def handle_message(event):
                 if res:
                     scanned_stocks.append((clean_symbol_display(sym), res))
             scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
-            scan_results = [f"- {sym}: {res['action']} (คะแนน {res['score']})" for sym, res in scanned_stocks]
+            scan_results = [f"- {sym} [{res['sector']}]: {res['action']} (คะแนน {res['score']})" for sym, res in scanned_stocks]
             reply_text = "📊 ผลสแกน Watchlist:\n" + ("\n".join(scan_results) if scan_results else "ไม่มีหุ้นในรายการ")
 
         elif text == "สรุปหุ้นวันนี้":
