@@ -88,9 +88,87 @@ def calculate_ema(df, window=50):
         return df['Close'].iloc[-1]
     return df['Close'].ewm(span=window, adjust=False).mean().iloc[-1]
 
+def calculate_bollinger_bands(df, window=20, num_std=2):
+    if len(df) < window:
+        cur = df['Close'].iloc[-1]
+        return cur, cur, cur
+    sma = df['Close'].rolling(window=window).mean()
+    std = df['Close'].rolling(window=window).std()
+    upper = sma + (std * num_std)
+    lower = sma - (std * num_std)
+    return upper.iloc[-1], sma.iloc[-1], lower.iloc[-1]
+
+def check_volume_spike(df, window=20, mult=1.5):
+    if len(df) < window + 1:
+        return False
+    avg_vol = df['Volume'].iloc[-(window+1):-1].mean()
+    cur_vol = df['Volume'].iloc[-1]
+    return cur_vol >= (avg_vol * mult)
+
+def analyze_stock_deep(symbol):
+    try:
+        df = yf.Ticker(symbol).history(period='60d')
+        if df.empty or len(df) < 20:
+            return None
+        
+        cur_price = df['Close'].iloc[-1]
+        rsi = calculate_rsi(df)
+        macd, sig, hist = calculate_macd(df)
+        ema50 = calculate_ema(df, 50)
+        upper, sma, lower = calculate_bollinger_bands(df)
+        vol_spike = check_volume_spike(df)
+        
+        suggested_buy_price = round(lower, 2) if cur_price > lower else round(cur_price, 2)
+        suggested_stop_loss = round(cur_price * 0.95, 2)
+        suggested_take_profit = round(cur_price * 1.10, 2)
+
+        reasons = []
+        action = "HOLD"
+        score = 50  # คะแนนพื้นฐาน
+        
+        if rsi < 38 or cur_price <= lower * 1.02:
+            action = "BUY"
+            score += 35
+            reasons.append(f"RSI อยู่ที่ {rsi:.1f} (เข้าเขต Oversold) และราคาลงมาทดสอบแนวรับกรอบล่าง Bollinger Bands โอกาสฟื้นตัวสูง")
+            if vol_spike:
+                score += 15
+                reasons.append("พบปริมาณซื้อขายหนาแน่นผิดปกติ (Volume Spike) มีแรงซื้อสะสมจากผู้เล่นรายใหญ่")
+        elif hist > 0 and cur_price > ema50:
+            action = "ADD/HOLD"
+            score += 25
+            reasons.append(f"โครงสร้างราคายืนเหนือเส้น EMA 50 และ MACD Histogram เป็นบวก ({hist:.2f}) โมเมนตัมขาขึ้นแข็งแกร่ง")
+            if vol_spike:
+                score += 10
+                reasons.append("มี Volume สนับสนุนการปรับตัวขึ้นต่อเนื่อง")
+        elif rsi > 68 or cur_price >= upper * 0.98:
+            action = "SELL"
+            score -= 20
+            reasons.append(f"RSI สูงถึง {rsi:.1f} เข้าเขต Overbought และราคาชนแนวต้านกรอบบน เสี่ยงโดนเทขายทำกำไร")
+        else:
+            action = "HOLD"
+            reasons.append(f"ราคาเคลื่อนไหวออกข้าง (Sideway) รอดูความชัดเจนของทิศทางตลาด")
+
+        return {
+            "price": cur_price,
+            "rsi": rsi,
+            "macd_hist": hist,
+            "ema50": ema50,
+            "bb_upper": upper,
+            "bb_lower": lower,
+            "vol_spike": vol_spike,
+            "action": action,
+            "score": min(max(score, 0), 100),
+            "reasons": reasons,
+            "buy_price": suggested_buy_price,
+            "stop_loss": suggested_stop_loss,
+            "take_profit": suggested_take_profit
+        }
+    except:
+        return None
+
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot is running!"
+    return "Financial Advisor Trading Bot (Ranked Scan) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -147,11 +225,10 @@ def handle_message(event):
         progress = (total_portfolio / target) * 100
         diff = target - total_portfolio
         paused = total_portfolio <= plan.get("trading_paused_at_value", 8000)
-        
         status_text = "⚠️ พอร์ตถึงขีดจำกัดความเสี่ยง (หยุดซื้อเพิ่ม)" if paused else "🟢 พอร์ตอยู่ในเกณฑ์ปกติ"
 
         reply_text = (
-            f"📊 สถานะพอร์ตและการเงิน:\n"
+            f"📊 สถานะพอร์ต & แผนการเงิน:\n"
             f"- เงินสด: {cash:,.2f} ฿\n"
             f"- มูลค่าหุ้นรวม: {total_stock_value:,.2f} ฿\n"
             f"- พอร์ตวม: {total_portfolio:,.2f} ฿\n"
@@ -166,101 +243,127 @@ def handle_message(event):
         stocks = portfolio.get("stocks", {})
         plan = portfolio.get("financial_plan", {})
         target = plan.get("target_value", 20000.0)
-        watchlist = portfolio.get("watchlist", [])
         
         total_stock_value = 0
-        sell_advices = []
+        analysis_reports = []
         
         for symbol, info in stocks.items():
             shares = info['shares']
             total_cost = info.get('total_cost', 0)
             avg_cost = info.get('average_cost', 0)
             sl = info.get('stop_loss', avg_cost * 0.95)
-            try:
-                df = yf.Ticker(symbol).history(period='60d')
-                cur_price = df['Close'].iloc[-1]
-                rsi = calculate_rsi(df)
-                hist = calculate_macd(df)[2]
-                ema50 = calculate_ema(df, 50)
-            except:
-                cur_price = avg_cost
-                rsi, hist, ema50 = 50.0, 0.0, avg_cost
             
-            market_value = shares * cur_price
-            total_stock_value += market_value
-            pl_pct = ((cur_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+            res = analyze_stock_deep(symbol)
+            if not res:
+                analysis_reports.append(f"• {symbol}: ดึงข้อมูลไม่ได้")
+                continue
             
-            if cur_price <= sl:
-                sell_advices.append(f"🚨 {symbol} หลุด Stop Loss ({sl:.2f} ฿) แนะนำพิจารณาขายตัดขาดทุน")
-            elif rsi > 70 or (cur_price < ema50 and hist < 0):
-                sell_advices.append(f"⚠️ {symbol} สัญญาณเทคนิคอ่อนแอ (RSI: {rsi:.1f}) พิจารณาลดพอร์ต")
+            total_stock_value += shares * res['price']
+            pl_pct = ((res['price'] - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+            reason_text = "\n    - ".join(res['reasons'])
+            
+            if res['price'] <= sl or res['action'] == "SELL":
+                analysis_reports.append(
+                    f"🚨 [{symbol}] แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
+                    f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
+                    f"  - จุดตัดขาดทุน: {sl:.2f} ฿\n"
+                    f"  - เหตุผล:\n    - {reason_text}"
+                )
             else:
-                sell_advices.append(f"✅ {symbol} โครงสร้างยังแข็งแกร่ง แนะนำถือต่อ")
-
-        watchlist_picks = []
-        for sym in watchlist:
-            try:
-                df = yf.Ticker(sym).history(period='60d')
-                if not df.empty and len(df) >= 30:
-                    rsi = calculate_rsi(df)
-                    hist = calculate_macd(df)[2]
-                    latest = df['Close'].iloc[-1]
-                    if rsi < 40 or (hist > 0 and latest > calculate_ema(df, 50)):
-                        watchlist_picks.append(f"• {sym} (RSI: {rsi:.1f}, MACD บวก น่าสะสม)")
-            except:
-                pass
+                analysis_reports.append(
+                    f"✅ [{symbol}] แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
+                    f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
+                    f"  - โซนซื้อเพิ่ม: {res['buy_price']:.2f} ฿ | เป้าทำกำไร: {res['take_profit']:.2f} ฿\n"
+                    f"  - เหตุผล:\n    - {reason_text}"
+                )
 
         total_portfolio = cash + total_stock_value
         progress = (total_portfolio / target) * 100
 
         reply_text = (
-            f"🧠 รายงานวิเคราะห์แผนการเงิน & เทคนิค:\n"
-            f"- เป้าหมายพอร์ต: {target:,.2f} ฿ (คืบหน้า {progress:.1f}%)\n\n"
-            f"📋 คำแนะนำหุ้นในพอร์ต:\n" + ("\n".join(sell_advices) if sell_advices else "• ไม่มีหุ้นในพอร์ต") +
-            f"\n\n💡 โอกาสจาก Watchlist:\n" + ("\n".join(watchlist_picks[:3]) if watchlist_picks else "• รอดูจังหวะตลาดพักตัว")
+            f"🧠 วิเคราะห์พอร์ตตามแผนการเงิน:\n"
+            f"- ความคืบหน้าสู่เป้าหมาย: {progress:.1f}% ({total_portfolio:,.2f} / {target:,.2f} ฿)\n\n"
+            f"📋 หุ้นในพอร์ตของคุณ:\n\n" + ("\n\n".join(analysis_reports) if analysis_reports else "• ไม่มีหุ้นในพอร์ต")
         )
+
+    elif text == "สแกนหุ้น":
+        watchlist = portfolio.get("watchlist", [])
+        scanned_stocks = []
+        for sym in watchlist:
+            res = analyze_stock_deep(sym)
+            if res:
+                scanned_stocks.append((sym, res))
+        
+        # จัดอันดับตามคะแนนความน่าสนใจจากมากไปน้อย (Ranking)
+        scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
+        
+        scan_results = []
+        for rank, (sym, res) in enumerate(scanned_stocks, 1):
+            vol_text = " 🔥 [Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
+            reasons_formatted = "\n    - ".join(res['reasons'])
+            cost_10_shares = res['buy_price'] * 10
+            
+            scan_results.append(
+                f"🏆 อันดับที่ {rank}: {sym} (คะแนนความน่าสนใจ: {res['score']}/100)\n"
+                f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿{vol_text}\n"
+                f"  - สถานะทางเทคนิค: [{res['action']}]\n"
+                f"  - 💡 เหตุผลควรเข้าซื้อ:\n    - {reasons_formatted}\n"
+                f"  - 📊 ระดับราคาตามกลยุทธ์:\n"
+                f"    * โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
+                f"    * จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
+                f"    * เป้าหมายทำกำไร (Take Profit): {res['take_profit']:.2f} ฿\n"
+                f"  - 🛒 **คำแนะนำการลงทุน: สั่งซื้อ 10 หุ้น**\n"
+                f"    (ใช้วงเงินประมาณ {cost_10_shares:,.2f} ฿)"
+            )
+        
+        reply_text = "📊 ผลสแกน Watchlist (จัดอันดับความน่าสนใจ):\n\n" + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
+
+    elif text.startswith("สแกน "):
+        if len(parts) >= 2:
+            symbol = parts[1].upper()
+            if not symbol.endswith(".BK"):
+                symbol += ".BK"
+            res = analyze_stock_deep(symbol)
+            if res:
+                vol_text = "มี (วอลุ่มหนาแน่นผิดปกติ ⚡)" if res['vol_spike'] else "ปกติ"
+                reasons_formatted = "\n  - ".join(res['reasons'])
+                cost_10_shares = res['buy_price'] * 10
+                reply_text = (
+                    f"🔎 แผนวิเคราะห์เจาะลึก [{symbol}]:\n"
+                    f"- คะแนนความน่าสนใจ: {res['score']}/100\n"
+                    f"- ราคาปัจจุบัน: {res['price']:.2f} ฿\n"
+                    f"- สถานะแนะนำ: [{res['action']}]\n\n"
+                    f"💡 เหตุผลการเข้าซื้อ:\n  - {reasons_formatted}\n\n"
+                    f"📊 ระดับราคาตามกลยุทธ์:\n"
+                    f"  - 🟢 โซนราคาเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
+                    f"  - 🔴 จุดตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
+                    f"  - 🎯 เป้าหมายทำกำไร: {res['take_profit']:.2f} ฿\n\n"
+                    f"🛒 **คำแนะนำการลงทุน: สั่งซื้อ 10 หุ้น**\n"
+                    f"  (ใช้วงเงินประมาณ {cost_10_shares:,.2f} ฿)\n\n"
+                    f"📌 ข้อมูลตัวชี้วัด:\n"
+                    f"  - RSI: {res['rsi']:.1f} | MACD Hist: {res['macd_hist']:.2f}\n"
+                    f"  - Volume Surge: {vol_text}"
+                )
+            else:
+                reply_text = f"❌ ไม่สามารถดึงข้อมูลหุ้น {symbol} ได้ หรือชื่อหุ้นไม่ถูกต้อง"
+        else:
+            reply_text = "❌ รูปแบบไม่ถูกต้อง (ตัวอย่าง: สแกน PTT)"
 
     elif text in ["ช่วยเหลือ", "help", "คำสั่ง"]:
         reply_text = (
-            "📋 คู่มือคำสั่งบอตวางแผนการเงิน:\n"
+            "📋 คู่มือคำสั่งบอตวางแผนการลงทุน:\n"
             "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
-            "2. วิเคราะห์พอร์ต -> คำแนะนำซื้อ/ขายตามเทคนิคและ Stop Loss\n"
-            "3. สแกนหุ้น -> ตรวจสอบสัญญาณ Watchlist (RSI/MACD/EMA)\n"
-            "4. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
-            "   (เช่น ซื้อ PTT.BK 10 35.0 20)\n"
-            "5. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
-            "   (เช่น ขาย PTT.BK 10 38.0 20)\n"
-            "6. รายการติดตาม / ติดตาม [หุ้น] / เลิกติดตาม [หุ้น]"
+            "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต\n"
+            "3. สแกนหุ้น -> จัดอันดับ Watchlist พร้อมเหตุผลและสั่ง 10 หุ้น\n"
+            "4. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
+            "5. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
+            "6. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
+            "7. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
         )
 
     elif text == "รายการติดตาม":
         watchlist = portfolio.get("watchlist", [])
         reply_text = "📋 รายชื่อหุ้นในระบบติดตาม:\n" + ", ".join(watchlist) if watchlist else "ยังไม่มีหุ้นในรายการติดตาม"
-
-    elif text == "สแกนหุ้น":
-        watchlist = portfolio.get("watchlist", [])
-        scan_results = []
-        for sym in watchlist:
-            try:
-                df = yf.Ticker(sym).history(period='60d')
-                if not df.empty and len(df) >= 30:
-                    latest = df['Close'].iloc[-1]
-                    rsi = calculate_rsi(df)
-                    hist = calculate_macd(df)[2]
-                    ema50 = calculate_ema(df, 50)
-                    
-                    status = "ปกติ"
-                    if rsi < 35 and hist > 0:
-                        status = "สัญญาณกลับตัว (Oversold+MACD ตัดขึ้น)"
-                    elif rsi > 70:
-                        status = "ระวัง Overbought"
-                    elif latest > ema50 and hist > 0:
-                        status = "ขาขึ้นแข็งแกร่ง"
-                    
-                    scan_results.append(f"- {sym}: {latest:.2f} ฿ | RSI: {rsi:.1f} [{status}]")
-            except:
-                scan_results.append(f"- {sym}: ข้อมูลผิดพลาด")
-        reply_text = "📈 ผลวิเคราะห์ Watchlist:\n" + ("\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
 
     elif text.startswith("ติดตาม "):
         if len(parts) >= 2:
