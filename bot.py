@@ -42,7 +42,6 @@ def clean_symbol_display(symbol):
     return symbol.replace(".BK", "")
 
 def check_set_market_trend():
-    """เทคนิคที่ 1: ตรวจสอบแนวโน้มตลาดรวม SET Index (^SET)"""
     try:
         df_set = yf.Ticker("^SET").history(period="60d")
         if df_set.empty:
@@ -287,8 +286,48 @@ def analyze_stock_deep(portfolio, symbol):
         print(f"Error analyzing {symbol}: {e}")
         return None
 
+def analyze_momentum_breakout(symbol):
+    """ฟังก์ชันสแกนหุ้นซิ่งแบบ Momentum Breakout (เบรกแนวต้าน 20 วัน + Volume พุ่ง 2 เท่า)"""
+    formatted_sym = format_symbol(symbol)
+    try:
+        df = yf.Ticker(formatted_sym).history(period='40d')
+        if df.empty or len(df) < 25:
+            return None
+        
+        cur_price = df['Close'].iloc[-1]
+        high_20 = df['High'].iloc[-21:-1].max()
+        cur_vol = df['Volume'].iloc[-1]
+        avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
+        
+        vol_ratio = (cur_vol / avg_vol_20) if avg_vol_20 > 0 else 1.0
+        is_breakout = (cur_price >= high_20 * 0.995) and (vol_ratio >= 2.0)
+        
+        suggested_buy_price = round(cur_price, 2)
+        suggested_stop_loss = round(cur_price * 0.97, 2)  # ตัดขาดทุนกระชับ 3% สำหรับหุ้นซิ่ง
+        suggested_take_profit = round(cur_price * 1.08, 2) # เป้าหมายสั้น 8%
+        
+        reasons = []
+        if is_breakout:
+            reasons.append(f"🔥 สัญญาณ Breakout ชัดเจน: ราคาเบรกแนวต้าน 20 วันที่ {high_20:.2f} ฿")
+            reasons.append(f"⚡ ปริมาณซื้อขายหนาแน่นพุ่งสูงกว่าค่าเฉลี่ย {vol_ratio:.1f} เท่า (Volume Surge ≥ 2x)")
+        else:
+            reasons.append(f"⏳ ยังไม่เข้าเกณฑ์หุ้นซิ่ง (ราคาปัจจุบัน {cur_price:.2f} ฿ | แนวต้าน 20 วัน: {high_20:.2f} ฿ | Volume: {vol_ratio:.1f}x)")
+            
+        return {
+            "price": cur_price,
+            "high_20": high_20,
+            "vol_ratio": vol_ratio,
+            "is_breakout": is_breakout,
+            "reasons": reasons,
+            "buy_price": suggested_buy_price,
+            "stop_loss": suggested_stop_loss,
+            "take_profit": suggested_take_profit
+        }
+    except Exception as e:
+        print(f"Error breakout scan {symbol}: {e}")
+        return None
+
 def calculate_trade_statistics(portfolio):
-    """เทคนิคที่ 3: คำนวณสถิติการเทรดและ Win Rate จากประวัติจริง"""
     transactions = portfolio.get("transactions", [])
     sells = [t for t in transactions if t.get("type") == "SELL"]
     if not sells:
@@ -395,7 +434,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Advanced Techniques Active) is running!"
+    return "Financial Advisor Trading Bot (Momentum Breakout Active) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -493,7 +532,6 @@ def handle_message(event):
                 total_stock_value += shares * res['price']
                 pl_pct = ((res['price'] - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
                 
-                # เทคนิคที่ 2: Trailing Stop / ปรับจุด Stop Loss เลื่อนขึ้นอัตโนมัติเมื่อมีกำไร
                 if res['price'] > avg_cost * 1.05:
                     new_trailing_sl = round(res['price'] * 0.96, 2)
                     if new_trailing_sl > sl:
@@ -567,6 +605,41 @@ def handle_message(event):
                 + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
             )
 
+        elif text == "สแกนหุ้นซิ่ง":
+            watchlist = portfolio.get("watchlist", [])
+            breakout_results = []
+            for sym in watchlist:
+                res = analyze_momentum_breakout(sym)
+                if res:
+                    breakout_results.append((clean_symbol_display(sym), res))
+            
+            breakout_results.sort(key=lambda x: (x[1]['is_breakout'], x[1]['vol_ratio']), reverse=True)
+            
+            results_text = []
+            for sym, res in breakout_results:
+                status_icon = "🚀 [หุ้นซิ่งเข้าเกณฑ์ Breakout]" if res['is_breakout'] else "⏳ [ยังไม่เบรกแนวต้าน]"
+                reasons_formatted = "\n    - ".join(res['reasons'])
+                rec_shares = calculate_dynamic_position_size(portfolio, res['buy_price'], res['stop_loss'])
+                est_cost = res['buy_price'] * rec_shares
+                
+                results_text.append(
+                    f"🔥 {sym} {status_icon}\n"
+                    f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (แนวต้าน 20 วัน: {res['high_20']:.2f} ฿)\n"
+                    f"  - อัตราส่วน Volume: {res['vol_ratio']:.1f}x ของค่าเฉลี่ย\n"
+                    f"  - 💡 สถานะ:\n    - {reasons_formatted}\n"
+                    f"  - 📊 แผนเทรดสั้น (หุ้นซิ่ง):\n"
+                    f"    * จุดเข้าซื้อ: {res['buy_price']:.2f} ฿\n"
+                    f"    * ตัดขาดทุนด่วน (Stop Loss): {res['stop_loss']:.2f} ฿\n"
+                    f"    * ทำกำไรเร็ว (Take Profit): {res['take_profit']:.2f} ฿\n"
+                    f"    * แนะนำซื้อตามแผน: {rec_shares} หุ้น (ประมาณ {est_cost:,.2f} ฿)"
+                )
+            
+            reply_text = (
+                "🚀 ผลสแกนหุ้นซิ่ง (Momentum Breakout Strategy)\n"
+                "⏱️ (เน้นเก็งกำไรสั้น 1-3 วัน จากการเบรกแนวต้านและ Volume พุ่ง 2 เท่าขึ้นไป):\n\n"
+                + ("\n\n".join(results_text) if results_text else "ยังไม่มีหุ้นใน Watchlist")
+            )
+
         elif text == "วิเคราะห์อุตสาหกรรม":
             reply_text = generate_sector_analysis_text(portfolio)
 
@@ -613,13 +686,14 @@ def handle_message(event):
                 "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
                 "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นพร้อม Trailing Stop\n"
                 "3. สแกนหุ้น -> สแกน Watchlist พร้อมเช็ก SET Trend\n"
-                "4. วิเคราะห์อุตสาหกรรม -> จัดกลุ่มหุ้นแยกตาม Sector\n"
-                "5. สรุปหุ้นวันนี้ -> สรุป Top 5 หุ้นเด่นประจำวัน\n"
-                "6. สถิติการเทรด -> ดูอัตรา Win Rate และ Profit Factor\n"
-                "7. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
-                "8. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อ\n"
-                "9. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขาย\n"
-                "10. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
+                "4. สแกนหุ้นซิ่ง -> สแกนเก็งกำไรระยะสั้น (Momentum Breakout)\n"
+                "5. วิเคราะห์อุตสาหกรรม -> จัดกลุ่มหุ้นแยกตาม Sector\n"
+                "6. สรุปหุ้นวันนี้ -> สรุป Top 5 หุ้นเด่นประจำวัน\n"
+                "7. สถิติการเทรด -> ดูอัตรา Win Rate และ Profit Factor\n"
+                "8. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
+                "9. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อ\n"
+                "10. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขาย\n"
+                "11. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
             )
 
         elif text == "รายการติดตาม":
