@@ -41,12 +41,28 @@ def format_symbol(symbol):
 def clean_symbol_display(symbol):
     return symbol.replace(".BK", "")
 
+def check_set_market_trend():
+    """เทคนิคที่ 1: ตรวจสอบแนวโน้มตลาดรวม SET Index (^SET)"""
+    try:
+        df_set = yf.Ticker("^SET").history(period="60d")
+        if df_set.empty:
+            return True, "🟢 ตลาดรวม: ปกติ (ไม่พบข้อมูลดัชนีสำรอง)"
+        
+        set_price = df_set['Close'].iloc[-1]
+        set_ema50 = df_set['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
+        
+        if set_price < set_ema50:
+            return False, "⚠️ คำเตือนตลาดรวม: SET Index อยู่ต่ำกว่าเส้น EMA 50 (ตลาดอยู่ในภาวะขาลง ระมัดระวังการซื้อเป็นพิเศษ)"
+        else:
+            return True, "🟢 ตลาดรวม: SET Index โครงสร้างขาขึ้นแข็งแกร่ง (ปลอดภัยต่อการลงทุน)"
+    except:
+        return True, "🟢 ตลาดรวม: โครงสร้างปกติ"
+
 def get_stock_sector(symbol):
     try:
         info = yf.Ticker(symbol).info
         sector = info.get('sector', None)
         if not sector:
-            # Fallback ฐานข้อมูลอุตสาหกรรมหุ้นไทยยอดนิยม
             sector_map = {
                 "PTT.BK": "Energy (พลังงาน)", "PTTEP.BK": "Energy (พลังงาน)", "TOP.BK": "Energy (พลังงาน)", "BCP.BK": "Energy (พลังงาน)",
                 "ADVANC.BK": "Communication (สื่อสาร)", "TRUE.BK": "Communication (สื่อสาร)",
@@ -58,7 +74,6 @@ def get_stock_sector(symbol):
             }
             sector = sector_map.get(symbol, "General / Others (ทั่วไป)")
         else:
-            # แปลงชื่อ Sector สากลให้เข้าใจง่ายขึ้น
             sector_translations = {
                 "Energy": "Energy (พลังงาน)",
                 "Financial Services": "Financial Services (การเงิน/ธนาคาร)",
@@ -272,6 +287,33 @@ def analyze_stock_deep(portfolio, symbol):
         print(f"Error analyzing {symbol}: {e}")
         return None
 
+def calculate_trade_statistics(portfolio):
+    """เทคนิคที่ 3: คำนวณสถิติการเทรดและ Win Rate จากประวัติจริง"""
+    transactions = portfolio.get("transactions", [])
+    sells = [t for t in transactions if t.get("type") == "SELL"]
+    if not sells:
+        return "📊 ยังไม่มีประวัติการขายทำกำไร/ขาดทุนเพื่อคำนวณสถิติ (ลองบันทึกการขายก่อน)"
+    
+    total_trades = len(sells)
+    winning_trades = [t for t in sells if t.get("realized_pnl", 0) > 0]
+    losing_trades = [t for t in sells if t.get("realized_pnl", 0) <= 0]
+    
+    win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+    total_profit = sum(t.get("realized_pnl", 0) for t in winning_trades)
+    total_loss = abs(sum(t.get("realized_pnl", 0) for t in losing_trades))
+    
+    profit_factor = (total_profit / total_loss) if total_loss > 0 else (total_profit if total_profit > 0 else 0)
+    
+    return (
+        f"📊 สถิติประสิทธิภาพการเทรดของคุณ:\n"
+        f"- จำนวนครั้งที่เทรดขาย: {total_trades} ครั้ง\n"
+        f"- ชนะ (Win): {len(winning_trades)} ครั้ง | แพ้ (Loss): {len(losing_trades)} ครั้ง\n"
+        f"- 🎯 **Win Rate:** {win_rate:.1f}%\n"
+        f"- กำไรรวม: +{total_profit:,.2f} ฿\n"
+        f"- ขาดทุนรวม: -{total_loss:,.2f} ฿\n"
+        f"- 📈 **Profit Factor:** {profit_factor:.2f} (ค่าที่ดีควรมากกว่า 1.5)"
+    )
+
 def generate_sector_analysis_text(portfolio):
     watchlist = portfolio.get("watchlist", ["ADVANC.BK", "PTT.BK", "AOT.BK", "KBANK.BK", "CPALL.BK"])
     sectors_dict = {}
@@ -287,11 +329,11 @@ def generate_sector_analysis_text(portfolio):
     if not sectors_dict:
         return "❌ ไม่พบข้อมูลหุ้นใน Watchlist สำหรับจัดหมวดหมู่อุตสาหกรรม"
         
-    msg = ["🏭 รายงานวิเคราะห์รายอุตสาหกรรม (Sector Analysis)\n⏱️ (อ้างอิงข้อมูล Watchlist ปัจจุบัน):\n"]
+    set_ok, set_msg = check_set_market_trend()
+    msg = [f"🏭 รายงานวิเคราะห์รายอุตสาหกรรม (Sector Analysis)\n{set_msg}\n⏱️ (อ้างอิงข้อมูล Watchlist):\n"]
     
     for sector_name, stocks in sectors_dict.items():
         msg.append(f"📂 **หมวด: {sector_name}**")
-        # เรียงลำดับหุ้นในหมวดตามคะแนน
         stocks.sort(key=lambda x: x[1]['score'], reverse=True)
         for sym, res in stocks:
             vol_icon = "🔥" if res['vol_spike'] else ""
@@ -300,7 +342,7 @@ def generate_sector_analysis_text(portfolio):
                 f"    สถานะ: [{res['action']}] (คะแนน: {res['score']}/100)\n"
                 f"    โซนซื้อ: {res['buy_price']:.2f} ฿ | เป้าขาย: {res['take_profit']:.2f} ฿"
             )
-        msg.append("") # เว้นบรรทัด
+        msg.append("")
         
     return "\n".join(msg)
 
@@ -312,13 +354,14 @@ def generate_top5_summary_text(portfolio):
         if res and res['action'] != "❌ ห้ามซื้อเด็ดขาด":
             scanned_stocks.append((clean_symbol_display(sym), res))
     
+    set_ok, set_msg = check_set_market_trend()
     if not scanned_stocks:
-        return "⚠️ วันนี้ไม่มีหุ้นใน Watchlist ที่ผ่านเกณฑ์ความปลอดภัย (ติดกฎเหล็กห้ามซื้อทั้งหมด)"
+        return f"🌅 สรุปหุ้นวันนี้\n{set_msg}\n\n⚠️ วันนี้ไม่มีหุ้นใน Watchlist ที่ผ่านเกณฑ์ความปลอดภัย (ติดกฎเหล็กห้ามซื้อทั้งหมด)"
         
     scanned_stocks.sort(key=lambda x: x[1]['score'], reverse=True)
     top5 = scanned_stocks[:5]
     
-    msg = ["🌅 สรุป 5 หุ้นน่าซื้อประจำวัน (ผ่านกฎเหล็กความปลอดภัย)\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
+    msg = [f"🌅 สรุปหุ้นวันนี้\n{set_msg}\n⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n"]
     for rank, (sym, res) in enumerate(top5, 1):
         vol_text = " 🔥[Volume พุ่งหนาแน่น]" if res['vol_spike'] else ""
         est_cost = res['buy_price'] * res['rec_shares']
@@ -352,7 +395,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Sector Analysis Active) is running!"
+    return "Financial Advisor Trading Bot (Advanced Techniques Active) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -449,6 +492,15 @@ def handle_message(event):
                 
                 total_stock_value += shares * res['price']
                 pl_pct = ((res['price'] - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+                
+                # เทคนิคที่ 2: Trailing Stop / ปรับจุด Stop Loss เลื่อนขึ้นอัตโนมัติเมื่อมีกำไร
+                if res['price'] > avg_cost * 1.05:
+                    new_trailing_sl = round(res['price'] * 0.96, 2)
+                    if new_trailing_sl > sl:
+                        sl = new_trailing_sl
+                        info['stop_loss'] = sl
+                        update_user_portfolio(user_id, portfolio)
+
                 reason_text = "\n    - ".join(res['reasons'])
                 
                 if res['price'] <= sl or res['action'] == "SELL":
@@ -456,7 +508,7 @@ def handle_message(event):
                         f"🚨 [{display_sym}] ({res['sector']})\n"
                         f"  - แนะนำ: 🔴 ขาย / ลดพอร์ต\n"
                         f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
-                        f"  - จุดตัดขาดทุน: {sl:.2f} ฿\n"
+                        f"  - จุดตัดขาดทุน (Trailing Stop): {sl:.2f} ฿\n"
                         f"  - เหตุผล:\n    - {reason_text}"
                     )
                 else:
@@ -465,6 +517,7 @@ def handle_message(event):
                         f"  - แนะนำ: 🟢 ถือต่อ / ทยอยสะสม\n"
                         f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ (กำไร/ขาดทุน: {pl_pct:+.2f}%)\n"
                         f"  - โซนซื้อเพิ่ม: {res['buy_price']:.2f} ฿ | เป้าทำกำไร: {res['take_profit']:.2f} ฿\n"
+                        f"  - จุด Stop Loss ป้องกันกำไร: {sl:.2f} ฿\n"
                         f"  - เหตุผล:\n    - {reason_text}"
                     )
 
@@ -474,10 +527,11 @@ def handle_message(event):
             reply_text = (
                 f"🧠 วิเคราะห์พอร์ตตามแผนการเงิน:\n"
                 f"- ความคืบหน้าสู่เป้าหมาย: {progress:.1f}% ({total_portfolio:,.2f} / {target:,.2f} ฿)\n\n"
-                f"📋 หุ้นในพอร์ตของคุณ:\n\n" + ("\n\n".join(analysis_reports) if analysis_reports else "• ไม่มีหุ้นในพอร์ต")
+                f"📋 หุ้นในพอร์ตของคุณ (เปิดใช้งานระบบ Trailing Stop):\n\n" + ("\n\n".join(analysis_reports) if analysis_reports else "• ไม่มีหุ้นในพอร์ต")
             )
 
         elif text == "สแกนหุ้น":
+            set_ok, set_msg = check_set_market_trend()
             watchlist = portfolio.get("watchlist", [])
             scanned_stocks = []
             for sym in watchlist:
@@ -507,8 +561,9 @@ def handle_message(event):
                 )
             
             reply_text = (
-                "📊 ผลสแกน Watchlist (ตรวจสอบ 4 กฎเหล็กความปลอดภัย)\n"
-                "⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
+                f"📊 ผลสแกน Watchlist (ตรวจสอบ 4 กฎเหล็ก)\n"
+                f"{set_msg}\n"
+                f"⏱️ (อ้างอิงข้อมูลราคาปิดย้อนหลัง 60 วันทำการ):\n\n"
                 + ("\n\n".join(scan_results) if scan_results else "ยังไม่มีหุ้นใน Watchlist")
             )
 
@@ -517,6 +572,9 @@ def handle_message(event):
 
         elif text == "สรุปหุ้นวันนี้":
             reply_text = generate_top5_summary_text(portfolio)
+
+        elif text == "สถิติการเทรด":
+            reply_text = calculate_trade_statistics(portfolio)
 
         elif text.startswith("สแกน "):
             if len(parts) >= 2:
@@ -553,14 +611,15 @@ def handle_message(event):
             reply_text = (
                 "📋 คู่มือคำสั่งบอตวางแผนการลงทุน:\n"
                 "1. ดูพอร์ต -> ตรวจสอบเงินสด มูลค่าพอร์ต และเป้าหมาย\n"
-                "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นในพอร์ต (พร้อมบอกหมวดอุตสาหกรรม)\n"
-                "3. สแกนหุ้น -> สแกน Watchlist พร้อมตรวจ 4 กฎเหล็ก\n"
-                "4. วิเคราะห์อุตสาหกรรม -> จัดกลุ่มหุ้นใน Watchlist แยกตามหมวด Sector\n"
-                "5. สรุปหุ้นวันนี้ -> สรุป Top 5 เฉพาะตัวที่ผ่านกฎเหล็ก\n"
-                "6. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
-                "7. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อจริง\n"
-                "8. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขายจริง\n"
-                "9. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
+                "2. วิเคราะห์พอร์ต -> สรุปแผนจัดการหุ้นพร้อม Trailing Stop\n"
+                "3. สแกนหุ้น -> สแกน Watchlist พร้อมเช็ก SET Trend\n"
+                "4. วิเคราะห์อุตสาหกรรม -> จัดกลุ่มหุ้นแยกตาม Sector\n"
+                "5. สรุปหุ้นวันนี้ -> สรุป Top 5 หุ้นเด่นประจำวัน\n"
+                "6. สถิติการเทรด -> ดูอัตรา Win Rate และ Profit Factor\n"
+                "7. สแกน [หุ้น] -> เจาะลึกรายตัว (เช่น สแกน PTT)\n"
+                "8. ซื้อ [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกซื้อ\n"
+                "9. ขาย [หุ้น] [จำนวน] [ราคา] [ค่าธรรมเนียม] -> บันทึกขาย\n"
+                "10. ติดตาม [หุ้น] / เลิกติดตาม [หุ้น] / รายการติดตาม"
             )
 
         elif text == "รายการติดตาม":
