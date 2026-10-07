@@ -1062,6 +1062,103 @@ def combined_universe(portfolio):
     )
 
 
+def build_buy_today_report(portfolio):
+    symbols = combined_universe(portfolio)
+    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
+    market_regime = get_market_regime(frames)
+    equity, _ = estimate_portfolio_equity(portfolio, frames)
+    risk_status = portfolio_risk_status(portfolio, equity)
+
+    results = []
+    for symbol in symbols:
+        result = analyze_swing_symbol(symbol, frames.get(symbol), market_regime)
+        if result and result["action"] == "BUY" and result["score"] >= 70:
+            quantity = calculate_position_size(portfolio, equity, result["entry_price"], result["stop_loss"])
+            result["quantity"] = quantity
+            results.append(result)
+
+    results.sort(key=lambda x: (x["score"], x["volume_ratio"]), reverse=True)
+    results = results[:5]
+
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    lines = [
+        f"🎯 หุ้นควรซื้อวันนี้ ({today_str})",
+        f"ตลาดรวม: {market_regime['message']}",
+        f"มูลค่าพอร์ต: {equity:,.2f} บาท\n",
+    ]
+
+    if risk_status["paused"]:
+        lines.append("⚠️ พอร์ตถึงเกณฑ์หยุดเพิ่มความเสี่ยง ไม่แนะนำให้เปิดสถานะซื้อเพิ่ม\n")
+
+    if not results:
+        lines.append("❌ วันนี้ยังไม่มีหุ้นตัวใดเข้าเงื่อนไขสถานะ BUY ที่แข็งแกร่งพอ แนะนำให้ถือเงินสดรอดูท่าทีตลาด")
+        return "\n".join(lines)
+
+    for idx, res in enumerate(results, 1):
+        reasons_text = "\n  - ".join(res["reasons"])
+        est_cost = res["entry_price"] * res["quantity"]
+        lines.extend([
+            f"{idx}. {display_symbol(res['symbol'])} [{res['sector']}] (คะแนน: {res['score']}/100)",
+            f"  - ราคาปัจจุบัน: {res['price']:.2f} ฿ | Volume: {res['volume_ratio']:.2f}x",
+            f"  - 📍 จุดเข้าซื้อ: {res['entry_price']:.2f} ฿",
+            f"  - 🛑 ตัดขาดทุน (Stop Loss): {res['stop_loss']:.2f} ฿",
+            f"  - 🎯 เป้าทำกำไร (2R): {res['target_price']:.2f} ฿",
+            f"  - 📊 ขนาดที่ควรซื้อ: {res['quantity']} หุ้น (~{est_cost:,.2f} ฿)",
+            f"  - 💡 เหตุผลสนับสนุน:\n  - {reasons_text}\n"
+        ])
+
+    lines.append("⚠️ คำเตือน: สัญญาณวิเคราะห์เชิงปริมาณ ไม่รับประกันผลตอบแทน")
+    return "\n".join(lines)
+
+
+def check_portfolio_sell_alerts(portfolio, frames=None):
+    stocks = portfolio.get("stocks", {})
+    if not stocks:
+        return ""
+
+    symbols = list(stocks.keys())
+    if frames is None:
+        frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
+
+    market_regime = get_market_regime(frames)
+    alerts = []
+
+    for symbol, info in stocks.items():
+        display_sym = display_symbol(symbol)
+        shares = int(info.get("shares", 0))
+        avg_cost = safe_float(info.get("average_cost"), 0)
+        stop_loss = safe_float(info.get("stop_loss"), avg_cost * 0.95)
+
+        frame = frames.get(symbol)
+        res = analyze_swing_symbol(symbol, frame, market_regime) if frame is not None else None
+
+        current_price = res["price"] if res else avg_cost
+        pnl_pct = ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+
+        should_sell = False
+        reasons = []
+
+        if current_price <= stop_loss:
+            should_sell = True
+            reasons.append(f"ราคาปัจจุบัน ({current_price:.2f} ฿) ร่วงหลุดจุด Stop Loss ที่ตั้งไว้ ({stop_loss:.2f} ฿)")
+
+        if res and res["action"] in {"SELL", "REJECT"}:
+            should_sell = True
+            reasons.append(f"โครงสร้างทางเทคนิคเปลี่ยนเป็น [{res['action']}] (คะแนน: {res['score']}/100)")
+            for r in res["reasons"][:2]:
+                reasons.append(f"  - {r}")
+
+        if should_sell:
+            reason_str = "\n".join(reasons)
+            alerts.append(
+                f"🚨 หุ้นในพอร์ตควรขาย: {display_sym} ({shares} หุ้น)\n"
+                f"  - ต้นทุนเฉลี่ย: {avg_cost:.2f} ฿ | ล่าสุด: {current_price:.2f} ฿ (P/L: {pnl_pct:+.2f}%)\n"
+                f"  - เหตุผลที่ควรขาย:\n{reason_str}"
+            )
+
+    return "\n\n".join(alerts)
+
+
 def build_swing_report(portfolio, symbols, title, limit=10):
     symbols = unique_symbols(symbols)
 
@@ -1321,7 +1418,6 @@ def build_single_stock_report(portfolio, symbol):
         for reason in result["reasons"]
     )
 
-    # ตรวจสอบสถานะในพอร์ตของผู้ใช้เพื่อสรุปคำแนะนำการจัดการ
     holding_info = portfolio.get("stocks", {}).get(formatted_symbol)
     conclusion_lines = ["\n💡 สรุปคำแนะนำการลงทุนรายตัว:"]
 
@@ -1382,7 +1478,7 @@ def build_portfolio_report(user_id, update_trailing=False):
     stocks = portfolio.get("stocks", {})
     symbols = list(stocks.keys())
 
-    frames = get_market_frames(symbols)
+    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
     equity, stock_value = estimate_portfolio_equity(
         portfolio,
         frames,
@@ -1413,6 +1509,11 @@ def build_portfolio_report(user_id, update_trailing=False):
             else "สถานะความเสี่ยง: ปกติ"
         ),
     ]
+
+    # ตรวจสอบแจ้งเตือนหุ้นที่ควรขายในพอร์ต
+    sell_alerts = check_portfolio_sell_alerts(portfolio, frames)
+    if sell_alerts:
+        lines.extend(["", "🚨 แจ้งเตือนด่วน:", sell_alerts])
 
     if not stocks:
         lines.extend(["", "ยังไม่มีหุ้นในพอร์ต"])
@@ -1475,9 +1576,9 @@ def build_portfolio_report(user_id, update_trailing=False):
             changed = True
 
         status = (
-            "ถึงจุด Stop"
+            "⚠️ ถึงจุด Stop (ควรขาย)"
             if price <= stop_loss
-            else "ถือตามแผน"
+            else "✅ ถือตามแผน"
         )
 
         lines.extend(
@@ -1586,6 +1687,8 @@ def run_scan_job(user_id, job_type, payload=None):
                 "สรุปหุ้นวันนี้: Top 5",
                 limit=5,
             )
+        elif job_type == "buy_today":
+            result = build_buy_today_report(portfolio)
         elif job_type == "scan":
             result = build_swing_report(
                 portfolio,
@@ -1823,14 +1926,27 @@ def process_sell(portfolio, symbol, shares, price, fee):
 
 
 # =========================================================
-# SCHEDULER
+# SCHEDULER (AUTOMATED NOTIFICATIONS)
 # =========================================================
 
 def scheduled_morning_summary():
-    logger.info("เริ่มงานสรุปหุ้นประจำวัน")
+    logger.info("เริ่มงานสรุปหุ้นประจำวันและตรวจสอบแจ้งเตือนพอร์ต")
 
     for user_id in get_registered_users():
-        queue_scan(user_id, "summary")
+        try:
+            portfolio = get_user_portfolio(user_id)
+            # ส่งสรุปหุ้น Top 5 ตามปกติ
+            queue_scan(user_id, "summary")
+
+            # ตรวจสอบว่ามีหุ้นตัวใดในพอร์ตที่ควรขายด่วนหรือไม่ ถ้ามีให้ส่งแจ้งเตือนอัตโนมัติ
+            sell_alerts = check_portfolio_sell_alerts(portfolio)
+            if sell_alerts:
+                push_long_message(
+                    user_id,
+                    "🚨 ระบบแจ้งเตือนอัตโนมัติ:\n\n" + sell_alerts
+                )
+        except Exception:
+            logger.exception(f"Scheduled morning task failed for {user_id}")
 
 
 scheduler = None
@@ -1934,6 +2050,14 @@ def handle_message(event):
             accepted = queue_scan(user_id, "summary")
             reply_text = (
                 "กำลังจัดทำสรุปหุ้นวันนี้ ระบบจะส่งผลกลับมาเมื่อเสร็จ"
+                if accepted
+                else "ระบบกำลังประมวลผลคำสั่งนี้อยู่แล้ว"
+            )
+
+        elif text in {"ควรซื้อวันนี้", "ซื้อวันนี้"}:
+            accepted = queue_scan(user_id, "buy_today")
+            reply_text = (
+                "กำลังคัดกรองหุ้นที่ควรซื้อวันนี้ ระบบจะส่งผลกลับมาเมื่อเสร็จ"
                 if accepted
                 else "ระบบกำลังประมวลผลคำสั่งนี้อยู่แล้ว"
             )
@@ -2146,24 +2270,22 @@ def handle_message(event):
 
         elif text in {"ช่วยเหลือ", "help", "คำสั่ง"}:
             reply_text = (
-                "คำสั่งของบอต\n"
+                "คำสั่งของบอต:\n"
                 "1. ดูพอร์ต\n"
-                "2. วิเคราะห์พอร์ต\n"
+                "2. วิเคราะห์พอร์ต (เช็กจุดขายอัตโนมัติ)\n"
                 "3. สรุปหุ้นวันนี้\n"
-                "4. สแกนหุ้น\n"
-                "5. สแกน SET50\n"
-                "6. สแกนหุ้นซิ่ง\n"
-                "7. วิเคราะห์ PTT (หรือ สแกน PTT)\n"
-                "8. รายการติดตาม\n"
-                "9. ติดตาม PTT\n"
-                "10. เลิกติดตาม PTT\n"
-                "11. ซื้อ PTT 100 35.50 10\n"
-                "12. ขาย PTT 100 38.00 10\n"
-                "13. ฝากเงิน 1000\n"
-                "14. ตั้งเป้าหมาย 20000 3\n"
-                "15. สถิติการเทรด\n\n"
-                "การสแกนหุ้นใช้ข้อมูลเชิงเทคนิค "
-                "ไม่ได้รับประกันกำไรหรือดำเนินการซื้อขายจริง"
+                "4. ควรซื้อวันนี้ (ใหม่!)\n"
+                "5. สแกนหุ้น\n"
+                "6. สแกน SET50\n"
+                "7. สแกนหุ้นซิ่ง\n"
+                "8. วิเคราะห์ PTT (หรือ สแกน PTT)\n"
+                "9. รายการติดตาม\n"
+                "10. ติดตาม / เลิกติดตาม PTT\n"
+                "11. ซื้อ / ขาย PTT 100 35.50 10\n"
+                "12. ฝากเงิน 1000\n"
+                "13. ตั้งเป้าหมาย 20000 3\n"
+                "14. สถิติการเทรด\n\n"
+                "ระบบมีแจ้งเตือนอัตโนมัติเวลา 08:30 น."
             )
 
         else:
