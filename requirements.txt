@@ -1,6 +1,7 @@
-Flask
-line-bot-sdk
-pandas
-yfinance
-gunicorn
-APScheduler
+Flask>=3.0,<4
+gunicorn>=21,<24
+line-bot-sdk>=2.4,<3
+pandas>=2.1,<3
+numpy>=1.26,<3
+yfinance>=0.2.40,<1
+APScheduler>=3.10,<4
