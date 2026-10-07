@@ -60,9 +60,6 @@ TIMEZONE_NAME = os.getenv("TZ", "Asia/Bangkok")
 MAX_LINE_TEXT = 4500
 SCHEMA_VERSION = 2
 
-# รายการสำรองเท่านั้น สมาชิก SET50 มีการเปลี่ยนทุกครึ่งปี
-# สามารถกำหนดรายชื่อจริงผ่าน Environment Variable:
-# SET50_SYMBOLS=ADVANC,AOT,AWC,...
 FALLBACK_LARGE_CAP_SYMBOLS = [
     "ADVANC", "AOT", "AWC", "BANPU", "BBL",
     "BDMS", "BH", "BJC", "BTS", "CBG",
@@ -371,7 +368,6 @@ def normalize_portfolio(raw):
         existing_watchlist = []
 
     if old_schema < SCHEMA_VERSION:
-        # ย้ายข้อมูลเก่าโดยผสาน SET50 กับ Watchlist เดิมครั้งเดียว
         base["watchlist"] = unique_symbols(
             SET50_UNIVERSE + existing_watchlist
         )
@@ -475,7 +471,6 @@ def get_user_portfolio(user_id):
     with storage_lock:
         data = load_store_unlocked()
 
-        # รองรับ portfolio.json แบบเก่าที่ไม่ได้ครอบด้วย user_id
         if looks_like_single_portfolio(data):
             portfolio = normalize_portfolio(data)
             data = {user_id: portfolio}
@@ -796,8 +791,6 @@ def create_trade_levels(snapshot):
     structure_stop = snapshot["previous_low10"] * 0.995
 
     stop_loss = max(atr_stop, structure_stop)
-
-    # ป้องกัน Stop ที่ใกล้หรือไกลผิดปกติ
     stop_loss = min(stop_loss, price * 0.985)
     stop_loss = max(stop_loss, price * 0.92)
 
@@ -1932,10 +1925,11 @@ def handle_message(event):
                 else "ระบบกำลังสแกนหุ้นซิ่งอยู่แล้ว"
             )
 
-        elif text.startswith("สแกน "):
+        # รองรับทั้งคำว่า "สแกน [หุ้น]" และ "วิเคราะห์ [หุ้น]" (ยกเว้นคำว่า "วิเคราะห์พอร์ต")
+        elif text.startswith("สแกน ") or (text.startswith("วิเคราะห์ ") and text != "วิเคราะห์พอร์ต"):
             if len(parts) < 2:
                 raise ValueError(
-                    "ตัวอย่างคำสั่ง: สแกน PTT"
+                    "ตัวอย่างคำสั่ง: สแกน PTT หรือ วิเคราะห์ PTT"
                 )
 
             symbol = format_symbol(parts[1])
@@ -2122,7 +2116,7 @@ def handle_message(event):
                 "4. สแกนหุ้น\n"
                 "5. สแกน SET50\n"
                 "6. สแกนหุ้นซิ่ง\n"
-                "7. สแกน PTT\n"
+                "7. วิเคราะห์ PTT (หรือ สแกน PTT)\n"
                 "8. รายการติดตาม\n"
                 "9. ติดตาม PTT\n"
                 "10. เลิกติดตาม PTT\n"
