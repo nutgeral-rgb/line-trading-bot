@@ -1288,22 +1288,22 @@ def build_breakout_report(portfolio):
 
 
 def build_single_stock_report(portfolio, symbol):
-    symbol = format_symbol(symbol)
+    formatted_symbol = format_symbol(symbol)
 
     frames = get_market_frames(
-        [symbol, MARKET_INDEX_SYMBOL]
+        [formatted_symbol, MARKET_INDEX_SYMBOL]
     )
 
     market_regime = get_market_regime(frames)
     result = analyze_swing_symbol(
-        symbol,
-        frames.get(symbol),
+        formatted_symbol,
+        frames.get(formatted_symbol),
         market_regime,
     )
 
     if not result:
         return (
-            f"ไม่สามารถวิเคราะห์ {display_symbol(symbol)} ได้ "
+            f"ไม่สามารถวิเคราะห์ {display_symbol(formatted_symbol)} ได้ "
             "อาจไม่มีข้อมูลหรือชื่อหลักทรัพย์ไม่ถูกต้อง"
         )
 
@@ -1321,8 +1321,45 @@ def build_single_stock_report(portfolio, symbol):
         for reason in result["reasons"]
     )
 
+    # ตรวจสอบสถานะในพอร์ตของผู้ใช้เพื่อสรุปคำแนะนำการจัดการ
+    holding_info = portfolio.get("stocks", {}).get(formatted_symbol)
+    conclusion_lines = ["\n💡 สรุปคำแนะนำการลงทุนรายตัว:"]
+
+    if holding_info:
+        avg_cost = safe_float(holding_info.get("average_cost"), 0)
+        pnl_pct = ((result['price'] - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+        
+        if result['action'] == "REJECT" or result['price'] <= result['stop_loss']:
+            conclusion_lines.append(
+                f"• **คำแนะนำสำหรับคนมีหุ้นในพอร์ต:** 🔴 **ควรขายออก (SELL)**\n"
+                f"  - *เหตุผล:* ราคาปัจจุบันต่ำกว่าหรือแตะจุด Stop Loss ({result['stop_loss']:.2f} บาท) หรือสภาพเทคนิคเริ่มอ่อนแอ (P/L ปัจจุบัน {pnl_pct:+.2f}%) ควรขายล็อกกำไรหรือตัดขาดทุนเพื่อบริหารความเสี่ยง"
+            )
+        else:
+            conclusion_lines.append(
+                f"• **คำแนะนำสำหรับคนมีหุ้นในพอร์ต:** 🟢 **ควรถือต่อ (HOLD/TRAIL)**\n"
+                f"  - *เหตุผล:* ต้นทุนเฉลี่ยอยู่ที่ {avg_cost:.2f} บาท (P/L {pnl_pct:+.2f}%) โครงสร้างราคายังแข็งแกร่งยืนเหนือเส้นค่าเฉลี่ย ควรถือรันเทรนด์ไปเป้าหมายทำกำไรที่ {result['target_price']:.2f} บาท หรือถือลาก Stop Loss ตามระบบที่ {result['stop_loss']:.2f} บาท"
+            )
+    else:
+        if result['action'] == "BUY":
+            conclusion_lines.append(
+                f"• **คำแนะนำสำหรับคนยังไม่มีหุ้น:** 🟢 **ควรพิจารณาเข้าซื้อ (BUY)**\n"
+                f"  - *เหตุผล:* หุ้นผ่านเกณฑ์ความปลอดภัย คะแนนสูง ({result['score']}/100) และมี Volume หนาแน่น เหมาะสำหรับสะสมที่โซนราคา {result['entry_price']:.2f} บาท โดยมีจุดตัดขาดทุน (Stop Loss) ที่ {result['stop_loss']:.2f} บาท"
+            )
+        elif result['action'] == "WATCH":
+            conclusion_lines.append(
+                f"• **คำแนะนำสำหรับคนยังไม่มีหุ้น:** 🟡 **ควรเฝ้าระวัง (WATCH)**\n"
+                f"  - *เหตุผล:* สัญญาณยังอยู่ในเกณฑ์ใช้ได้แต่ยังไม่สมบูรณ์ ควรออรอดูกลุ่มราคาพักตัวใกล้แนวรับหรือรอจังหวะ Volume เข้าเพิ่มจึงค่อยตัดสินใจ"
+            )
+        else:
+            conclusion_lines.append(
+                f"• **คำแนะนำสำหรับคนยังไม่มีหุ้น:** 🔴 **ไม่แนะนำให้เข้าซื้อ (AVOID)**\n"
+                f"  - *เหตุผล:* หุ้นไม่ผ่านเกณฑ์ความปลอดภัยหรือโครงสร้างราคาอยู่ในขาลง หลีกเลี่ยงการเข้าลงทุนเพื่อความปลอดภัยของเงินทุน"
+            )
+
+    conclusion_text = "\n".join(conclusion_lines)
+
     return (
-        f"วิเคราะห์ {display_symbol(symbol)} [{result['sector']}]\n"
+        f"วิเคราะห์ {display_symbol(formatted_symbol)} [{result['sector']}]\n"
         f"ตลาดรวม: {market_regime['message']}\n"
         f"สถานะ: {result['action']} | คะแนน {result['score']}/100\n"
         f"ราคา: {result['price']:.2f} บาท\n"
@@ -1334,7 +1371,8 @@ def build_single_stock_report(portfolio, symbol):
         f"Stop Loss: {result['stop_loss']:.2f}\n"
         f"เป้าหมาย 2R: {result['target_price']:.2f}\n"
         f"จำนวนตามความเสี่ยง: {quantity} หุ้น\n"
-        f"เหตุผล:\n{reason_text}\n\n"
+        f"เหตุผล:\n{reason_text}\n"
+        f"{conclusion_text}\n\n"
         "ผลวิเคราะห์ไม่ใช่การรับประกันผลตอบแทน"
     )
 
@@ -1925,7 +1963,6 @@ def handle_message(event):
                 else "ระบบกำลังสแกนหุ้นซิ่งอยู่แล้ว"
             )
 
-        # รองรับทั้งคำว่า "สแกน [หุ้น]" และ "วิเคราะห์ [หุ้น]" (ยกเว้นคำว่า "วิเคราะห์พอร์ต")
         elif text.startswith("สแกน ") or (text.startswith("วิเคราะห์ ") and text != "วิเคราะห์พอร์ต"):
             if len(parts) < 2:
                 raise ValueError(
