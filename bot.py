@@ -19,7 +19,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 PORTFOLIO_FILE = 'portfolio.json'
 
-# รายชื่อหุ้นกลุ่ม SET50 มาตรฐานสำหรับเป็น Watchlist เริ่มต้นของระบบ
 SET50_WATCHLIST = [
     "PTT.BK", "PTTEP.BK", "TOP.BK", "BCP.BK", "ADVANC.BK", 
     "TRUE.BK", "AOT.BK", "AAV.BK", "BEM.BK", "KBANK.BK", 
@@ -118,12 +117,11 @@ def get_user_portfolio(user_id):
                 "risk_reward_ratio": 2.0
             },
             "stocks": {},
-            "watchlist": SET50_WATCHLIST.copy(), # บูรณาการ SET50 เป็น Watchlist เริ่มต้น
+            "watchlist": SET50_WATCHLIST.copy(),
             "transactions": []
         }
         save_data(data)
     else:
-        # อัปเดตผู้ใช้เดิมให้มี Watchlist ครบชุดหากยังเป็นรายการเก่า
         if "watchlist" not in data[user_id] or len(data[user_id]["watchlist"]) <= 5:
             data[user_id]["watchlist"] = SET50_WATCHLIST.copy()
             save_data(data)
@@ -325,7 +323,7 @@ def analyze_momentum_breakout(symbol):
 
 def calculate_trade_statistics(portfolio):
     transactions = portfolio.get("transactions", [])
-    sells = [t for t in transactions if t.get("type"] == "SELL"]
+    sells = [t for t in transactions if t.get("type") == "SELL"] # แก้ไขวงเล็บให้ถูกต้องแล้ว
     if not sells:
         return "📊 ยังไม่มีประวัติการขายทำกำไร/ขาดทุนเพื่อคำนวณสถิติ"
     total_trades = len(sells)
@@ -419,7 +417,7 @@ scheduler.start()
 
 @app.route("/", methods=['GET'])
 def home():
-    return "Financial Advisor Trading Bot (Integrated SET50 Watchlist) is running!"
+    return "Financial Advisor Trading Bot (Integrated SET50 Watchlist Fixed) is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
