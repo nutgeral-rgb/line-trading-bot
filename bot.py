@@ -61,7 +61,7 @@ TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 
 MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
 RISK_PROFILES = {
@@ -1204,7 +1204,7 @@ def build_plan_report(portfolio, frames=None):
 
 
 def calculate_trade_statistics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type"] == "SELL"]
+    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
     if not sells:
         return "ยังไม่มีธุรกรรมขายสำหรับคำนวณสถิติ"
 
