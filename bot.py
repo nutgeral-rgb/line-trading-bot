@@ -61,7 +61,7 @@ TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 
 MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
 RISK_PROFILES = {
@@ -773,7 +773,6 @@ def get_market_regime(frames):
         if index_snapshot else True
     )
 
-    # ตลาดกว้างแข็งแกร่งเมื่อหุ้นส่วนใหญ่ (>= 50%) ยืนเหนือ EMA 50
     breadth_healthy = breadth_pct >= 50.0
     overall_positive = index_positive and breadth_healthy
 
@@ -814,9 +813,8 @@ def compute_sector_rankings(frames):
         for sec in sector_performances if sector_counts[sec] > 0
     }
 
-    # จัดอันดับ Sector จากแรงส่งมากไปน้อย
     sorted_sectors = sorted(sector_averages.keys(), key=lambda x: sector_averages[x], reverse=True)
-    top_sectors = set(sorted_sectors[:3]) # Top 3 กลุ่มอุตสาหกรรมนำตลาด
+    top_sectors = set(sorted_sectors[:3])
     return top_sectors, sector_averages
 
 
@@ -903,12 +901,10 @@ def analyze_swing_symbol(symbol, frame, market_regime, top_sectors=None):
     else:
         reasons.append("ราคายังต่ำกว่า EMA50")
 
-    # เทคนิคที่ 2: Multi-Timeframe Weekly Trend
     if snapshot["is_weekly_up"]:
         score += 10
         reasons.append("โครงสร้างรายสัปดาห์ (Weekly) ขาขึ้นแข็งแกร่ง")
 
-    # เทคนิคที่ 1: Sector Rotation
     if top_sectors and sector in top_sectors:
         score += 12
         reasons.append(f"อยู่ในกลุ่มอุตสาหกรรมนำตลาด ({sector})")
@@ -936,12 +932,10 @@ def analyze_swing_symbol(symbol, frame, market_regime, top_sectors=None):
         score += 10
         reasons.append("ย่อตัวเข้าหาแนวรับ EMA20")
 
-    # เทคนิคที่ 3: Bollinger Squeeze
     if snapshot["is_squeeze"]:
         score += 10
         reasons.append("Bollinger Bands บีบตัวแคบ (Squeeze) เตรียมระเบิดราคา")
 
-    # เทคนิคที่ 5: Price Action Strong Close
     if snapshot["is_strong_close"]:
         score += 8
         reasons.append("แท่งเทียนปิดแข็งแกร่งบริเวณราคาสูงสุดของวัน")
@@ -1210,7 +1204,7 @@ def build_plan_report(portfolio, frames=None):
 
 
 def calculate_trade_statistics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
+    sells = [t for t in portfolio.get("transactions", []) if t.get("type"] == "SELL"]
     if not sells:
         return "ยังไม่มีธุรกรรมขายสำหรับคำนวณสถิติ"
 
@@ -1302,12 +1296,13 @@ def build_buy_today_report(portfolio):
         buy_fee = calculate_commission(cost)
         net_target = net_profit_after_fee(result["entry_price"], result["target_price"], quantity)
         reason_text = "\n  - ".join(result["reasons"][:5])
+        squeeze_text = "🔥 มีการบีบตัว" if result["is_squeeze"] else "ปกติ"
 
         lines.extend([
             "",
             f"{index}. {display_symbol(result['symbol'])} [{result['sector']}] "
             f"คะแนน {result['score']}/100",
-            f"  รูปแบบ: {result['setup_label']} | Squeeze: {'🔥 มีการบีบตัว' : 'ปกติ'}",
+            f"  รูปแบบ: {result['setup_label']} | Squeeze: {squeeze_text}",
             f"  ราคาล่าสุด: {result['price']:.2f} | RSI: {result['rsi']:.1f} | Volume: {result['volume_ratio']:.2f}x",
             f"  จุดเข้า: {result['entry_price']:.2f} | Stop: {result['stop_loss']:.2f} | เป้า 2R: {result['target_price']:.2f}",
             f"  ขนาดเหมาะสม: {quantity} หุ้น (~{cost:,.2f} ฿) | กำไรคาดหวังสุทธิ: {net_target:,.2f} ฿",
