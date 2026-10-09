@@ -1748,10 +1748,35 @@ def handle_message(event):
             reply_text = process_sell(portfolio, parts[1], parts[2], parts[3], fee)
             update_user_portfolio(user_id, portfolio)
         elif text.startswith("ฝากเงิน "):
+            if len(parts) != 2:
+                raise ValueError("รูปแบบ: ฝากเงิน 1000")
+
             amount = positive_float(parts[1], "จำนวนเงิน")
-            portfolio["cash"] = safe_float(portfolio.get("cash"), 0) + amount
-            update_user_portfolio(user_id, portfolio)
-            reply_text = f"ฝากเงิน {amount:,.2f} ฿ สำเร็จ"
+
+            # อ่านและแก้ไขภายใต้ Lock เดียวสำหรับคำสั่งฝากเงินนี้
+            with storage_lock:
+                portfolio = get_user_portfolio(user_id)
+
+                portfolio["cash"] = (
+                    safe_float(portfolio.get("cash"), 0) + amount
+                )
+                portfolio["contributions_total"] = (
+                    safe_float(portfolio.get("contributions_total"), 0)
+                    + amount
+                )
+
+                portfolio.setdefault("transactions", []).append({
+                    "type": "DEPOSIT",
+                    "amount": amount,
+                    "date": utc_now_text(),
+                })
+
+                update_user_portfolio(user_id, portfolio)
+
+            reply_text = (
+                f"บันทึกเงินฝาก {amount:,.2f} บาทแล้ว\n"
+                "เงินฝากเพิ่มเป็นเงินทุน ไม่ใช่กำไรจากการลงทุน"
+            )
         elif text in {"ช่วยเหลือ", "help", "คำสั่ง"}:
             reply_text = (
                 "คำสั่งบอต (ระบบ 5 เทคนิคขั้นสูง):\n"
