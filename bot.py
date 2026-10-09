@@ -1617,6 +1617,38 @@ def process_sell(portfolio, symbol, shares, price, fee=None):
     return f"บันทึกขาย {display_symbol(symbol)} {shares} หุ้น สำเร็จ กำไรสุทธิ {realized_pnl:+,.2f} ฿"
 
 
+from scanner_upgrade import ScannerUpgrade
+
+
+upgraded_scanner = ScannerUpgrade(
+    get_frames=get_market_frames,
+    universe=SET50_UNIVERSE,
+    sectors=SECTOR_MAP,
+    index_symbol=MARKET_INDEX_SYMBOL,
+    commission=calculate_commission,
+    get_portfolio=get_user_portfolio,
+    risk_profile=get_risk_profile,
+    risk_status=portfolio_risk_status,
+    now_local=now_local,
+    min_avg_value=MIN_AVG_VALUE,
+    min_atr_pct=MIN_ATR_PCT,
+    max_atr_pct=MAX_ATR_PCT,
+    max_extension_pct=MAX_EXTENSION_PCT,
+    board_lot=BOARD_LOT,
+    allow_odd_lot=ALLOW_ODD_LOT,
+)
+
+# เปลี่ยนเฉพาะชั้นวิเคราะห์/รายงาน
+# ไม่แก้ข้อมูลธุรกรรม และไม่ส่งคำสั่งซื้อขายจริง
+build_buy_today_report = upgraded_scanner.buy_today
+build_swing_report = upgraded_scanner.swing_report
+build_single_stock_report = upgraded_scanner.single_report
+check_portfolio_sell_alerts = upgraded_scanner.sell_alerts
+build_portfolio_report = upgraded_scanner.portfolio_report
+build_plan_report = upgraded_scanner.plan_report
+build_daily_plan_report = upgraded_scanner.daily_plan
+
+
 # =========================================================
 # SCHEDULER
 # =========================================================
