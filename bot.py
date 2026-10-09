@@ -573,7 +573,7 @@ def get_market_frames(symbols, force=False):
         try:
             downloaded = yf.download(
                 tickers=missing,
-                period="9mo",
+                period="2y",
                 interval="1d",
                 auto_adjust=False,
                 group_by="ticker",
