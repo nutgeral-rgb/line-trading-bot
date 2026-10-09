@@ -1726,6 +1726,13 @@ def handle_message(event):
         elif text == "สแกนหุ้น":
             queue_scan(user_id, "scan")
             reply_text = "กำลังสแกนหุ้น..."
+        elif text == "สแกน SET50":
+            accepted = queue_scan(user_id, "set50")
+            reply_text = (
+                "กำลังสแกนกลุ่มหุ้นอ้างอิงที่ตั้งไว้"
+                if accepted
+                else "ระบบกำลังประมวลผลคำสั่งนี้อยู่แล้ว"
+            )
         elif text.startswith("สแกน ") or (text.startswith("วิเคราะห์ ") and text != "วิเคราะห์พอร์ต"):
             symbol = format_symbol(parts[1])
             queue_scan(user_id, "single", symbol)
