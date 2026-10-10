@@ -61,7 +61,7 @@ TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 
 MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
 RISK_PROFILES = {
@@ -1380,7 +1380,6 @@ def build_performance_report(portfolio):
             status = "FAILED"
             fail_count += 1
             
-            # จำแนกประเภทความผิดพลาดเชิงลึก
             failure_tags = []
             if first_day_close > entry * 1.01 and min_price_after <= stop:
                 failure_tags.append("🐂 [False Breakout / Bull Trap]: เบรกขึ้นวันแรกแต่ถูกทุบหลุดแนวรับ")
@@ -1845,7 +1844,7 @@ def handle_message(event):
                 "7. สรุปหุ้นวันนี้ / สแกนหุ้น\n"
                 "8. วิเคราะห์ PTT\n"
                 "9. ซื้อ / ขาย PTT [จำนวน] [ราคา]\n"
-                "10. ฝากเงินรูปแบป [จำนวน]"
+                "10. ฝากเงิน [จำนวน]"
             )
         else:
             reply_text = "ไม่รู้จักคำสั่ง พิมพ์ 'ช่วยเหลือ'"
