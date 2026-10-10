@@ -61,7 +61,7 @@ TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 
 MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
 RISK_PROFILES = {
@@ -1123,7 +1123,7 @@ def portfolio_risk_status(portfolio, equity):
 # =========================================================
 
 def trade_metrics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
+    sells = [t for t in portfolio.get("transactions", []) if t.get("type"] == "SELL"]
     profits = [safe_float(t.get("realized_pnl"), 0) for t in sells]
 
     if not profits:
@@ -1226,17 +1226,20 @@ def combined_universe(portfolio):
 
 
 def record_signal_history(portfolio, candidates):
-    """บันทึกประวัติสัญญาณแนะนำพร้อมบริบทเชิงเทคนิค ณ วันแนะนำ"""
+    """บันทึกประวัติสัญญาณแนะนำพร้อมบริบทเชิงเทคนิคและวันที่ใช้คำนวณ"""
     history = portfolio.setdefault("signal_history", [])
     today_str = now_local().strftime("%Y-%m-%d")
     
-    existing_symbols = {item["symbol"] for item in history if item.get("date") == today_str}
+    existing_keys = {(item.get("date"), item.get("symbol")) for item in history}
     
     for cand in candidates:
         sym = cand["symbol"]
-        if sym not in existing_symbols:
+        d_date = cand.get("data_date", today_str)
+        key = (today_str, sym)
+        if key not in existing_keys:
             history.append({
                 "date": today_str,
+                "data_date": d_date,
                 "symbol": sym,
                 "entry_price": cand["price"],
                 "stop_loss": cand["stop_loss"],
@@ -1247,9 +1250,22 @@ def record_signal_history(portfolio, candidates):
                 "volume_ratio": cand["volume_ratio"],
                 "status": "PENDING"
             })
+            existing_keys.add(key)
     
     if len(history) > 100:
         portfolio["signal_history"] = history[-100:]
+
+
+def persist_signal_history(user_id, scanned_portfolio):
+    """บันทึก signal_history ลงดิสก์จริงเพื่อป้องกันข้อมูลหาย"""
+    with storage_lock:
+        latest = get_user_portfolio(user_id)
+        merged = {}
+        for item in latest.get("signal_history", []) + scanned_portfolio.get("signal_history", []):
+            merged[(item.get("date"), item.get("symbol"))] = item
+        history = sorted(merged.values(), key=lambda i: str(i.get("date", "")))
+        latest["signal_history"] = history[-100:]
+        update_user_portfolio(user_id, latest)
 
 
 def build_buy_today_report(portfolio):
@@ -1284,11 +1300,12 @@ def build_buy_today_report(portfolio):
         candidates.append(result)
 
     candidates.sort(key=lambda item: (item["score"], item["rs_20"]), reverse=True)
-    
-    if candidates:
-        record_signal_history(portfolio, candidates)
-
     top_candidates = candidates[:max(slots, 3)]
+    
+    if top_candidates:
+        record_signal_history(portfolio, top_candidates)
+        persist_signal_history(get_registered_users()[0] if get_registered_users() else "default", portfolio)
+
     today_text = now_local().strftime("%d/%m/%Y %H:%M")
     top_sector_names = ", ".join(list(top_sectors)[:3])
 
@@ -1331,7 +1348,7 @@ def build_buy_today_report(portfolio):
 
 
 def build_performance_report(portfolio):
-    """วิเคราะห์ผลย้อนหลังเชิงลึก พร้อมจำแนกประเภทความผิดพลาด (Post-Mortem Analysis)"""
+    """วิเคราะห์ผลย้อนหลังเชิงลึก ป้องกัน Look-ahead Bias ด้วย data_date"""
     history = portfolio.get("signal_history", [])
     if not history:
         return "ยังไม่มีประวัติการแนะนำหุ้นย้อนหลังสำหรับตรวจสอบผล"
@@ -1348,6 +1365,7 @@ def build_performance_report(portfolio):
     for item in history[-10:]:
         sym = item["symbol"]
         rec_date = item["date"]
+        start_day = item.get("data_date")
         entry = item["entry_price"]
         stop = item["stop_loss"]
         target = item["target_price"]
@@ -1357,7 +1375,12 @@ def build_performance_report(portfolio):
         if fr is None or fr.empty:
             continue
 
-        sub_fr = fr[fr.index >= pd.to_datetime(rec_date)]
+        index_days = fr.index.strftime("%Y-%m-%d")
+        if start_day:
+            sub_fr = fr[index_days > start_day]
+        else:
+            sub_fr = fr[index_days >= rec_date]
+
         current_price = float(fr["Close"].dropna().iloc[-1])
         
         if not sub_fr.empty:
@@ -1513,7 +1536,8 @@ def build_swing_report(portfolio, symbols, title, limit=10):
 
 def build_single_stock_report(portfolio, symbol):
     formatted_symbol = format_symbol(symbol)
-    frames = get_market_frames([formatted_symbol, MARKET_INDEX_SYMBOL])
+    # โหลด Universe ทั้งหมดเพื่อให้คำนวณ Market Breadth และ Sector ได้ถูกต้อง ไม่อ้างอิงตัวเดียว
+    frames = get_market_frames(SET50_UNIVERSE + [formatted_symbol, MARKET_INDEX_SYMBOL])
     market_regime = get_market_regime(frames)
     top_sectors, _ = compute_sector_rankings(frames)
     result = analyze_swing_symbol(formatted_symbol, frames.get(formatted_symbol), market_regime, top_sectors)
@@ -1606,8 +1630,10 @@ def run_scan_job(user_id, job_type, payload=None):
             result = build_swing_report(portfolio, combined_universe(portfolio), "สรุปหุ้นวันนี้ (Top 5)", limit=5)
         elif job_type == "buy_today":
             result = build_buy_today_report(portfolio)
+            persist_signal_history(user_id, portfolio)
         elif job_type == "daily_plan":
             result = build_daily_plan_report(portfolio)
+            persist_signal_history(user_id, portfolio)
         elif job_type == "sell_check":
             alerts = check_portfolio_sell_alerts(portfolio)
             result = "🚨 แจ้งเตือนจุดขาย\n\n" + alerts if alerts else "ตรวจสอบแล้ว หุ้นในพอร์ตยังอยู่ในเกณฑ์ปกติ"
@@ -1668,6 +1694,10 @@ def process_buy(portfolio, symbol, shares, price, fee=None):
         new_shares = shares
         new_total_cost = total_cost
         new_average = total_cost / shares
+
+    # ป้องกัน Stop Loss สูงกว่าหรือเท่ากับต้นทุนเฉลี่ย
+    if stop_loss <= 0 or stop_loss >= new_average:
+        stop_loss = round(new_average * 0.95, 2)
 
     r_unit = max(new_average - stop_loss, new_average * 0.015)
     stocks[symbol] = {
@@ -1812,11 +1842,15 @@ def handle_message(event):
         elif text == "สถิติการเทรด":
             reply_text = calculate_trade_statistics(portfolio)
         elif text.startswith("ซื้อ "):
+            if len(parts) < 4:
+                raise ValueError("รูปแบบคำสั่งไม่ถูกต้อง กรุณาใช้: ซื้อ [หุ้น] [จำนวน] [ราคา]")
             fee = parts[4] if len(parts) >= 5 else None
             with storage_lock:
                 reply_text = process_buy(portfolio, parts[1], parts[2], parts[3], fee)
                 update_user_portfolio(user_id, portfolio)
         elif text.startswith("ขาย "):
+            if len(parts) < 4:
+                raise ValueError("รูปแบบคำสั่งไม่ถูกต้อง กรุณาใช้: ขาย [หุ้น] [จำนวน] [ราคา]")
             fee = parts[4] if len(parts) >= 5 else None
             with storage_lock:
                 reply_text = process_sell(portfolio, parts[1], parts[2], parts[3], fee)
@@ -1841,7 +1875,7 @@ def handle_message(event):
                 "4. เช็กจุดขาย\n"
                 "5. ผลการแนะนำ (เช็กผลย้อนหลัง)\n"
                 "6. แผนการเงิน\n"
-                "7. สรุปหุ้นวันนี้ / สแกนหุ้น\n"
+                "7. สรุปหุ้นวันนี้ / สแกนหุ้น / สแกน SET50\n"
                 "8. วิเคราะห์ PTT\n"
                 "9. ซื้อ / ขาย PTT [จำนวน] [ราคา]\n"
                 "10. ฝากเงิน [จำนวน]"
