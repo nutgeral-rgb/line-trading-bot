@@ -61,7 +61,7 @@ TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 
 MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
 RISK_PROFILES = {
@@ -1123,7 +1123,7 @@ def portfolio_risk_status(portfolio, equity):
 # =========================================================
 
 def trade_metrics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type"] == "SELL"]
+    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
     profits = [safe_float(t.get("realized_pnl"), 0) for t in sells]
 
     if not profits:
@@ -1536,7 +1536,6 @@ def build_swing_report(portfolio, symbols, title, limit=10):
 
 def build_single_stock_report(portfolio, symbol):
     formatted_symbol = format_symbol(symbol)
-    # โหลด Universe ทั้งหมดเพื่อให้คำนวณ Market Breadth และ Sector ได้ถูกต้อง ไม่อ้างอิงตัวเดียว
     frames = get_market_frames(SET50_UNIVERSE + [formatted_symbol, MARKET_INDEX_SYMBOL])
     market_regime = get_market_regime(frames)
     top_sectors, _ = compute_sector_rankings(frames)
@@ -1695,7 +1694,6 @@ def process_buy(portfolio, symbol, shares, price, fee=None):
         new_total_cost = total_cost
         new_average = total_cost / shares
 
-    # ป้องกัน Stop Loss สูงกว่าหรือเท่ากับต้นทุนเฉลี่ย
     if stop_loss <= 0 or stop_loss >= new_average:
         stop_loss = round(new_average * 0.95, 2)
 
