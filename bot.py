@@ -1227,16 +1227,26 @@ def combined_universe(portfolio):
 
 def record_signal_history(portfolio, candidates):
     history = portfolio.setdefault("signal_history", [])
-    today_str = now_local().strftime("%Y-%m-%d")
+    today_dt = now_local().date()
     
-    existing_symbols = {item["symbol"] for item in history if item.get("date") == today_str}
+    # ตรวจสอบหุ้นที่เพิ่งถูกแนะนำไปในช่วง 15 วันที่ผ่านมา (ไม่ให้บันทึกซ้ำซ้อน)
+    active_symbols = set()
+    for item in history:
+        try:
+            item_date = datetime.strptime(item.get("date", ""), "%Y-%m-%d").date()
+            # หากยังไม่เกิน 15 วัน ถือว่ายังอยู่ในช่วงติดตาม ห้ามบันทึกซ้ำ
+            if (today_dt - item_date).days < 15:
+                active_symbols.add(item["symbol"])
+        except (ValueError, TypeError):
+            continue
     
     for cand in candidates:
         sym = cand["symbol"]
-        if sym not in existing_symbols:
+        # ถ้าหุ้นตัวนี้เพิ่งถูกแนะนำไปไม่นาน จะถูกข้าม ไม่บันทึกซ้ำ
+        if sym not in active_symbols:
             history.append({
-                "date": today_str,
-                "data_date": cand.get("data_date", today_str),
+                "date": today_dt.strftime("%Y-%m-%d"),
+                "data_date": cand.get("data_date", today_dt.strftime("%Y-%m-%d")),
                 "symbol": sym,
                 "entry_price": cand["price"],
                 "stop_loss": cand["stop_loss"],
@@ -1247,10 +1257,10 @@ def record_signal_history(portfolio, candidates):
                 "volume_ratio": cand["volume_ratio"],
                 "status": "PENDING"
             })
+            active_symbols.add(sym) # ป้องกันการซ้ำกันในรอบสแกนเดียวกันด้วย
     
     if len(history) > 100:
         portfolio["signal_history"] = history[-100:]
-
 
 def build_buy_today_report(portfolio):
     symbols = combined_universe(portfolio)
