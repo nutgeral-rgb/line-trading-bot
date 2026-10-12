@@ -20,6 +20,8 @@ from flask import Flask, abort, jsonify, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import exchange_calendars as xcals
+
 
 
 # =========================================================
