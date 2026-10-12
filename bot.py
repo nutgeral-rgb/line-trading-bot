@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import json
 import logging
 import math
@@ -6,13 +7,15 @@ import os
 import tempfile
 import threading
 import time
+import uuid
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, abort, jsonify, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -20,7 +23,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 logging.basicConfig(
@@ -29,45 +32,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger("portfolio-bot")
 
-app = Flask(__name__)
+BKK = timezone(timedelta(hours=7))
+VERSION = 16
+TRACKING_VERSION = 2
+MAX_LINE_TEXT = 4000
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    logger.warning("ยังไม่ได้ตั้งค่า LINE_CHANNEL_ACCESS_TOKEN หรือ LINE_CHANNEL_SECRET")
+if not TOKEN or not SECRET:
+    raise RuntimeError(
+        "ต้องตั้งค่า LINE_CHANNEL_ACCESS_TOKEN และ LINE_CHANNEL_SECRET"
+    )
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+PORTFOLIO_FILE = os.path.abspath(
+    os.getenv("PORTFOLIO_FILE", "portfolio.json")
+)
 
-PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE", "portfolio.json")
-MARKET_INDEX_SYMBOL = os.getenv("MARKET_INDEX_SYMBOL", "^SET.BK")
+INDEX_SYMBOL = os.getenv(
+    "MARKET_INDEX_SYMBOL", "^SET.BK"
+).strip().upper()
+
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "900"))
+MAX_DATA_AGE_DAYS = int(os.getenv("MAX_DATA_AGE_DAYS", "7"))
+SIGNAL_HORIZON = int(os.getenv("SIGNAL_HORIZON", "15"))
+
 BOARD_LOT = max(1, int(os.getenv("BOARD_LOT", "100")))
-ALLOW_ODD_LOT = os.getenv("ALLOW_ODD_LOT", "true").lower() == "true"
-MIN_AVG_VALUE = float(os.getenv("MIN_AVG_VALUE", "10000000"))
-ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
-TIMEZONE_NAME = os.getenv("TZ", "Asia/Bangkok")
+ALLOW_ODD_LOT = (
+    os.getenv("ALLOW_ODD_LOT", "true").lower() == "true"
+)
 
-COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.00157"))
-VAT_RATE = float(os.getenv("VAT_RATE", "0.07"))
-MIN_COMMISSION = float(os.getenv("MIN_COMMISSION", "0"))
-
+MIN_AVG_VALUE = float(
+    os.getenv("MIN_AVG_VALUE", "10000000")
+)
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "1.2"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "12.0"))
-MAX_EXTENSION_PCT = float(os.getenv("MAX_EXTENSION_PCT", "12.0"))
-TIME_STOP_DAYS = int(os.getenv("TIME_STOP_DAYS", "15"))
 
-DEFAULT_RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
+COMMISSION_RATE = float(
+    os.getenv("COMMISSION_RATE", "0.00157")
+)
+VAT_RATE = float(os.getenv("VAT_RATE", "0.07"))
+MIN_COMMISSION = float(
+    os.getenv("MIN_COMMISSION", "0")
+)
+SLIPPAGE = float(os.getenv("SLIPPAGE", "0.002"))
+MAX_ENTRY_GAP = float(os.getenv("MAX_ENTRY_GAP", "0.02"))
 
-MAX_LINE_TEXT = 4500
-SCHEMA_VERSION = 11
-BANGKOK_TZ = timezone(timedelta(hours=7))
+ENABLE_SCHEDULER = (
+    os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
+)
 
 RISK_PROFILES = {
     "conservative": {
         "label": "ระมัดระวัง",
-        "risk_per_trade": 0.010,
+        "risk_per_trade": 0.01,
         "max_positions": 3,
         "max_total_risk": 0.04,
         "max_weight": 0.25,
@@ -75,7 +93,7 @@ RISK_PROFILES = {
     },
     "balanced": {
         "label": "สมดุล",
-        "risk_per_trade": 0.020,
+        "risk_per_trade": 0.02,
         "max_positions": 4,
         "max_total_risk": 0.07,
         "max_weight": 0.35,
@@ -83,7 +101,7 @@ RISK_PROFILES = {
     },
     "aggressive": {
         "label": "เชิงรุก",
-        "risk_per_trade": 0.030,
+        "risk_per_trade": 0.03,
         "max_positions": 5,
         "max_total_risk": 0.12,
         "max_weight": 0.45,
@@ -91,242 +109,194 @@ RISK_PROFILES = {
     },
 }
 
-FALLBACK_LARGE_CAP_SYMBOLS = [
-    "ADVANC", "AOT", "AWC", "BANPU", "BBL",
-    "BDMS", "BH", "BJC", "BTS", "CBG",
-    "CENTEL", "COM7", "CPALL", "CPAXT", "CPF",
-    "CPN", "CRC", "DELTA", "EA", "EGCO",
-    "GLOBAL", "GPSC", "GULF", "HMPRO", "ITC",
-    "IVL", "KBANK", "KKP", "KTB", "KTC",
-    "LH", "MINT", "MTC", "OR", "OSP",
-    "PTT", "PTTEP", "PTTGC", "RATCH", "SAWAD",
-    "SCB", "SCC", "SCGP", "TCAP", "TIDLOR",
-    "TISCO", "TOP", "TRUE", "TU", "WHA",
-]
+DEFAULT_RISK_MODE = os.getenv(
+    "RISK_MODE", "balanced"
+).lower()
 
-SECTOR_MAP = {
-    "ADVANC.BK": "สื่อสาร",
-    "AOT.BK": "ขนส่งและการบิน",
-    "AWC.BK": "พัฒนาอสังหาริมทรัพย์",
-    "BANPU.BK": "พลังงาน",
-    "BBL.BK": "ธนาคาร",
-    "BDMS.BK": "การแพทย์",
-    "BH.BK": "การแพทย์",
-    "BJC.BK": "พาณิชย์",
-    "BTS.BK": "ขนส่ง",
-    "CBG.BK": "อาหารและเครื่องดื่ม",
-    "CENTEL.BK": "ท่องเที่ยวและโรงแรม",
-    "COM7.BK": "พาณิชย์",
-    "CPALL.BK": "พาณิชย์",
-    "CPAXT.BK": "พาณิชย์",
-    "CPF.BK": "อาหารและการเกษตร",
-    "CPN.BK": "พัฒนาอสังหาริมทรัพย์",
-    "CRC.BK": "พาณิชย์",
-    "DELTA.BK": "ชิ้นส่วนอิเล็กทรอนิกส์",
-    "EA.BK": "พลังงานและสาธารณูปโภค",
-    "EGCO.BK": "พลังงานและสาธารณูปโภค",
-    "GLOBAL.BK": "พาณิชย์",
-    "GPSC.BK": "พลังงานและสาธารณูปโภค",
-    "GULF.BK": "พลังงานและสาธารณูปโภค",
-    "HMPRO.BK": "พาณิชย์",
-    "ITC.BK": "อาหารและการเกษตร",
-    "IVL.BK": "ปิโตรเคมีและเคมีภัณฑ์",
-    "KBANK.BK": "ธนาคาร",
-    "KKP.BK": "ธนาคาร",
-    "KTB.BK": "ธนาคาร",
-    "KTC.BK": "เงินทุนและหลักทรัพย์",
-    "LH.BK": "พัฒนาอสังหาริมทรัพย์",
-    "MINT.BK": "อาหารและท่องเที่ยว",
-    "MTC.BK": "เงินทุนและหลักทรัพย์",
-    "OR.BK": "พลังงานและพาณิชย์",
-    "OSP.BK": "อาหารและเครื่องดื่ม",
-    "PTT.BK": "พลังงาน",
-    "PTTEP.BK": "พลังงาน",
-    "PTTGC.BK": "ปิโตรเคมีและเคมีภัณฑ์",
-    "RATCH.BK": "พลังงานและสาธารณูปโภค",
-    "SAWAD.BK": "เงินทุนและหลักทรัพย์",
-    "SCB.BK": "ธนาคาร",
-    "SCC.BK": "วัสดุก่อสร้าง",
-    "SCGP.BK": "บรรจุภัณฑ์",
-    "TCAP.BK": "เงินทุนและหลักทรัพย์",
-    "TIDLOR.BK": "เงินทุนและหลักทรัพย์",
-    "TISCO.BK": "ธนาคาร",
-    "TOP.BK": "พลังงาน",
-    "TRUE.BK": "สื่อสาร",
-    "TU.BK": "อาหารและการเกษตร",
-    "WHA.BK": "พัฒนาอสังหาริมทรัพย์",
+if DEFAULT_RISK_MODE not in RISK_PROFILES:
+    DEFAULT_RISK_MODE = "balanced"
+
+FALLBACK_SYMBOLS = """
+ADVANC AOT AWC BANPU BBL BDMS BH BJC BTS CBG
+CENTEL COM7 CPALL CPAXT CPF CPN CRC DELTA EA EGCO
+GLOBAL GPSC GULF HMPRO ITC IVL KBANK KKP KTB KTC
+LH MINT MTC OR OSP PTT PTTEP PTTGC RATCH SAWAD
+SCB SCC SCGP TCAP TIDLOR TISCO TOP TRUE TU WHA
+""".split()
+
+SECTOR_GROUPS = {
+    "สื่อสาร": "ADVANC TRUE",
+    "ธนาคาร": "BBL KBANK KKP KTB SCB TISCO",
+    "พาณิชย์": "BJC COM7 CPALL CPAXT CRC GLOBAL HMPRO",
+    "พลังงาน": "BANPU EA EGCO GPSC GULF OR PTT PTTEP RATCH TOP",
+    "อาหาร": "CBG CPF ITC OSP TU",
+    "อสังหาริมทรัพย์": "AWC CPN LH WHA",
+    "การแพทย์": "BDMS BH",
+    "เงินทุน": "KTC MTC SAWAD TCAP TIDLOR",
+    "ขนส่ง": "AOT BTS",
+    "ท่องเที่ยว": "CENTEL MINT",
+    "ปิโตรเคมี": "IVL PTTGC",
+    "วัสดุก่อสร้าง": "SCC",
+    "บรรจุภัณฑ์": "SCGP",
+    "อิเล็กทรอนิกส์": "DELTA",
 }
 
+app = Flask(__name__)
+line_api = LineBotApi(TOKEN)
+handler = WebhookHandler(SECRET)
+
 
 # =========================================================
-# GENERAL UTILITIES
+# UTILITIES
 # =========================================================
 
-def format_symbol(symbol):
-    symbol = str(symbol).upper().strip()
-    if not symbol:
-        return ""
-    if symbol.startswith("^"):
-        return symbol
-    if not symbol.endswith(".BK"):
+def now_bkk():
+    return datetime.now(BKK)
+
+
+def utc_text():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_symbol(value):
+    symbol = str(value).strip().upper()
+
+    allowed = set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789^&._-"
+    )
+    if (
+        not symbol
+        or len(symbol) > 30
+        or any(character not in allowed for character in symbol)
+    ):
+        raise ValueError("ชื่อหุ้นไม่ถูกต้อง")
+
+    if not symbol.startswith("^") and not symbol.endswith(".BK"):
         symbol += ".BK"
+
     return symbol
 
 
 def display_symbol(symbol):
-    return str(symbol).replace(".BK", "")
+    symbol = str(symbol)
+    return symbol[:-3] if symbol.endswith(".BK") else symbol
 
 
-def unique_symbols(symbols):
-    output = []
-    seen = set()
-    for symbol in symbols:
-        formatted = format_symbol(symbol)
-        if formatted and formatted not in seen:
-            seen.add(formatted)
-            output.append(formatted)
-    return output
+def unique_symbols(values):
+    return list(dict.fromkeys(format_symbol(value) for value in values))
 
 
-def get_configured_universe():
-    raw = os.getenv("SET50_SYMBOLS", "").strip()
-    if raw:
-        symbols = raw.replace(",", " ").split()
-    else:
-        symbols = FALLBACK_LARGE_CAP_SYMBOLS
-    return unique_symbols(symbols)
+configured_symbols = os.getenv(
+    "SET50_SYMBOLS", ""
+).replace(",", " ").split()
+
+UNIVERSE = unique_symbols(
+    configured_symbols or FALLBACK_SYMBOLS
+)
+
+SECTOR_MAP = {
+    format_symbol(symbol): sector
+    for sector, names in SECTOR_GROUPS.items()
+    for symbol in names.split()
+}
 
 
-SET50_UNIVERSE = get_configured_universe()
-
-
-def safe_float(value, default=0.0):
+def number(value, name, minimum=0):
     try:
         result = float(value)
-        if not math.isfinite(result):
-            return default
-        return result
     except (TypeError, ValueError):
-        return default
+        raise ValueError(f"{name} ต้องเป็นตัวเลข")
+
+    if not math.isfinite(result) or result < minimum:
+        raise ValueError(f"{name} ไม่ถูกต้อง")
+
+    return result
 
 
-def positive_float(value, field_name):
-    result = safe_float(value, -1)
+def positive_number(value, name):
+    result = number(value, name)
     if result <= 0:
-        raise ValueError(f"{field_name} ต้องมากกว่า 0")
+        raise ValueError(f"{name} ต้องมากกว่า 0")
     return result
 
 
-def non_negative_float(value, field_name):
-    result = safe_float(value, -1)
-    if result < 0:
-        raise ValueError(f"{field_name} ต้องไม่น้อยกว่า 0")
+def positive_int(value, name):
+    text = str(value)
+    if not text.isdecimal():
+        raise ValueError(f"{name} ต้องเป็นจำนวนเต็มบวก")
+
+    result = int(text)
+    if result <= 0 or result > 100000000:
+        raise ValueError(f"{name} ไม่ถูกต้อง")
+
     return result
 
 
-def positive_int(value, field_name):
-    try:
-        result = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{field_name} ต้องเป็นจำนวนเต็ม")
-    if result <= 0:
-        raise ValueError(f"{field_name} ต้องมากกว่า 0")
-    return result
-
-
-def now_local():
-    return datetime.now(BANGKOK_TZ)
-
-
-def utc_now_text():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_iso(value, fallback=None):
-    try:
-        parsed = datetime.fromisoformat(str(value))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    except (TypeError, ValueError):
-        return fallback
-
-
-def calculate_commission(value):
+def commission(value, settings=None):
     if value <= 0:
         return 0.0
-    commission = value * COMMISSION_RATE
-    if commission < MIN_COMMISSION:
-        commission = MIN_COMMISSION
-    return round(commission * (1 + VAT_RATE), 2)
+
+    cfg = settings or {
+        "rate": COMMISSION_RATE,
+        "vat": VAT_RATE,
+        "minimum": MIN_COMMISSION,
+    }
+
+    return round(
+        max(value * cfg["rate"], cfg["minimum"])
+        * (1 + cfg["vat"]),
+        2,
+    )
 
 
-def round_trip_cost_pct():
-    return COMMISSION_RATE * (1 + VAT_RATE) * 2 * 100
-
-
-def net_profit_after_fee(entry_price, exit_price, quantity):
-    if quantity <= 0:
-        return 0.0
-    buy_fee = calculate_commission(entry_price * quantity)
-    sell_fee = calculate_commission(exit_price * quantity)
-    return ((exit_price - entry_price) * quantity) - buy_fee - sell_fee
-
-
-def split_message(text, max_length=MAX_LINE_TEXT):
-    text = str(text)
-    if len(text) <= max_length:
-        return [text]
-
+def split_message(text):
     chunks = []
-    current = []
+    current = ""
 
-    for line in text.splitlines():
-        candidate = "\n".join(current + [line])
-        if len(candidate) <= max_length:
-            current.append(line)
-        else:
+    for line in str(text).splitlines():
+        while len(line) > MAX_LINE_TEXT:
             if current:
-                chunks.append("\n".join(current))
-            if len(line) <= max_length:
-                current = [line]
-            else:
-                for start in range(0, len(line), max_length):
-                    chunks.append(line[start:start + max_length])
-                current = []
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:MAX_LINE_TEXT])
+            line = line[MAX_LINE_TEXT:]
+
+        candidate = current + ("\n" if current else "") + line
+
+        if len(candidate) > MAX_LINE_TEXT:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
 
     if current:
-        chunks.append("\n".join(current))
+        chunks.append(current)
 
-    return chunks
+    return chunks or ["ไม่มีข้อมูล"]
 
 
 def push_long_message(user_id, text):
     for chunk in split_message(text):
-        line_bot_api.push_message(user_id, TextSendMessage(text=chunk))
+        line_api.push_message(
+            user_id,
+            TextSendMessage(text=chunk),
+        )
 
 
 # =========================================================
-# PORTFOLIO STORAGE (SAFE JSON RECOVERY FIX)
+# JSON STORAGE
 # =========================================================
+
+class StorageError(RuntimeError):
+    pass
+
 
 storage_lock = threading.RLock()
 
 
-def default_financial_plan():
-    return {
-        "target_value": 20000.0,
-        "target_months": 3,
-        "monthly_contribution": 0.0,
-        "max_portfolio_drawdown_pct": 0.20,
-        "trading_paused_at_value": 8000.0,
-        "risk_reward_ratio": 2.0,
-    }
-
-
 def default_portfolio():
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": VERSION,
         "cash": 10000.0,
         "initial_capital": 10000.0,
         "contributions_total": 0.0,
@@ -336,1550 +306,2508 @@ def default_portfolio():
         "high_water_mark": 10000.0,
         "risk_mode": DEFAULT_RISK_MODE,
         "plan_start_equity": 10000.0,
-        "plan_start_date": utc_now_text(),
-        "financial_plan": default_financial_plan(),
+        "plan_start_date": utc_text(),
+        "financial_plan": {
+            "target_value": 20000.0,
+            "target_months": 3,
+            "max_portfolio_drawdown_pct": 0.20,
+            "trading_paused_at_value": 8000.0,
+        },
         "stocks": {},
-        "watchlist": SET50_UNIVERSE.copy(),
+        "watchlist": UNIVERSE.copy(),
         "transactions": [],
         "signal_history": [],
     }
 
 
-def looks_like_single_portfolio(data):
-    if not isinstance(data, dict):
-        return False
-    portfolio_keys = {
-        "cash", "financial_plan", "stocks",
-        "watchlist", "transactions", "initial_capital",
-    }
-    return bool(portfolio_keys.intersection(data.keys()))
-
-
-def normalize_holding(info, fallback_price=0.0):
-    shares = int(safe_float(info.get("shares"), 0))
-    if shares <= 0:
-        return None
-
-    average_cost = safe_float(info.get("average_cost"), fallback_price)
-    total_cost = safe_float(info.get("total_cost"), average_cost * shares)
-    initial_stop = safe_float(info.get("initial_stop"), average_cost * 0.95)
-    stop_loss = safe_float(info.get("stop_loss"), initial_stop)
-    r_unit = safe_float(info.get("r_unit"), max(average_cost - initial_stop, average_cost * 0.02))
-
-    if r_unit <= 0:
-        r_unit = max(average_cost * 0.02, 0.01)
-
-    return {
-        "shares": shares,
-        "total_cost": max(0.0, total_cost),
-        "average_cost": max(0.0, average_cost),
-        "initial_stop": max(0.0, initial_stop),
-        "stop_loss": max(0.0, stop_loss),
-        "r_unit": r_unit,
-        "target_price": safe_float(info.get("target_price"), average_cost + (2 * r_unit)),
-        "highest_price": max(average_cost, safe_float(info.get("highest_price"), average_cost)),
-        "tp1_done": bool(info.get("tp1_done", False)),
-        "opened_at": info.get("opened_at") or utc_now_text(),
-    }
-
-
 def normalize_portfolio(raw):
-    base = default_portfolio()
-
     if not isinstance(raw, dict):
-        return base
+        raise StorageError("รูปแบบพอร์ตไม่ถูกต้อง ไม่ได้รีเซ็ตข้อมูล")
 
-    old_schema = int(safe_float(raw.get("schema_version"), 0))
+    result = default_portfolio()
+    result.update(copy.deepcopy(raw))
 
-    for key in [
-        "cash", "initial_capital", "contributions_total",
-        "withdrawals_total", "realized_pnl_total",
-        "fees_total", "high_water_mark", "plan_start_equity",
-    ]:
-        if key in raw:
-            base[key] = safe_float(raw.get(key), base[key])
+    if not isinstance(result["stocks"], dict):
+        raise StorageError("ข้อมูลหุ้นในพอร์ตไม่ถูกต้อง")
+    if not isinstance(result["watchlist"], list):
+        raise StorageError("ข้อมูล Watchlist ไม่ถูกต้อง")
+    if not isinstance(result["transactions"], list):
+        raise StorageError("ข้อมูลธุรกรรมไม่ถูกต้อง")
+    if not isinstance(result["signal_history"], list):
+        raise StorageError("ข้อมูลประวัติสัญญาณไม่ถูกต้อง")
+    if not isinstance(result["financial_plan"], dict):
+        raise StorageError("ข้อมูลแผนการเงินไม่ถูกต้อง")
 
-    mode = str(raw.get("risk_mode", DEFAULT_RISK_MODE)).lower()
-    base["risk_mode"] = mode if mode in RISK_PROFILES else "balanced"
-    base["plan_start_date"] = raw.get("plan_start_date") or utc_now_text()
+    try:
+        result["watchlist"] = unique_symbols(result["watchlist"])
+        result["stocks"] = {
+            format_symbol(symbol): info
+            for symbol, info in result["stocks"].items()
+        }
+    except ValueError as error:
+        raise StorageError("ชื่อหุ้นในพอร์ตไม่ถูกต้อง") from error
 
-    if isinstance(raw.get("financial_plan"), dict):
-        for key, value in raw["financial_plan"].items():
-            if key in base["financial_plan"]:
-                base["financial_plan"][key] = value
+    if result["risk_mode"] not in RISK_PROFILES:
+        result["risk_mode"] = DEFAULT_RISK_MODE
 
-    base["financial_plan"]["target_value"] = max(
-        safe_float(base["financial_plan"].get("target_value"), 20000.0), 1.0
-    )
-    base["financial_plan"]["target_months"] = max(
-        int(safe_float(base["financial_plan"].get("target_months"), 3)), 1
-    )
+    plan = default_portfolio()["financial_plan"]
+    plan.update(result["financial_plan"])
+    result["financial_plan"] = plan
+    result["schema_version"] = VERSION
 
-    if isinstance(raw.get("transactions"), list):
-        base["transactions"] = raw["transactions"]
-
-    if isinstance(raw.get("signal_history"), list):
-        base["signal_history"] = raw["signal_history"]
-
-    existing_watchlist = raw.get("watchlist", [])
-    if not isinstance(existing_watchlist, list):
-        existing_watchlist = []
-
-    if old_schema < 2:
-        base["watchlist"] = unique_symbols(SET50_UNIVERSE + existing_watchlist)
-    else:
-        base["watchlist"] = unique_symbols(existing_watchlist)
-
-    if not base["watchlist"]:
-        base["watchlist"] = SET50_UNIVERSE.copy()
-
-    clean_stocks = {}
-    raw_stocks = raw.get("stocks", {})
-
-    if isinstance(raw_stocks, dict):
-        for symbol, info in raw_stocks.items():
-            if not isinstance(info, dict):
-                continue
-            symbol = format_symbol(symbol)
-            holding = normalize_holding(info)
-            if symbol and holding:
-                clean_stocks[symbol] = holding
-
-    base["stocks"] = clean_stocks
-    base["schema_version"] = SCHEMA_VERSION
-    return base
+    return result
 
 
 def load_store_unlocked():
     if not os.path.exists(PORTFOLIO_FILE):
         return {}
+
     try:
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.exception("อ่านไฟล์ Portfolio ไม่สำเร็จหรือไฟล์เสียหาย สำรองไฟล์เป็น .bak และรีเซ็ตอัตโนมัติ")
-        try:
-            if os.path.exists(PORTFOLIO_FILE):
-                os.replace(PORTFOLIO_FILE, PORTFOLIO_FILE + f".bak_{int(time.time())}")
-        except Exception:
-            pass
-        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StorageError(
+            "อ่าน portfolio.json ไม่สำเร็จ "
+            "ระบบไม่รีเซ็ตหรือเขียนทับไฟล์เดิม"
+        ) from error
+
+    if not isinstance(data, dict):
+        raise StorageError("portfolio.json ต้องเป็น JSON object")
+
+    return data
 
 
 def save_store_unlocked(data):
-    absolute_path = os.path.abspath(PORTFOLIO_FILE)
-    directory = os.path.dirname(absolute_path)
+    directory = os.path.dirname(PORTFOLIO_FILE)
     os.makedirs(directory, exist_ok=True)
 
-    file_descriptor, temporary_path = tempfile.mkstemp(
-        prefix="portfolio_", suffix=".tmp", dir=directory,
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".portfolio_",
+        suffix=".tmp",
+        dir=directory,
     )
 
     try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temporary_path, absolute_path)
+
+        os.replace(temporary, PORTFOLIO_FILE)
     finally:
-        if os.path.exists(temporary_path):
-            os.remove(temporary_path)
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
-def get_user_portfolio(user_id):
+@contextmanager
+def store_transaction():
+    """
+    fcntl ใช้กับ Linux/Render
+    ล็อกการอ่าน-แก้-เขียนข้ามเธรดและข้ามโปรเซส
+    """
+    directory = os.path.dirname(PORTFOLIO_FILE)
+    os.makedirs(directory, exist_ok=True)
+
     with storage_lock:
-        data = load_store_unlocked()
+        with open(
+            PORTFOLIO_FILE + ".lock",
+            "a+",
+            encoding="utf-8",
+        ) as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                data = load_store_unlocked()
+                yield data
+                save_store_unlocked(data)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-        if looks_like_single_portfolio(data):
-            portfolio = normalize_portfolio(data)
-            data = {user_id: portfolio}
-            save_store_unlocked(data)
-            return copy.deepcopy(portfolio)
 
-        portfolio = normalize_portfolio(data.get(user_id))
-        data[user_id] = portfolio
-        save_store_unlocked(data)
-        return copy.deepcopy(portfolio)
+def user_in_store(data, user_id):
+    if "cash" in data or "stocks" in data:
+        raise StorageError(
+            "พบพอร์ตเดิมแบบไม่มีเจ้าของ "
+            "ต้องระบุเจ้าของก่อนย้ายข้อมูล"
+        )
+
+    if user_id not in data:
+        data[user_id] = default_portfolio()
+
+    data[user_id] = normalize_portfolio(data[user_id])
+    return data[user_id]
 
 
-def update_user_portfolio(user_id, portfolio):
-    with storage_lock:
-        data = load_store_unlocked()
-        if looks_like_single_portfolio(data):
-            data = {}
+def get_portfolio(user_id):
+    with store_transaction() as data:
+        return copy.deepcopy(user_in_store(data, user_id))
+
+
+def mutate_portfolio(user_id, callback, event_id=None):
+    with store_transaction() as data:
+        processed = data.setdefault("__processed_events__", {})
+
+        if not isinstance(processed, dict):
+            raise StorageError("ข้อมูลป้องกันรายการซ้ำไม่ถูกต้อง")
+
+        if event_id and event_id in processed:
+            previous = processed[event_id]
+            if previous["user_id"] != user_id:
+                raise StorageError("รหัสเหตุการณ์ไม่ตรงกับผู้ใช้")
+            return "รายการนี้บันทึกไว้แล้ว ไม่ได้ทำซ้ำ\n" + previous["reply"]
+
+        portfolio = user_in_store(data, user_id)
+        reply = callback(portfolio)
         data[user_id] = normalize_portfolio(portfolio)
-        save_store_unlocked(data)
+
+        if event_id:
+            processed[event_id] = {
+                "user_id": user_id,
+                "reply": reply,
+            }
+            while len(processed) > 2000:
+                processed.pop(next(iter(processed)))
+
+        return reply
 
 
-def get_registered_users():
-    with storage_lock:
-        data = load_store_unlocked()
-    if looks_like_single_portfolio(data):
-        return []
-    return [uid for uid, value in data.items() if isinstance(value, dict)]
+def registered_users():
+    with store_transaction() as data:
+        if "cash" in data or "stocks" in data:
+            raise StorageError("ยังไม่ได้ระบุเจ้าของพอร์ตเดิม")
+
+        return [
+            key for key, value in data.items()
+            if not key.startswith("__") and isinstance(value, dict)
+        ]
 
 
 # =========================================================
-# MARKET DATA CACHE (CHUNKED DOWNLOADS & RATE LIMIT FIX)
+# MARKET DATA
 # =========================================================
 
 market_cache = {}
 market_cache_lock = threading.RLock()
 
 
-def extract_downloaded_frame(downloaded, symbol, total_symbols):
+def extract_frame(downloaded, symbol, count):
     if downloaded is None or downloaded.empty:
         return None
 
-    try:
-        if isinstance(downloaded.columns, pd.MultiIndex):
-            level_zero = downloaded.columns.get_level_values(0)
-            level_one = downloaded.columns.get_level_values(1)
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        frame = None
 
-            if symbol in level_zero:
-                frame = downloaded[symbol].copy()
-            elif symbol in level_one:
-                frame = downloaded.xs(symbol, axis=1, level=1).copy()
-            else:
-                return None
-        elif total_symbols == 1:
-            frame = downloaded.copy()
-        else:
+        for level in range(downloaded.columns.nlevels):
+            if symbol in downloaded.columns.get_level_values(level):
+                frame = downloaded.xs(
+                    symbol, axis=1, level=level
+                ).copy()
+                break
+
+        if frame is None:
             return None
-
-        frame.columns = [str(column).strip().title() for column in frame.columns]
-        required = {"Open", "High", "Low", "Close", "Volume"}
-
-        if not required.issubset(frame.columns):
-            return None
-
-        frame = frame[["Open", "High", "Low", "Close", "Volume"]].copy()
-        frame = frame.dropna(subset=["Close"])
-
-        return None if frame.empty else frame
-    except Exception:
-        logger.exception("แยกข้อมูล %s ไม่สำเร็จ", symbol)
+    elif count == 1:
+        frame = downloaded.copy()
+    else:
         return None
 
+    frame.columns = [
+        str(column).strip().title()
+        for column in frame.columns
+    ]
 
-def get_market_frames(symbols, force=False):
-    symbols = unique_symbols(symbols)
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    if not set(required).issubset(frame.columns):
+        return None
+
+    optional = [
+        col for col in ["Dividends", "Stock Splits"]
+        if col in frame.columns
+    ]
+
+    frame = frame[required + optional].copy()
+    index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+
+    if index.tz is not None:
+        index = index.tz_convert(
+            "Asia/Bangkok"
+        ).tz_localize(None)
+
+    frame.index = index.normalize()
+    frame = frame.sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+
+    for col in required + optional:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    frame = frame.dropna(subset=required)
+
+    valid = (
+        (frame["Open"] > 0)
+        & (frame["High"] > 0)
+        & (frame["Low"] > 0)
+        & (frame["Close"] > 0)
+        & (frame["Volume"] >= 0)
+        & (frame["High"] >= frame["Low"])
+        & (frame["High"] >= frame["Open"])
+        & (frame["High"] >= frame["Close"])
+        & (frame["Low"] <= frame["Open"])
+        & (frame["Low"] <= frame["Close"])
+    )
+
+    frame = frame[valid]
+
+    return frame if not frame.empty else None
+
+
+def completed_frame(frame):
+    if frame is None or frame.empty:
+        return None
+
+    current = now_bkk()
+    today = pd.Timestamp(current.date())
+
+    # ก่อน 18:00 น. ไม่ใช้แท่งรายวันของวันนี้
+    if (current.hour, current.minute) < (18, 0):
+        result = frame[frame.index < today]
+    else:
+        result = frame[frame.index <= today]
+
+    return result.copy() if not result.empty else None
+
+
+def get_market_frames(symbols):
+    requested = unique_symbols(symbols)
     now = time.time()
     results = {}
     missing = []
 
     with market_cache_lock:
-        for symbol in symbols:
-            item = market_cache.get(symbol)
-            if not force and item and item["expires_at"] > now:
-                if isinstance(item["frame"], pd.DataFrame):
-                    results[symbol] = item["frame"].copy()
+        for symbol in requested:
+            cached = market_cache.get(symbol)
+
+            if cached and cached["expires_at"] > now:
+                if cached["frame"] is not None:
+                    results[symbol] = cached["frame"].copy()
             else:
                 missing.append(symbol)
 
-    if missing:
-        chunk_size = 15
-        for i in range(0, len(missing), chunk_size):
-            chunk = missing[i:i + chunk_size]
+    for offset in range(0, len(missing), 10):
+        chunk = missing[offset:offset + 10]
+
+        try:
+            downloaded = yf.download(
+                tickers=chunk,
+                period="2y",
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+                group_by="ticker",
+                threads=False,
+                progress=False,
+                timeout=20,
+            )
+        except Exception:
+            logger.exception("ดาวน์โหลดข้อมูลตลาดไม่สำเร็จ")
+            downloaded = None
+
+        for symbol in chunk:
             try:
-                downloaded = yf.download(
-                    tickers=chunk,
-                    period="2y",
-                    interval="1d",
-                    auto_adjust=False,
-                    group_by="ticker",
-                    threads=True,
-                    progress=False,
+                frame = extract_frame(
+                    downloaded, symbol, len(chunk)
                 )
-
-                for symbol in chunk:
-                    frame = extract_downloaded_frame(downloaded, symbol, len(chunk))
-                    with market_cache_lock:
-                        market_cache[symbol] = {
-                            "expires_at": now + (CACHE_SECONDS if frame is not None else 60),
-                            "frame": frame,
-                        }
-                    if frame is not None:
-                        results[symbol] = frame.copy()
-                time.sleep(0.5)
             except Exception:
-                logger.exception("ดาวน์โหลดข้อมูลตลาดแบบ Batch ไม่สำเร็จสำหรับกลุ่ม %s", chunk)
+                logger.exception("แยกข้อมูล %s ไม่สำเร็จ", symbol)
+                frame = None
 
-    return results
+            with market_cache_lock:
+                market_cache[symbol] = {
+                    "expires_at": now + (
+                        CACHE_SECONDS if frame is not None else 60
+                    ),
+                    "frame": frame,
+                }
 
+            if frame is not None:
+                results[symbol] = frame.copy()
 
-# =========================================================
-# TECHNICAL ANALYSIS & MARKET REGIME
-# =========================================================
+        if offset + 10 < len(missing):
+            time.sleep(0.5)
 
-def calculate_rsi(close, period=14):
-    delta = close.diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
+    output = {}
 
-    average_gain = gains.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    average_loss = losses.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    for symbol, frame in results.items():
+        complete = completed_frame(frame)
+        if complete is not None:
+            output[symbol] = complete
 
-    relative_strength = average_gain / average_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + relative_strength))
-
-    if rsi.empty or pd.isna(rsi.iloc[-1]):
-        return 50.0
-
-    return float(rsi.iloc[-1])
-
-
-def period_return(close, days):
-    if len(close) <= days:
-        return 0.0
-    past = float(close.iloc[-1 - days])
-    if past <= 0:
-        return 0.0
-    return (float(close.iloc[-1]) / past - 1) * 100
+    return output
 
 
-def check_weekly_trend(frame):
-    if frame is None or len(frame) < 120:
-        return True
-    try:
-        weekly = frame.resample('W').agg({
-            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-        }).dropna()
-        if len(weekly) < 25:
-            return True
-        w_close = weekly['Close'].astype(float)
-        w_ema20 = w_close.ewm(span=20, adjust=False).mean()
-        return float(w_close.iloc[-1]) >= float(w_ema20.iloc[-1])
-    except Exception:
-        return True
-
-
-def calculate_bollinger_squeeze(close, window=20):
-    if len(close) < window:
-        return False, 0.0
-    sma = close.rolling(window).mean()
-    std = close.rolling(window).std()
-    upper = sma + (2 * std)
-    lower = sma - (2 * std)
-    bandwidth = (upper - lower) / sma
-    recent_bw = bandwidth.tail(60)
-    is_squeeze = float(bandwidth.iloc[-1]) <= float(recent_bw.quantile(0.2))
-    return is_squeeze, float(bandwidth.iloc[-1])
-
-
-def check_price_action(data_row):
-    try:
-        high = float(data_row['High'])
-        low = float(data_row['Low'])
-        close = float(data_row['Close'])
-        rng = high - low
-        if rng <= 0:
-            return False
-        close_location = (close - low) / rng
-        return close_location >= 0.65
-    except Exception:
+def frame_recent(frame):
+    if frame is None or frame.empty:
         return False
 
+    age = (now_bkk().date() - frame.index[-1].date()).days
+    return 0 <= age <= MAX_DATA_AGE_DAYS
 
-def calculate_snapshot(frame):
-    if frame is None or len(frame) < 60:
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def rsi_value(close, period=14):
+    changes = close.diff().dropna().tolist()
+
+    if len(changes) < period:
         return None
 
-    data = frame.copy().dropna(subset=["Close"])
-    if len(data) < 60:
+    gain = sum(max(x, 0) for x in changes[:period]) / period
+    loss = sum(max(-x, 0) for x in changes[:period]) / period
+
+    for change in changes[period:]:
+        gain = (
+            gain * (period - 1) + max(change, 0)
+        ) / period
+        loss = (
+            loss * (period - 1) + max(-change, 0)
+        ) / period
+
+    if loss == 0:
+        return 100.0 if gain > 0 else 50.0
+
+    return 100 - 100 / (1 + gain / loss)
+
+
+def snapshot(frame):
+    if frame is None or len(frame) < 90:
         return None
 
-    close = data["Close"].astype(float)
-    high = data["High"].astype(float)
-    low = data["Low"].astype(float)
-    volume = data["Volume"].fillna(0).astype(float)
+    close = frame["Close"].astype(float)
+    price = float(close.iloc[-1])
 
-    ema10 = close.ewm(span=10, adjust=False).mean()
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
 
-    macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    histogram = macd_line - signal_line
+    macd = (
+        close.ewm(span=12, adjust=False).mean()
+        - close.ewm(span=26, adjust=False).mean()
+    )
+    hist = macd - macd.ewm(span=9, adjust=False).mean()
 
-    previous_close = close.shift(1)
+    previous = close.shift(1)
     true_range = pd.concat(
-        [high - low, (high - previous_close).abs(), (low - previous_close).abs()],
+        [
+            frame["High"] - frame["Low"],
+            (frame["High"] - previous).abs(),
+            (frame["Low"] - previous).abs(),
+        ],
         axis=1,
     ).max(axis=1)
-    atr_series = true_range.rolling(14).mean()
 
-    previous_20 = data.iloc[:-1].tail(20)
-    previous_10 = data.iloc[:-1].tail(10)
+    atr = float(true_range.rolling(14).mean().iloc[-1])
+    rsi = rsi_value(close)
 
-    if previous_20.empty or previous_10.empty:
+    if (
+        price <= 0
+        or not math.isfinite(atr)
+        or atr <= 0
+        or rsi is None
+    ):
         return None
 
-    price = float(close.iloc[-1])
-    atr = float(atr_series.iloc[-1])
-    if not math.isfinite(atr) or atr <= 0:
-        atr = price * 0.025
+    previous20 = frame.iloc[-21:-1]
+    previous10 = frame.iloc[-11:-1]
 
-    ema20_val = float(ema20.iloc[-1])
-    is_squeeze, bw_val = calculate_bollinger_squeeze(close)
-    is_strong_close = check_price_action(data.iloc[-1])
-    is_weekly_up = check_weekly_trend(data)
+    average_volume = float(previous20["Volume"].mean())
+    volume_ratio = (
+        float(frame["Volume"].iloc[-1]) / average_volume
+        if average_volume > 0 else 0
+    )
 
-    average_volume20 = float(previous_20["Volume"].fillna(0).mean())
-    current_volume = float(volume.iloc[-1])
-    traded_values = previous_20["Close"] * previous_20["Volume"].fillna(0)
+    # W-FRI กำหนด label เป็นวันศุกร์
+    # หากแท่งล่าสุดเป็นวันจันทร์–พฤหัสบดี
+    # สัปดาห์นั้นจะมี label เป็นวันศุกร์ในอนาคตและถูกตัดออก
+    weekly = close.resample("W-FRI").last().dropna()
+    weekly = weekly[weekly.index <= frame.index[-1]]
 
-    return {
-        "price": price,
-        "ema10": float(ema10.iloc[-1]),
-        "ema20": ema20_val,
-        "ema50": float(ema50.iloc[-1]),
-        "rsi": calculate_rsi(close),
-        "macd_hist": float(histogram.iloc[-1]),
-        "macd_hist_prev": float(histogram.iloc[-2]),
-        "atr": atr,
-        "atr_pct": (atr / price * 100) if price > 0 else 0.0,
-        "previous_high20": float(previous_20["High"].max()),
-        "previous_low10": float(previous_10["Low"].min()),
-        "volume_ratio": (current_volume / average_volume20) if average_volume20 > 0 else 0.0,
-        "average_traded_value": float(traded_values.mean()),
-        "ret_5": period_return(close, 5),
-        "ret_20": period_return(close, 20),
-        "ret_60": period_return(close, 60),
-        "extension_pct": ((price - ema20_val) / ema20_val * 100) if ema20_val > 0 else 0.0,
-        "is_squeeze": is_squeeze,
-        "bandwidth": bw_val,
-        "is_strong_close": is_strong_close,
-        "is_weekly_up": is_weekly_up,
-        "data_date": str(data.index[-1].date()),
-    }
+    weekly_up = False
 
+    if len(weekly) >= 25:
+        weekly_ema = weekly.ewm(
+            span=20, adjust=False
+        ).mean()
+        weekly_up = bool(
+            weekly.iloc[-1] >= weekly_ema.iloc[-1]
+        )
 
-def get_market_regime(frames):
-    index_frame = frames.get(MARKET_INDEX_SYMBOL)
-    index_snapshot = calculate_snapshot(index_frame) if index_frame is not None else None
-
-    above_ema50_count = 0
-    total_checked = 0
-
-    for sym, fr in frames.items():
-        if sym == MARKET_INDEX_SYMBOL:
-            continue
-        snap = calculate_snapshot(fr)
-        if snap:
-            total_checked += 1
-            if snap["price"] > snap["ema50"]:
-                above_ema50_count += 1
-
-    breadth_pct = (above_ema50_count / total_checked * 100) if total_checked > 0 else 50.0
-
-    if index_snapshot is not None:
-        index_positive = index_snapshot["price"] > index_snapshot["ema50"]
-        index_ret20 = index_snapshot["ret_20"]
-        index_ret60 = index_snapshot["ret_60"]
-    else:
-        index_positive = breadth_pct >= 40.0
-        index_ret20 = 0.0
-        index_ret60 = 0.0
-
-    breadth_healthy = breadth_pct >= 40.0
-    overall_positive = index_positive and breadth_healthy
-
-    status = "POSITIVE" if overall_positive else "DEFENSIVE"
-    message = (
-        f"ตลาดรวมแข็งแกร่ง (Breadth: {breadth_pct:.1f}% ยืนเหนือ EMA50)"
-        if overall_positive
-        else f"ตลาดระมัดระวัง (Breadth: {breadth_pct:.1f}% ยืนเหนือ EMA50)"
+    last = frame.iloc[-1]
+    candle_range = float(last["High"] - last["Low"])
+    strong_close = bool(
+        candle_range > 0
+        and (
+            float(last["Close"]) - float(last["Low"])
+        ) / candle_range >= 0.65
     )
 
     return {
-        "status": status,
-        "is_positive": overall_positive,
-        "message": message,
-        "breadth_pct": breadth_pct,
-        "ret_20": index_ret20,
-        "ret_60": index_ret60,
+        "date": frame.index[-1].strftime("%Y-%m-%d"),
+        "price": price,
+        "ema20": float(ema20.iloc[-1]),
+        "ema50": float(ema50.iloc[-1]),
+        "rsi": rsi,
+        "atr": atr,
+        "atr_pct": atr / price * 100,
+        "hist": float(hist.iloc[-1]),
+        "hist_prev": float(hist.iloc[-2]),
+        "weekly_up": weekly_up,
+        "strong_close": strong_close,
+        "previous_high20": float(previous20["High"].max()),
+        "previous_low10": float(previous10["Low"].min()),
+        "volume_ratio": volume_ratio,
+        "average_value": float(
+            (
+                previous20["Close"]
+                * previous20["Volume"]
+            ).mean()
+        ),
+        "ret20": (
+            price / float(close.iloc[-21]) - 1
+        ) * 100,
+        "extension_pct": (
+            price / float(ema20.iloc[-1]) - 1
+        ) * 100,
     }
 
 
-def compute_sector_rankings(frames):
-    sector_performances = {}
-    sector_counts = {}
+def market_context(frames):
+    index_frame = frames.get(INDEX_SYMBOL)
+    index_snap = (
+        snapshot(index_frame)
+        if frame_recent(index_frame)
+        else None
+    )
 
-    for sym, fr in frames.items():
-        if sym == MARKET_INDEX_SYMBOL:
-            continue
-        sec = SECTOR_MAP.get(sym, "ทั่วไป")
-        snap = calculate_snapshot(fr)
-        if snap:
-            ret = snap["ret_20"]
-            sector_performances[sec] = sector_performances.get(sec, 0.0) + ret
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+    available = {}
 
-    sector_averages = {
-        sec: (sector_performances[sec] / sector_counts[sec])
-        for sec in sector_performances if sector_counts[sec] > 0
+    for symbol in UNIVERSE:
+        frame = frames.get(symbol)
+
+        if frame_recent(frame):
+            snap = snapshot(frame)
+            if snap:
+                available[symbol] = snap
+
+    asof = max(
+        (snap["date"] for snap in available.values()),
+        default=None,
+    )
+
+    comparable = {
+        symbol: snap
+        for symbol, snap in available.items()
+        if snap["date"] == asof
     }
 
-    sorted_sectors = sorted(sector_averages.keys(), key=lambda x: sector_averages[x], reverse=True)
-    top_sectors = set(sorted_sectors[:3])
-    return top_sectors, sector_averages
+    breadth = (
+        100 * sum(
+            snap["price"] > snap["ema50"]
+            for snap in comparable.values()
+        ) / len(comparable)
+        if comparable else None
+    )
 
+    coverage = (
+        len(comparable) / len(UNIVERSE)
+        if UNIVERSE else 0
+    )
 
-def create_trade_levels(snapshot, setup):
-    price = snapshot["price"]
-    atr = snapshot["atr"]
+    sufficient = bool(
+        asof
+        and len(comparable) >= 20
+        and coverage >= 0.8
+        and index_snap
+        and index_snap["date"] == asof
+    )
 
-    if setup == "PULLBACK":
-        atr_stop = price - (1.2 * atr)
-    else:
-        atr_stop = price - (1.5 * atr)
-
-    structure_stop = snapshot["previous_low10"] * 0.995
-    stop_loss = max(atr_stop, structure_stop)
-    stop_loss = min(stop_loss, price * 0.985)
-    stop_loss = max(stop_loss, price * 0.90)
-
-    risk_per_share = max(price - stop_loss, price * 0.015)
-    fee_buffer = price * (round_trip_cost_pct() / 100)
-    target_1r = price + risk_per_share + fee_buffer
-    target_2r = price + (2 * risk_per_share) + fee_buffer
-    days_to_target = math.ceil((target_2r - price) / atr) if atr > 0 else 0
+    positive = bool(
+        sufficient
+        and breadth >= 40
+        and index_snap["price"] > index_snap["ema50"]
+    )
 
     return {
-        "entry_price": round(price, 2),
-        "stop_loss": round(stop_loss, 2),
-        "target_1r": round(target_1r, 2),
-        "target_price": round(target_2r, 2),
-        "risk_per_share": risk_per_share,
-        "expected_days": max(1, days_to_target),
+        "date": asof,
+        "breadth": breadth,
+        "checked": len(comparable),
+        "sufficient": sufficient,
+        "positive": positive,
+        "index_ret20": (
+            index_snap["ret20"] if index_snap else None
+        ),
     }
 
 
-def detect_setup(snapshot):
-    price = snapshot["price"]
-    uptrend = price > snapshot["ema50"] and snapshot["ema20"] > snapshot["ema50"]
-
-    if not uptrend:
+def analyze_symbol(symbol, frame, context):
+    if not frame_recent(frame):
         return None
 
-    if price > snapshot["previous_high20"] and snapshot["volume_ratio"] >= 1.3:
-        return "BREAKOUT"
+    snap = snapshot(frame)
+    if snap is None:
+        return None
+
+    price = snap["price"]
+    uptrend = (
+        price > snap["ema50"]
+        and snap["ema20"] > snap["ema50"]
+    )
+
+    setup = None
+
+    if uptrend:
+        if (
+            price > snap["previous_high20"]
+            and snap["volume_ratio"] >= 1.3
+        ):
+            setup = "BREAKOUT"
+        elif (
+            -1 <= snap["extension_pct"] <= 4.5
+            and 40 <= snap["rsi"] <= 62
+            and snap["hist"] > snap["hist_prev"]
+        ):
+            setup = "PULLBACK"
+        elif (
+            snap["hist"] > 0
+            and 52 <= snap["rsi"] <= 72
+        ):
+            setup = "MOMENTUM"
+
+    tests = [
+        (
+            price > snap["ema20"] > snap["ema50"],
+            20,
+            "ราคายืนเหนือ EMA20 และ EMA50",
+        ),
+        (
+            snap["weekly_up"],
+            12,
+            "แนวโน้มสัปดาห์ที่จบแล้วเป็นบวก",
+        ),
+        (
+            context["index_ret20"] is not None
+            and snap["ret20"] > context["index_ret20"],
+            10,
+            "ผลตอบแทน 20 วันแข็งกว่าดัชนี",
+        ),
+        (
+            snap["hist"] > 0
+            and snap["hist"] > snap["hist_prev"],
+            10,
+            "MACD เป็นบวกและเพิ่มขึ้น",
+        ),
+        (
+            50 <= snap["rsi"] <= 70,
+            8,
+            "RSI อยู่ในช่วงที่กำหนด",
+        ),
+        (
+            snap["volume_ratio"] >= 1.5,
+            10,
+            "Volume สูงกว่าค่าเฉลี่ย",
+        ),
+        (
+            setup is not None,
+            12,
+            "มีรูปแบบเข้าซื้อตามกฎ",
+        ),
+        (
+            snap["strong_close"],
+            8,
+            "ราคาปิดใกล้จุดสูงของวัน",
+        ),
+        (
+            MIN_ATR_PCT <= snap["atr_pct"] <= 7,
+            5,
+            "ATR อยู่ในช่วงที่กำหนด",
+        ),
+        (
+            context["positive"],
+            5,
+            "ตลาดรวมผ่านเกณฑ์",
+        ),
+    ]
+
+    score = sum(points for passed, points, _ in tests if passed)
+    reasons = [
+        reason for passed, _, reason in tests if passed
+    ]
+
+    stop = round(
+        max(
+            price - 1.5 * snap["atr"],
+            snap["previous_low10"] * 0.995,
+        ),
+        2,
+    )
+    stop = min(stop, round(price * 0.985, 2))
+    stop = max(stop, round(price * 0.90, 2))
+
+    target = round(
+        price + 2 * (price - stop),
+        2,
+    )
+
+    blocked = [
+        not context["sufficient"],
+        not context["positive"],
+        snap["date"] != context["date"],
+        not uptrend,
+        setup is None,
+        snap["average_value"] < MIN_AVG_VALUE,
+        not MIN_ATR_PCT <= snap["atr_pct"] <= MAX_ATR_PCT,
+        snap["rsi"] >= 80,
+        stop <= 0,
+        stop >= price,
+    ]
+
+    return {
+        **snap,
+        "symbol": symbol,
+        "sector": SECTOR_MAP.get(symbol, "ทั่วไป"),
+        "setup": setup,
+        "score": score,
+        "stop": stop,
+        "target": target,
+        "reasons": reasons,
+        "passes": not any(blocked),
+    }
+
+
+# =========================================================
+# PORTFOLIO RISK
+# =========================================================
+
+def portfolio_equity(portfolio, frames):
+    cash = float(portfolio.get("cash", 0))
+    stock_value = 0.0
+    missing = []
+
+    for symbol, info in portfolio["stocks"].items():
+        frame = frames.get(symbol)
+
+        if not frame_recent(frame):
+            missing.append(symbol)
+            continue
+
+        stock_value += (
+            int(info["shares"])
+            * float(frame["Close"].iloc[-1])
+        )
+
+    if missing:
+        return None, None, missing
+
+    return cash + stock_value, stock_value, []
+
+
+def open_risk(portfolio, frames):
+    result = 0.0
+
+    for symbol, info in portfolio["stocks"].items():
+        frame = frames.get(symbol)
+
+        if not frame_recent(frame):
+            return None
+
+        stop = float(info.get("stop_loss", 0))
+        if stop <= 0:
+            return None
+
+        price = float(frame["Close"].iloc[-1])
+        result += max(0, price - stop) * int(info["shares"])
+
+    return result
+
+
+def paused(portfolio, equity):
+    plan = portfolio["financial_plan"]
+    peak = max(
+        float(portfolio.get("high_water_mark", equity)),
+        equity,
+    )
+    drawdown = (peak - equity) / peak if peak > 0 else 0
+
+    return (
+        equity <= float(
+            plan.get("trading_paused_at_value", 8000)
+        )
+        or drawdown >= float(
+            plan.get("max_portfolio_drawdown_pct", 0.20)
+        )
+    )
+
+
+def trade_cost(entry, quantity):
+    gross = entry * (1 + SLIPPAGE) * quantity
+    return gross + commission(gross)
+
+
+def trade_stop_loss(entry, stop, quantity):
+    cost = trade_cost(entry, quantity)
+    exit_gross = stop * (1 - SLIPPAGE) * quantity
+    proceeds = exit_gross - commission(exit_gross)
+    return max(0.0, cost - proceeds)
+
+
+def choose_quantity(
+    entry, stop, money_limit, risk_limit
+):
+    if entry <= stop or risk_limit <= 0 or money_limit <= 0:
+        return 0
+
+    estimated_cap = int(
+        money_limit / (entry * (1 + SLIPPAGE))
+    )
+
+    step = BOARD_LOT
+    if ALLOW_ODD_LOT and estimated_cap < BOARD_LOT:
+        step = 1
+
+    low = 0
+    high = max(0, estimated_cap // step)
+
+    while low < high:
+        middle = (low + high + 1) // 2
+        quantity = middle * step
+
+        if (
+            trade_cost(entry, quantity) <= money_limit
+            and trade_stop_loss(entry, stop, quantity) <= risk_limit
+        ):
+            low = middle
+        else:
+            high = middle - 1
+
+    return low * step
+
+
+# =========================================================
+# SIGNAL TRACKING
+# =========================================================
+
+def new_signal(item):
+    return (
+        isinstance(item, dict)
+        and item.get("tracking_version") == TRACKING_VERSION
+    )
+
+
+def active_symbols(portfolio):
+    return {
+        item.get("symbol")
+        for item in portfolio["signal_history"]
+        if new_signal(item)
+        and item.get("status") in {
+            "PENDING", "DELIVERY_UNKNOWN"
+        }
+    }
+
+
+def prepare_signals(user_id, selected):
+    """
+    จองสัญญาณก่อนส่งรายงาน
+    DELIVERY_UNKNOWN ยังไม่นับผล
+    """
+    created_ids = []
+
+    def prepare(portfolio):
+        history = portfolio["signal_history"]
+        active = active_symbols(portfolio)
+
+        for item in selected:
+            symbol = item["symbol"]
+
+            if symbol in active:
+                continue
+
+            same_bar = any(
+                new_signal(old)
+                and old.get("symbol") == symbol
+                and old.get("data_date") == item["date"]
+                for old in history
+            )
+
+            if same_bar:
+                continue
+
+            signal_id = uuid.uuid4().hex
+
+            history.append({
+                "id": signal_id,
+                "tracking_version": TRACKING_VERSION,
+                "created_at": utc_text(),
+                "published_at": None,
+                "eligible_date": None,
+                "data_date": item["date"],
+                "symbol": symbol,
+                "setup": item["setup"],
+                "score": item["score"],
+                "entry_price": item["price"],
+                "stop_loss": item["stop"],
+                "target_price": item["target"],
+                "quantity": item["quantity"],
+                "horizon": SIGNAL_HORIZON,
+                "slippage": SLIPPAGE,
+                "max_entry_gap": MAX_ENTRY_GAP,
+                "fees": {
+                    "rate": COMMISSION_RATE,
+                    "vat": VAT_RATE,
+                    "minimum": MIN_COMMISSION,
+                },
+                "status": "DELIVERY_UNKNOWN",
+            })
+
+            created_ids.append(signal_id)
+            active.add(symbol)
+
+        return "จองสัญญาณแล้ว"
+
+    mutate_portfolio(user_id, prepare)
+    return created_ids
+
+
+def confirm_delivery(user_id, signal_ids):
+    if not signal_ids:
+        return
+
+    published = now_bkk()
+
+    def update(portfolio):
+        for item in portfolio["signal_history"]:
+            if (
+                not new_signal(item)
+                or item.get("id") not in signal_ids
+                or item.get("status") != "DELIVERY_UNKNOWN"
+            ):
+                continue
+
+            data_day = datetime.fromisoformat(
+                item["data_date"]
+            ).date()
+
+            # ถ้ารายงานส่งก่อนเปิดตลาด
+            # และใช้แท่งวันก่อนหน้า ให้เริ่มติดตามวันนี้
+            before_open = (
+                (published.hour, published.minute) < (9, 30)
+                and data_day < published.date()
+            )
+
+            eligible = (
+                published.date()
+                if before_open
+                else published.date() + timedelta(days=1)
+            )
+
+            item["published_at"] = published.isoformat()
+            item["eligible_date"] = eligible.isoformat()
+            item["status"] = "PENDING"
+
+        return "ยืนยันเวลาส่งแล้ว"
+
+    mutate_portfolio(user_id, update)
+
+
+def benchmark_return(index_frame, entry_day, exit_day):
+    if (
+        index_frame is None
+        or entry_day not in index_frame.index
+        or exit_day not in index_frame.index
+    ):
+        return None
+
+    first = float(index_frame.loc[entry_day, "Close"])
+    last = float(index_frame.loc[exit_day, "Close"])
+
+    if first <= 0:
+        return None
+
+    return (last / first - 1) * 100
+
+
+def evaluate_signal(item, frame, index_frame):
+    if not frame_recent(frame) or not frame_recent(index_frame):
+        return None, "ข้อมูลหุ้นหรือดัชนียังไม่พร้อม"
+
+    if not {"Dividends", "Stock Splits"}.issubset(frame.columns):
+        return None, "ข้อมูลปันผล/แตกหุ้นไม่ครบ"
+
+    eligible = item.get("eligible_date")
+    if not eligible:
+        return None, "ยังไม่มีวันเริ่มติดตามที่ยืนยันได้"
+
+    data_day = pd.Timestamp(item["data_date"])
+    if frame.index[0] > data_day:
+        return None, "ข้อมูลราคาไม่ครอบคลุมวันอ้างอิง"
+
+    latest = min(frame.index[-1], index_frame.index[-1])
+
+    days = index_frame.index[
+        (index_frame.index >= pd.Timestamp(eligible))
+        & (index_frame.index <= latest)
+    ]
+
+    if len(days) == 0:
+        return None, "รอวันซื้อขายหลังส่งคำแนะนำ"
+
+    entry_ref = float(item["entry_price"])
+    stop = float(item["stop_loss"])
+    target = float(item["target_price"])
+    quantity = int(item["quantity"])
+    slippage = float(item["slippage"])
+    max_gap = float(item["max_entry_gap"])
+    fees = item["fees"]
+    horizon = int(item["horizon"])
 
     if (
-        -1.0 <= snapshot["extension_pct"] <= 4.5
-        and 40 <= snapshot["rsi"] <= 62
-        and snapshot["macd_hist"] > snapshot["macd_hist_prev"]
+        not 0 < stop < entry_ref < target
+        or quantity <= 0
+        or horizon <= 0
     ):
-        return "PULLBACK"
+        return {
+            "status": "REVIEW",
+            "detail": "ข้อมูลระดับราคาหรือจำนวนหุ้นไม่ถูกต้อง",
+            "evaluated_at": utc_text(),
+        }, None
 
-    if snapshot["macd_hist"] > 0 and 52 <= snapshot["rsi"] <= 72:
-        return "MOMENTUM"
+    entry_fill = None
+    entry_cost = None
+    entry_day = None
 
-    return None
+    def finish(status, day, detail, exit_price=None):
+        outcome = {
+            "status": status,
+            "event_date": day.strftime("%Y-%m-%d"),
+            "detail": detail,
+            "evaluated_at": utc_text(),
+        }
 
+        if entry_fill is not None:
+            outcome["entry_fill"] = entry_fill
+            outcome["entry_date"] = entry_day.strftime("%Y-%m-%d")
 
-SETUP_LABEL = {
-    "BREAKOUT": "เบรกแนวต้าน 20 วัน",
-    "PULLBACK": "ย่อตัวในแนวโน้มขาขึ้น",
-    "MOMENTUM": "โมเมนตัมต่อเนื่อง",
-}
+        if exit_price is not None and entry_cost is not None:
+            exit_fill = exit_price * (1 - slippage)
+            gross = exit_fill * quantity
+            proceeds = gross - commission(gross, fees)
+            net_pnl = proceeds - entry_cost
 
+            outcome["exit_fill"] = exit_fill
+            outcome["net_pnl"] = net_pnl
+            outcome["net_return_pct"] = net_pnl / entry_cost * 100
+            outcome["index_return_pct"] = benchmark_return(
+                index_frame, entry_day, day
+            )
 
-def analyze_swing_symbol(symbol, frame, market_regime, top_sectors=None):
-    snapshot = calculate_snapshot(frame)
-    if snapshot is None:
-        return None
+        return outcome, None
 
-    price = snapshot["price"]
-    sector = SECTOR_MAP.get(symbol, "ทั่วไป")
-    market_ret20 = safe_float(market_regime.get("ret_20"), 0.0)
-    rs_20 = snapshot["ret_20"] - market_ret20
+    for number, day in enumerate(days[:horizon], 1):
+        if day not in frame.index:
+            return None, (
+                f"ข้อมูลหุ้นวันที่ {day.date()} ขาด "
+                "จึงไม่ข้ามไปตัดสินวันหลัง"
+            )
 
-    setup = detect_setup(snapshot)
-    score = 0
-    reasons = []
+        row = frame.loc[day]
 
-    if price > snapshot["ema20"] > snapshot["ema50"]:
-        score += 18
-        reasons.append("โครงสร้างขาขึ้น ราคายืนเหนือ EMA20 และ EMA50")
-    elif price > snapshot["ema50"]:
-        score += 8
-        reasons.append("ราคายืนเหนือ EMA50")
-    else:
-        reasons.append("ราคายังต่ำกว่า EMA50")
+        if (
+            float(row["Dividends"]) != 0
+            or float(row["Stock Splits"]) != 0
+        ):
+            return finish(
+                "REVIEW",
+                day,
+                "พบปันผลหรือแตกหุ้น ต้องตรวจผลกระทบต่อราคา",
+            )
 
-    if snapshot["is_weekly_up"]:
-        score += 10
-        reasons.append("โครงสร้างรายสัปดาห์ (Weekly) ขาขึ้นแข็งแกร่ง")
+        opening = float(row["Open"])
+        high = float(row["High"])
+        low = float(row["Low"])
+        close = float(row["Close"])
 
-    if top_sectors and sector in top_sectors:
-        score += 12
-        reasons.append(f"อยู่ในกลุ่มอุตสาหกรรมนำตลาด ({sector})")
+        if entry_fill is None:
+            candidate_fill = opening * (1 + slippage)
 
-    if market_ret20 != 0.0 and rs_20 > 0:
-        score += 12
-        reasons.append(f"แข็งกว่าตลาดใน 20 วัน {rs_20:+.1f}%")
+            if (
+                candidate_fill <= stop
+                or candidate_fill >= target
+                or candidate_fill > entry_ref * (1 + max_gap)
+            ):
+                return finish(
+                    "CANCELLED",
+                    day,
+                    "ราคาเปิดไม่เข้าเงื่อนไขซื้อจำลอง",
+                )
 
-    if snapshot["macd_hist"] > 0 and snapshot["macd_hist"] > snapshot["macd_hist_prev"]:
-        score += 10
-        reasons.append("MACD เป็นบวกและกำลังขยายตัว")
+            entry_fill = candidate_fill
+            entry_day = day
 
-    if 50 <= snapshot["rsi"] <= 70:
-        score += 8
-        reasons.append(f"RSI {snapshot['rsi']:.1f} อยู่ในโซนโมเมนตัม")
+            gross = entry_fill * quantity
+            entry_cost = gross + commission(gross, fees)
 
-    if snapshot["volume_ratio"] >= 1.5:
-        score += 10
-        reasons.append(f"Volume หนาแน่น {snapshot['volume_ratio']:.2f}x")
-
-    if setup == "BREAKOUT":
-        score += 12
-        reasons.append("เกิดสัญญาณเบรกแนวต้าน 20 วัน")
-    elif setup == "PULLBACK":
-        score += 10
-        reasons.append("ย่อตัวเข้าหาแนวรับ EMA20")
-
-    if snapshot["is_squeeze"]:
-        score += 10
-        reasons.append("Bollinger Bands บีบตัวแคบ (Squeeze) เตรียมระเบิดราคา")
-
-    if snapshot["is_strong_close"]:
-        score += 8
-        reasons.append("แท่งเทียนปิดแข็งแกร่งบริเวณราคาสูงสุดของวัน")
-
-    if MIN_ATR_PCT <= snapshot["atr_pct"] <= 7.0:
-        score += 6
-
-    if market_regime.get("is_positive") is True:
-        score += 5
-    elif market_regime.get("is_positive") is False:
-        score -= 10
-        reasons.append("หักคะแนนเนื่องจากตลาดรวมระมัดระวัง")
-
-    rejected = False
-    if snapshot["average_traded_value"] < MIN_AVG_VALUE:
-        rejected = True
-    if snapshot["rsi"] >= 80:
-        rejected = True
-        reasons.append("RSI สูงเกิน 80 เสี่ยงไล่ราคา")
-    if price < snapshot["ema50"] and snapshot["macd_hist"] < 0:
-        rejected = True
-        reasons.append("ราคาและ MACD อยู่ในโครงสร้างขาลง")
-    if snapshot["atr_pct"] < MIN_ATR_PCT:
-        rejected = True
-    if snapshot["atr_pct"] > MAX_ATR_PCT:
-        rejected = True
-
-    score = max(0, min(int(score), 100))
-
-    if rejected:
-        action = "REJECT"
-    elif setup and score >= 60:
-        action = "BUY"
-    elif score >= 50:
-        action = "WATCH"
-    else:
-        action = "HOLD"
-
-    levels = create_trade_levels(snapshot, setup or "MOMENTUM")
-
-    return {
-        "symbol": symbol,
-        "sector": sector,
-        "score": score,
-        "action": action,
-        "setup": setup,
-        "setup_label": SETUP_LABEL.get(setup, "ยังไม่มีรูปแบบเข้าเทรดชัดเจน"),
-        "rs_20": rs_20,
-        "rs_60": 0.0,
-        "reasons": reasons,
-        **snapshot,
-        **levels,
-    }
-
-
-# =========================================================
-# RISK AND POSITION SIZING
-# =========================================================
-
-def recent_loss_streak(portfolio):
-    streak = 0
-    for transaction in reversed(portfolio.get("transactions", [])):
-        if transaction.get("type") != "SELL":
-            continue
-        if safe_float(transaction.get("realized_pnl"), 0) < 0:
-            streak += 1
         else:
-            break
-    return streak
+            # ราคาเปิดเกิดก่อน High/Low ของวันนั้น
+            if opening <= stop:
+                return finish(
+                    "STOP",
+                    day,
+                    "เปิดต่ำกว่า Stop ใช้ราคาเปิดจำลองการออก",
+                    opening,
+                )
+
+            if opening >= target:
+                return finish(
+                    "TARGET",
+                    day,
+                    "เปิดถึงเป้า ใช้ราคาเป้าจำลองการออก",
+                    target,
+                )
+
+        hit_stop = low <= stop
+        hit_target = high >= target
+
+        if hit_stop and hit_target:
+            return finish(
+                "AMBIGUOUS",
+                day,
+                "แท่งเดียวแตะ Stop และเป้า แยกลำดับไม่ได้",
+            )
+
+        if hit_stop:
+            return finish(
+                "STOP", day, "แตะ Stop ก่อนเป้า", stop
+            )
+
+        if hit_target:
+            return finish(
+                "TARGET", day, "แตะเป้าก่อน Stop", target
+            )
+
+        if number == horizon:
+            return finish(
+                "TIMEOUT",
+                day,
+                f"ครบ {horizon} วันซื้อขาย",
+                close,
+            )
+
+    return None, (
+        f"ติดตามแล้ว {min(len(days), horizon)}/{horizon} "
+        "วันซื้อขาย"
+    )
 
 
-def estimate_portfolio_equity(portfolio, frames):
-    cash = safe_float(portfolio.get("cash"), 0)
-    stock_value = 0.0
+def build_performance_report(user_id):
+    portfolio = get_portfolio(user_id)
+    history = portfolio["signal_history"]
 
-    for symbol, info in portfolio.get("stocks", {}).items():
-        frame = frames.get(symbol)
-        price = safe_float(info.get("average_cost"), 0)
-        if frame is not None and not frame.empty:
-            price = safe_float(frame["Close"].dropna().iloc[-1], price)
-        stock_value += int(info.get("shares", 0)) * price
+    if not history:
+        return (
+            "ยังไม่มีประวัติคำแนะนำที่ติดตามได้\n"
+            "เมื่อรายงาน ควรซื้อวันนี้ หรือ แผนเทรดวันนี้ "
+            "ส่งหุ้นที่ผ่านเกณฑ์ ระบบจะเริ่มบันทึก"
+        )
 
-    return cash + stock_value, stock_value
+    pending = [
+        item for item in history
+        if new_signal(item)
+        and item.get("status") == "PENDING"
+    ]
 
+    frames = get_market_frames(
+        [item["symbol"] for item in pending]
+        + [INDEX_SYMBOL]
+    ) if pending else {}
 
-def calculate_open_risk(portfolio, frames):
-    open_risk = 0.0
-    for symbol, info in portfolio.get("stocks", {}).items():
-        shares = int(info.get("shares", 0))
-        stop_loss = safe_float(info.get("stop_loss"), 0)
-        frame = frames.get(symbol)
-        price = safe_float(info.get("average_cost"), 0)
-        if frame is not None and not frame.empty:
-            price = safe_float(frame["Close"].dropna().iloc[-1], price)
-        open_risk += max(0.0, (price - stop_loss) * shares)
-    return open_risk
+    waiting_notes = {}
 
+    def update(portfolio):
+        for item in portfolio["signal_history"]:
+            if (
+                not new_signal(item)
+                or item.get("status") != "PENDING"
+            ):
+                continue
 
-def get_risk_profile(portfolio, equity=None, drawdown=0.0):
-    mode = str(portfolio.get("risk_mode", DEFAULT_RISK_MODE)).lower()
-    profile = dict(RISK_PROFILES.get(mode, RISK_PROFILES["balanced"]))
-    profile["mode"] = mode if mode in RISK_PROFILES else "balanced"
+            outcome, waiting = evaluate_signal(
+                item,
+                frames.get(item["symbol"]),
+                frames.get(INDEX_SYMBOL),
+            )
 
-    multiplier = 1.0
-    notes = []
+            if outcome is None:
+                waiting_notes[item["id"]] = waiting
+                continue
 
-    if drawdown >= 0.15:
-        multiplier *= 0.5
-        notes.append("ลดความเสี่ยงลงครึ่งหนึ่ง เนื่องจาก Drawdown เกิน 15%")
-    elif drawdown >= 0.08:
-        multiplier *= 0.7
-        notes.append("ลดความเสี่ยง 30% เนื่องจาก Drawdown เกิน 8%")
+            item["status"] = outcome["status"]
+            item["outcome"] = outcome
 
-    streak = recent_loss_streak(portfolio)
-    if streak >= 3:
-        multiplier *= 0.5
-        notes.append(f"แพ้ติดกัน {streak} ไม้ ระบบลดขนาดสถานะอัตโนมัติ")
-    elif streak == 2:
-        multiplier *= 0.7
-        notes.append("แพ้ติดกัน 2 ไม้ ระบบลดขนาดสถานะชั่วคราว")
+        return "อัปเดตผลแล้ว"
 
-    profile["risk_per_trade"] = max(profile["risk_per_trade"] * multiplier, 0.0025)
-    profile["max_total_risk"] = profile["max_total_risk"] * multiplier
-    profile["notes"] = notes
-    return profile
+    mutate_portfolio(user_id, update)
+    history = get_portfolio(user_id)["signal_history"]
 
+    statuses = Counter(
+        item.get("status", "REVIEW")
+        for item in history
+        if new_signal(item)
+    )
+    legacy_count = sum(
+        not new_signal(item)
+        for item in history
+    )
 
-def calculate_position_size(portfolio, equity, entry_price, stop_loss, profile, open_risk=0.0):
-    if entry_price <= 0 or stop_loss >= entry_price or equity <= 0:
-        return 0, "ระยะ Stop Loss ไม่สมเหตุสมผล"
+    grouped = defaultdict(list)
 
-    cash = safe_float(portfolio.get("cash"), 0)
-    risk_per_share = entry_price - stop_loss
-
-    remaining_risk = max(0.0, (equity * profile["max_total_risk"]) - open_risk)
-    risk_budget = min(equity * profile["risk_per_trade"], remaining_risk)
-
-    if risk_budget <= 0:
-        return 0, "ความเสี่ยงเปิดอยู่เต็มเพดานพอร์ตแล้ว"
-
-    shares_by_risk = int(risk_budget / risk_per_share)
-    shares_by_weight = int((equity * profile["max_weight"]) / entry_price)
-    shares_by_cash = int((cash * 0.97) / entry_price)
-
-    quantity = max(0, min(shares_by_risk, shares_by_weight, shares_by_cash))
-    if quantity <= 0:
-        return 0, "เงินสดหรืองบความเสี่ยงไม่พอสำหรับหุ้นราคานี้"
-
-    lot_quantity = (quantity // BOARD_LOT) * BOARD_LOT
-    if lot_quantity >= BOARD_LOT:
-        return lot_quantity, "ซื้อแบบกระดานหลัก (Board Lot)"
-
-    if ALLOW_ODD_LOT:
-        return quantity, "ซื้อผ่านกระดานหน่วยย่อย (Odd Lot) เนื่องจากพอร์ตยังเล็ก"
-
-    return 0, f"จำนวนต่ำกว่า 1 ล็อต ({BOARD_LOT} หุ้น)"
-
-
-def portfolio_risk_status(portfolio, equity):
-    plan = portfolio.get("financial_plan", {})
-    high_water_mark = max(safe_float(portfolio.get("high_water_mark"), equity), equity)
-    max_drawdown = safe_float(plan.get("max_portfolio_drawdown_pct"), 0.20)
-    stop_value = safe_float(plan.get("trading_paused_at_value"), 8000)
-
-    drawdown = ((high_water_mark - equity) / high_water_mark) if high_water_mark > 0 else 0
-
-    return {
-        "paused": equity <= stop_value or drawdown >= max_drawdown,
-        "drawdown": drawdown,
-        "high_water_mark": high_water_mark,
-    }
-
-
-# =========================================================
-# TRADE STATISTICS AND PLAN TRACKING
-# =========================================================
-
-def trade_metrics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
-    profits = [safe_float(t.get("realized_pnl"), 0) for t in sells]
-
-    if not profits:
-        return {
-            "count": 0, "win_rate": 0.45, "rr": 2.0, "expectancy_r": 0.35, "is_estimate": True,
-        }
-
-    wins = [p for p in profits if p > 0]
-    losses = [p for p in profits if p < 0]
-
-    win_rate = len(wins) / len(profits)
-    average_win = (sum(wins) / len(wins)) if wins else 0
-    average_loss = (abs(sum(losses)) / len(losses)) if losses else 0
-    rr = (average_win / average_loss) if average_loss > 0 else 2.0
-
-    if len(profits) < 10:
-        return {
-            "count": len(profits), "win_rate": 0.45, "rr": 2.0, "expectancy_r": 0.35, "is_estimate": True,
-        }
-
-    return {
-        "count": len(profits),
-        "win_rate": win_rate,
-        "rr": rr,
-        "expectancy_r": (win_rate * rr) - (1 - win_rate),
-        "is_estimate": False,
-    }
-
-
-def build_plan_report(portfolio, frames=None):
-    plan = portfolio.get("financial_plan", {})
-    target = safe_float(plan.get("target_value"), 20000)
-    months = max(int(safe_float(plan.get("target_months"), 3)), 1)
-
-    symbols = list(portfolio.get("stocks", {}).keys())
-    if frames is None:
-        frames = get_market_frames(symbols) if symbols else {}
-
-    equity, _ = estimate_portfolio_equity(portfolio, frames)
-    start_equity = max(safe_float(portfolio.get("plan_start_equity"), 10000), 1)
-    start_date = parse_iso(portfolio.get("plan_start_date"), datetime.now(timezone.utc))
-
-    total_days = months * 30.44
-    elapsed_days = max((datetime.now(timezone.utc) - start_date).days, 0)
-    remaining_days = max(total_days - elapsed_days, 1)
-
-    contributions = safe_float(portfolio.get("contributions_total"), 0)
-    base_capital = start_equity + contributions
-
-    required_total = (target / equity) - 1 if equity > 0 else 0
-    required_monthly = ((target / equity) ** (30.44 / remaining_days) - 1) if equity > 0 else 0
-
-    expected_now = start_equity * ((target / start_equity) ** (min(elapsed_days, total_days) / total_days))
-    pace_gap = equity - expected_now
+    for item in history:
+        if new_signal(item):
+            grouped[
+                item.get("setup") or "ไม่ระบุ"
+            ].append(item)
 
     lines = [
-        "แผนการเงินและความคืบหน้า",
-        f"เงินทุนตั้งต้น: {start_equity:,.2f} บาท",
-        f"มูลค่าพอร์ตปัจจุบัน: {equity:,.2f} บาท",
-        f"เป้าหมาย: {target:,.2f} บาท ภายใน {months} เดือน",
+        "ผลการแนะนำย้อนหลัง — ผลจำลอง",
+        f"ถึงเป้า {statuses['TARGET']} | "
+        f"Stop {statuses['STOP']} | "
+        f"ครบเวลา {statuses['TIMEOUT']}",
+        f"กำลังติดตาม {statuses['PENDING']} | "
+        f"แตะทั้งคู่ {statuses['AMBIGUOUS']}",
+        f"ไม่ได้เข้า {statuses['CANCELLED']} | "
+        f"ต้องตรวจ {statuses['REVIEW']}",
+        f"ส่งไม่ยืนยัน {statuses['DELIVERY_UNKNOWN']} | "
+        f"ประวัติรุ่นเก่า {legacy_count}",
         "",
-        f"ผ่านไป: {elapsed_days} วัน | เหลือ: {int(remaining_days)} วัน",
-        f"กำไรสะสม: {((equity / base_capital - 1) * 100) if base_capital > 0 else 0:+.2f}%",
-        f"ควรมีตามแผน: {expected_now:,.2f} บาท (ต่างกัน {pace_gap:+,.2f} บาท)",
-        "",
-        "สิ่งที่ต้องทำเพิ่ม",
-        f"- ผลตอบแทนที่ต้องการ: {required_total * 100:+.2f}% ({required_monthly * 100:+.2f}% ต่อเดือน)",
+        "แยกตามรูปแบบ:",
     ]
+
+    for setup in ["BREAKOUT", "PULLBACK", "MOMENTUM", "ไม่ระบุ"]:
+        items = grouped.get(setup, [])
+
+        if not items:
+            continue
+
+        counts = Counter(
+            item.get("status")
+            for item in items
+        )
+
+        evaluated = [
+            item["outcome"]
+            for item in items
+            if item.get("status") in {
+                "TARGET", "STOP", "TIMEOUT"
+            }
+            and "net_pnl" in item.get("outcome", {})
+        ]
+
+        net_total = sum(
+            result["net_pnl"]
+            for result in evaluated
+        )
+        profit_count = sum(
+            result["net_pnl"] > 0
+            for result in evaluated
+        )
+
+        lines.extend([
+            f"- {setup}: ทั้งหมด {len(items)} "
+            f"| ถึงเป้า {counts['TARGET']} "
+            f"| Stop {counts['STOP']} "
+            f"| ครบเวลา {counts['TIMEOUT']}",
+            f"  กำไรหลังต้นทุน {profit_count}/{len(evaluated)} "
+            f"รายการที่คำนวณได้ "
+            f"| P/L รวมรายสัญญาณ {net_total:+,.2f} บาท",
+            f"  รอ/ประเมินไม่ได้ "
+            f"{counts['PENDING'] + counts['AMBIGUOUS'] + counts['CANCELLED'] + counts['REVIEW'] + counts['DELIVERY_UNKNOWN']}",
+        ])
+
+    lines.extend(["", "10 รายการล่าสุด:"])
+
+    for item in history[-10:]:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = display_symbol(item.get("symbol", "?"))
+
+        if not new_signal(item):
+            lines.append(
+                f"- {symbol}: LEGACY — ไม่รวมสถิติใหม่"
+            )
+            continue
+
+        status = item.get("status", "REVIEW")
+        lines.append(
+            f"- {symbol} [{item.get('data_date', '-')}] "
+            f"{item.get('setup', '-')} — {status}"
+        )
+
+        outcome = item.get("outcome", {})
+
+        if outcome:
+            lines.append(
+                "  " + outcome.get("detail", "")
+            )
+
+            if "net_pnl" in outcome:
+                lines.append(
+                    f"  P/L จำลองสุทธิ "
+                    f"{outcome['net_pnl']:+,.2f} บาท "
+                    f"({outcome['net_return_pct']:+.2f}%)"
+                )
+
+                if outcome.get("index_return_pct") is not None:
+                    lines.append(
+                        f"  ดัชนีช่วงวันเข้า–ออกเดียวกัน "
+                        f"{outcome['index_return_pct']:+.2f}% "
+                        "(ยังไม่หักต้นทุน)"
+                    )
+
+        elif status == "PENDING":
+            lines.append(
+                "  " + waiting_notes.get(
+                    item["id"],
+                    "รอข้อมูลวันซื้อขายถัดไป",
+                )
+            )
+
+    lines.extend([
+        "",
+        "คะแนนไม่ใช่โอกาสชนะ",
+        "P/L รวมรายสัญญาณไม่ใช่ผลตอบแทนพอร์ตจริง "
+        "เพราะรายการต่างหุ้นอาจเกิดพร้อมกัน",
+        "ไม่รวมรายการที่ข้อมูลไม่พอ/แยกลำดับไม่ได้ "
+        "เป็นชนะหรือแพ้",
+    ])
+
     return "\n".join(lines)
 
 
-def calculate_trade_statistics(portfolio):
-    sells = [t for t in portfolio.get("transactions", []) if t.get("type") == "SELL"]
-    if not sells:
-        return "ยังไม่มีธุรกรรมขายสำหรับคำนวณสถิติ"
-
-    profits = [safe_float(t.get("realized_pnl"), 0) for t in sells]
-    wins = [v for v in profits if v > 0]
-    losses = [v for v in profits if v < 0]
-    metrics = trade_metrics(portfolio)
-
-    return (
-        "สถิติการเทรดขั้นสูง\n"
-        f"รายการขาย: {len(sells)} ครั้ง | ชนะ: {len(wins)} | แพ้: {len(losses)}\n"
-        f"Win Rate: {len(wins) / len(profits) * 100:.2f}%\n"
-        f"กำไร/ขาดทุนรวม: {sum(profits):+,.2f} บาท\n"
-        f"Expectancy: {metrics['expectancy_r']:+.2f}R ต่อไม้\n"
-        f"ค่าธรรมเนียมสะสม: {safe_float(portfolio.get('fees_total')):,.2f} บาท"
-    )
-
-
 # =========================================================
-# REPORT GENERATION & PERFORMANCE TRACKING
+# REPORTS
 # =========================================================
 
 def combined_universe(portfolio):
     return unique_symbols(
-        portfolio.get("watchlist", []) + list(portfolio.get("stocks", {}).keys())
+        portfolio["watchlist"]
+        + list(portfolio["stocks"])
     )
 
 
-def record_signal_history(portfolio, candidates):
-    history = portfolio.setdefault("signal_history", [])
-    today_dt = now_local().date()
-    
-    # ตรวจสอบหุ้นที่เพิ่งถูกแนะนำไปในช่วง 15 วันที่ผ่านมา (ไม่ให้บันทึกซ้ำซ้อน)
-    active_symbols = set()
-    for item in history:
-        try:
-            item_date = datetime.strptime(item.get("date", ""), "%Y-%m-%d").date()
-            # หากยังไม่เกิน 15 วัน ถือว่ายังอยู่ในช่วงติดตาม ห้ามบันทึกซ้ำ
-            if (today_dt - item_date).days < 15:
-                active_symbols.add(item["symbol"])
-        except (ValueError, TypeError):
+def market_text(context):
+    breadth = (
+        f"{context['breadth']:.1f}%"
+        if context["breadth"] is not None
+        else "ไม่ทราบ"
+    )
+
+    status = (
+        "ผ่านเกณฑ์"
+        if context["positive"]
+        else "ไม่ผ่านเกณฑ์/ข้อมูลไม่ครบ"
+    )
+
+    return (
+        f"ตลาด {status} | Breadth {breadth} "
+        f"จาก {context['checked']}/{len(UNIVERSE)} "
+        "หุ้นอ้างอิง"
+    )
+
+
+def scan_candidates(
+    portfolio, frames, context, requested, limit
+):
+    equity, _, missing = portfolio_equity(
+        portfolio, frames
+    )
+
+    if missing or equity is None:
+        return [], (
+            "ประเมินพอร์ตไม่ครบ: "
+            + ", ".join(display_symbol(s) for s in missing)
+        )
+
+    if paused(portfolio, equity):
+        return [], "พอร์ตเข้าเงื่อนไขหยุดเพิ่มความเสี่ยง"
+
+    existing_risk = open_risk(portfolio, frames)
+
+    if existing_risk is None:
+        return [], "ยังคำนวณความเสี่ยงหุ้นที่ถืออยู่ไม่ครบ"
+
+    profile = RISK_PROFILES[portfolio["risk_mode"]]
+    slots = max(
+        0,
+        profile["max_positions"]
+        - len(portfolio["stocks"]),
+    )
+
+    if slots == 0:
+        return [], "จำนวนสถานะในพอร์ตเต็ม"
+
+    active = active_symbols(portfolio)
+    candidates = []
+
+    for symbol in unique_symbols(requested):
+        if symbol in portfolio["stocks"] or symbol in active:
             continue
-    
-    for cand in candidates:
-        sym = cand["symbol"]
-        # ถ้าหุ้นตัวนี้เพิ่งถูกแนะนำไปไม่นาน จะถูกข้าม ไม่บันทึกซ้ำ
-        if sym not in active_symbols:
-            history.append({
-                "date": today_dt.strftime("%Y-%m-%d"),
-                "data_date": cand.get("data_date", today_dt.strftime("%Y-%m-%d")),
-                "symbol": sym,
-                "entry_price": cand["price"],
-                "stop_loss": cand["stop_loss"],
-                "target_price": cand["target_price"],
-                "setup": cand["setup_label"],
-                "score": cand["score"],
-                "rsi": cand["rsi"],
-                "volume_ratio": cand["volume_ratio"],
-                "status": "PENDING"
-            })
-            active_symbols.add(sym) # ป้องกันการซ้ำกันในรอบสแกนเดียวกันด้วย
-    
-    if len(history) > 100:
-        portfolio["signal_history"] = history[-100:]
+
+        result = analyze_symbol(
+            symbol, frames.get(symbol), context
+        )
+
+        if (
+            result
+            and result["passes"]
+            and result["score"] >= profile["min_score"]
+        ):
+            candidates.append(result)
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    cash = float(portfolio["cash"])
+    selected = []
+
+    for result in candidates:
+        if len(selected) >= min(limit, slots):
+            break
+
+        money_limit = min(
+            cash,
+            equity * profile["max_weight"],
+        )
+        risk_limit = min(
+            equity * profile["risk_per_trade"],
+            max(
+                0,
+                equity * profile["max_total_risk"]
+                - existing_risk,
+            ),
+        )
+
+        quantity = choose_quantity(
+            result["price"],
+            result["stop"],
+            money_limit,
+            risk_limit,
+        )
+
+        if quantity <= 0:
+            continue
+
+        cost = trade_cost(result["price"], quantity)
+        loss = trade_stop_loss(
+            result["price"],
+            result["stop"],
+            quantity,
+        )
+
+        candidate = dict(result)
+        candidate["quantity"] = quantity
+        candidate["estimated_cost"] = cost
+        candidate["estimated_stop_loss"] = loss
+        selected.append(candidate)
+
+        cash -= cost
+        existing_risk += loss
+
+    return selected, None
+
 
 def build_buy_today_report(portfolio):
     symbols = combined_universe(portfolio)
-    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
-    market_regime = get_market_regime(frames)
-    top_sectors, _ = compute_sector_rankings(frames)
 
-    equity, _ = estimate_portfolio_equity(portfolio, frames)
-    risk_status = portfolio_risk_status(portfolio, equity)
-    profile = get_risk_profile(portfolio, equity, risk_status["drawdown"])
-    open_risk = calculate_open_risk(portfolio, frames)
-    open_positions = len(portfolio.get("stocks", {}))
-    slots = max(0, profile["max_positions"] - open_positions)
+    frames = get_market_frames(
+        UNIVERSE
+        + symbols
+        + list(portfolio["stocks"])
+        + [INDEX_SYMBOL]
+    )
 
-    candidates = []
-    for symbol in symbols:
-        result = analyze_swing_symbol(symbol, frames.get(symbol), market_regime, top_sectors)
-        if not result or result["action"] != "BUY":
-            continue
-        if result["score"] < profile["min_score"]:
-            continue
-        if symbol in portfolio.get("stocks", {}):
-            continue
+    context = market_context(frames)
 
-        quantity, note = calculate_position_size(
-            portfolio, equity, result["entry_price"],
-            result["stop_loss"], profile, open_risk,
-        )
-        result["quantity"] = quantity
-        result["size_note"] = note
-        candidates.append(result)
-
-    candidates.sort(key=lambda item: (item["score"], item["rs_20"]), reverse=True)
-    
-    if candidates:
-        record_signal_history(portfolio, candidates)
-
-    top_candidates = candidates[:max(slots, 3)]
-    today_text = now_local().strftime("%d/%m/%Y %H:%M")
-    top_sector_names = ", ".join(list(top_sectors)[:3])
+    selected, issue = scan_candidates(
+        portfolio,
+        frames,
+        context,
+        symbols,
+        5,
+    )
 
     lines = [
-        f"หุ้นควรซื้อวันนี้ (ระบบสแกน 5 เทคนิคขั้นสูง) [{today_text}]",
-        f"ตลาดรวม: {market_regime['message']}",
-        f"กลุ่มอุตสาหกรรมนำตลาด: {top_sector_names or 'กำลังประเมิน'}",
-        f"มูลค่าพอร์ต: {equity:,.2f} บาท | โหมด: {profile['label']}",
+        "หุ้นควรซื้อวันนี้",
+        f"เวลารายงาน "
+        f"{now_bkk().strftime('%d/%m/%Y %H:%M')}",
+        f"แท่งราคาล่าสุด "
+        f"{context['date'] or 'ไม่พร้อม'}",
+        market_text(context),
     ]
 
-    if risk_status["paused"]:
-        lines.append("⚠️ พอร์ตถึงเงื่อนไขหยุดเพิ่มความเสี่ยง")
+    if issue:
+        lines.append(issue)
 
-    if not top_candidates:
+    if not selected:
+        lines.append("ยังไม่มีแผนซื้อใหม่ที่ผ่านครบ")
+
+        if active_symbols(portfolio):
+            lines.append(
+                "หุ้นที่มีสัญญาณกำลังติดตาม "
+                "จะไม่สร้างประวัติซ้ำ"
+            )
+
+        return "\n".join(lines), []
+
+    for number, item in enumerate(selected, 1):
         lines.extend([
             "",
-            "ยังไม่มีหุ้นผ่านเกณฑ์ในรอบนี้ (ระบบคัดกรองเข้มงวดเพื่อความปลอดภัย)",
-            "การถือเงินสดรอจังหวะคือกลยุทธ์ที่ถูกต้อง",
-        ])
-        return "\n".join(lines)
-
-    for index, result in enumerate(top_candidates, 1):
-        quantity = 0 if (risk_status["paused"] or slots <= 0) else result["quantity"]
-        cost = quantity * result["entry_price"]
-        net_target = net_profit_after_fee(result["entry_price"], result["target_price"], quantity)
-        reason_text = "\n  - ".join(result["reasons"][:4])
-        squeeze_text = "🔥 มีการบีบตัว" if result["is_squeeze"] else "ปกติ"
-
-        lines.extend([
-            "",
-            f"{index}. {display_symbol(result['symbol'])} [{result['sector']}] คะแนน {result['score']}/100",
-            f"  รูปแบบ: {result['setup_label']} | Squeeze: {squeeze_text}",
-            f"  ราคาล่าสุด: {result['price']:.2f} | RSI: {result['rsi']:.1f} | Volume: {result['volume_ratio']:.2f}x",
-            f"  จุดเข้า: {result['entry_price']:.2f} | Stop: {result['stop_loss']:.2f} | เป้า 2R: {result['target_price']:.2f}",
-            f"  ขนาดเหมาะสม: {quantity} หุ้น (~{cost:,.2f} ฿) | กำไรสุทธิเป้าหมาย: {net_target:,.2f} ฿",
-            f"  เหตุผล:\n  - {reason_text}",
+            f"{number}. {display_symbol(item['symbol'])} "
+            f"[{item['sector']}] คะแนน {item['score']}/100",
+            f"รูปแบบ {item['setup']}",
+            f"ราคาอ้างอิง {item['price']:.2f} บาท",
+            f"Stop {item['stop']:.2f} "
+            f"| เป้า {item['target']:.2f}",
+            f"จำนวนตามงบ {item['quantity']} หุ้น",
+            f"เงินที่ใช้ประมาณ "
+            f"{item['estimated_cost']:,.2f} บาท",
+            f"ขาดทุนจำลองที่ Stop "
+            f"{item['estimated_stop_loss']:,.2f} บาท",
+            "เหตุผล: " + "; ".join(item["reasons"][:3]),
         ])
 
-    return "\n".join(lines)
+    lines.append(
+        "\nราคาอ้างอิงเป็นแท่งรายวันที่จบแล้ว "
+        "ไม่ใช่ราคาซื้อที่รับประกันได้"
+    )
+
+    return "\n".join(lines), selected
 
 
-def build_performance_report(portfolio):
-    history = portfolio.get("signal_history", [])
-    if not history:
-        return "ยังไม่มีประวัติการแนะนำหุ้นย้อนหลังสำหรับตรวจสอบผล"
-
-    symbols = list(set(item["symbol"] for item in history))
-    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
-    market_regime = get_market_regime(frames)
-
-    lines = ["📊 รายงานผลการแนะนำหุ้นย้อนหลังเชิงลึก (Post-Mortem Analysis)\n"]
-    success_count = 0
-    fail_count = 0
-    pending_count = 0
-
-    for item in history[-10:]:
-        sym = item["symbol"]
-        rec_date = item["date"]
-        start_day = item.get("data_date")
-        entry = item["entry_price"]
-        stop = item["stop_loss"]
-        target = item["target_price"]
-        setup_name = item.get("setup", "ไม่ระบุรูปแบบ")
-
-        fr = frames.get(sym)
-        if fr is None or fr.empty:
-            continue
-
-        index_days = fr.index.strftime("%Y-%m-%d")
-        if start_day:
-            sub_fr = fr[index_days > start_day]
-        else:
-            sub_fr = fr[index_days >= rec_date]
-
-        current_price = float(fr["Close"].dropna().iloc[-1])
-        
-        if not sub_fr.empty:
-            max_price_after = float(sub_fr["High"].max())
-            min_price_after = float(sub_fr["Low"].min())
-            first_day_close = float(sub_fr["Close"].iloc[0]) if len(sub_fr) > 0 else current_price
-        else:
-            max_price_after = current_price
-            min_price_after = current_price
-            first_day_close = current_price
-
-        status = "PENDING"
-        reason = ""
-
-        if max_price_after >= target:
-            status = "SUCCESS"
-            success_count += 1
-            reason = f"🎯 ถึงเป้าหมาย 2R ที่ {target:.2f} ฿ สำเร็จ (สูงสุด {max_price_after:.2f} ฿)"
-        elif min_price_after <= stop:
-            status = "FAILED"
-            fail_count += 1
-            
-            failure_tags = []
-            if first_day_close > entry * 1.01 and min_price_after <= stop:
-                failure_tags.append("🐂 [False Breakout / Bull Trap]: เบรกขึ้นวันแรกแต่ถูกทุบหลุดแนวรับ")
-            if not market_regime["is_positive"]:
-                failure_tags.append("📉 [Market Drag]: ตลาดรวมเป็นลบ/ระมัดระวัง กดดันภาพรวม")
-            
-            snap = calculate_snapshot(fr)
-            if snap and snap["volume_ratio"] < 0.7:
-                failure_tags.append("💤 [Low Volume Fade]: ขาดแรงซื้อหนุนหลังวันแนะนำ")
-            
-            if not failure_tags:
-                failure_tags.append("🛑 [Volatility Stop Out]: แรงขายกดดันระยะสั้นชนจุดตัดขาดทุน")
-
-            reason = f"หลุดจุด Stop Loss ({stop:.2f} ฿)\n    - สาเหตุ: " + "\n    - ".join(failure_tags)
-        else:
-            pending_count += 1
-            pnl_pct = ((current_price - entry) / entry) * 100
-            reason = f"⏳ กำลังรันเทรนด์ (ราคาปัจจุบัน {current_price:.2f} ฿ | P/L: {pnl_pct:+.2f}%)"
-
-        icon = "🎯" if status == "SUCCESS" else ("🛑" if status == "FAILED" else "⏳")
-        lines.extend([
-            f"{icon} [{rec_date}] {display_symbol(sym)} ({setup_name})",
-            f"  - แนะนำที่: {entry:.2f} ฿ | สถานะ: {status}",
-            f"  - วิเคราะห์: {reason}\n"
-        ])
-
-    summary_header = f"📈 สรุปสถิติ: สำเร็จ {success_count} | ผิดทาง {fail_count} | กำลังติดตาม {pending_count}\n"
-    return summary_header + "\n".join(lines)
-
-
-def check_portfolio_sell_alerts(portfolio, frames=None):
-    stocks = portfolio.get("stocks", {})
-    if not stocks:
+def check_sell_alerts(portfolio):
+    if not portfolio["stocks"]:
         return ""
 
-    symbols = list(stocks.keys())
-    if frames is None:
-        frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
+    frames = get_market_frames(
+        list(portfolio["stocks"])
+    )
+    messages = []
 
-    market_regime = get_market_regime(frames)
-    top_sectors, _ = compute_sector_rankings(frames)
-    alerts = []
+    for symbol, info in portfolio["stocks"].items():
+        frame = frames.get(symbol)
 
-    for symbol, info in stocks.items():
-        shares = int(info.get("shares", 0))
-        average_cost = safe_float(info.get("average_cost"), 0)
-        stop_loss = safe_float(info.get("stop_loss"), average_cost * 0.95)
-        r_unit = max(safe_float(info.get("r_unit"), average_cost * 0.02), 0.01)
-        target_price = safe_float(info.get("target_price"), average_cost + 2 * r_unit)
-
-        result = analyze_swing_symbol(symbol, frames.get(symbol), market_regime, top_sectors)
-        price = result["price"] if result else average_cost
-        pnl_pct = ((price - average_cost) / average_cost * 100) if average_cost > 0 else 0
-        r_multiple = (price - average_cost) / r_unit
-
-        actions = []
-        if price <= stop_loss:
-            actions.append(f"ขายทั้งหมดทันที ราคาหลุด Stop Loss ที่ {stop_loss:.2f} บาท")
-        elif price >= target_price:
-            actions.append(f"ถึงเป้าหมาย 2R ({target_price:.2f} ฿) ควรขายทำกำไร")
-
-        if not actions:
+        if not frame_recent(frame):
+            messages.append(
+                f"{display_symbol(symbol)}: ราคาไม่พร้อม"
+            )
             continue
 
-        alerts.append(
-            f"{display_symbol(symbol)} ({shares} หุ้น) | P/L: {pnl_pct:+.2f}% ({r_multiple:+.2f}R)\n"
-            + "".join(f"  - {a}\n" for a in actions)
-        )
+        price = float(frame["Close"].iloc[-1])
+        stop = float(info.get("stop_loss", 0))
+        target = float(info.get("target_price", 0))
 
-    return "\n".join(alerts)
-
-
-def build_daily_plan_report(portfolio):
-    sections = [build_buy_today_report(portfolio)]
-    alerts = check_portfolio_sell_alerts(portfolio)
-    if alerts:
-        sections.append("🚨 แจ้งเตือนจุดขายพอร์ต\n\n" + alerts)
-    sections.append(build_plan_report(portfolio))
-    return "\n\n==============================\n\n".join(sections)
-
-
-def build_swing_report(portfolio, symbols, title, limit=10):
-    symbols = unique_symbols(symbols)
-    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL])
-    market_regime = get_market_regime(frames)
-    top_sectors, _ = compute_sector_rankings(frames)
-
-    equity, _ = estimate_portfolio_equity(portfolio, frames)
-    risk_status = portfolio_risk_status(portfolio, equity)
-    profile = get_risk_profile(portfolio, equity, risk_status["drawdown"])
-    open_risk = calculate_open_risk(portfolio, frames)
-
-    results = []
-    for symbol in symbols:
-        result = analyze_swing_symbol(symbol, frames.get(symbol), market_regime, top_sectors)
-        if result and result["action"] in {"BUY", "WATCH"}:
-            quantity, note = calculate_position_size(
-                portfolio, equity, result["entry_price"],
-                result["stop_loss"], profile, open_risk,
+        if stop > 0 and price <= stop:
+            messages.append(
+                f"{display_symbol(symbol)}: ราคาปิด "
+                f"{price:.2f} อยู่ที่/ต่ำกว่า Stop "
+                f"{stop:.2f}"
             )
-            result["quantity"] = quantity
-            result["size_note"] = note
-            results.append(result)
+        elif target > 0 and price >= target:
+            messages.append(
+                f"{display_symbol(symbol)}: ราคาปิด "
+                f"{price:.2f} ถึงเป้า {target:.2f}"
+            )
 
-    results.sort(key=lambda item: (item["score"], item["rs_20"]), reverse=True)
-    results = results[:limit]
-
-    lines = [
-        title,
-        f"ตลาดรวม: {market_regime['message']}",
-        f"มูลค่าพอร์ต: {equity:,.2f} บาท | โหมด {profile['label']}",
-    ]
-
-    if not results:
-        lines.extend(["", "ยังไม่มีหุ้นผ่านเกณฑ์"])
-        return "\n".join(lines)
-
-    for index, result in enumerate(results, 1):
-        quantity = 0 if risk_status["paused"] else result["quantity"]
-        lines.extend([
-            "",
-            f"{index}. {display_symbol(result['symbol'])} [{result['sector']}]",
-            f"สถานะ: {result['action']} | คะแนน {result['score']}/100 | {result['setup_label']}",
-            f"ราคา {result['price']:.2f} | RSI {result['rsi']:.1f}",
-            f"เข้า {result['entry_price']:.2f} | Stop {result['stop_loss']:.2f} | เป้า {result['target_price']:.2f}",
-            f"จำนวน: {quantity} หุ้น ({result['size_note']})",
-        ])
-
-    return "\n".join(lines)
+    return "\n".join(messages)
 
 
-def build_single_stock_report(portfolio, symbol):
-    formatted_symbol = format_symbol(symbol)
-    frames = get_market_frames(SET50_UNIVERSE + [formatted_symbol, MARKET_INDEX_SYMBOL])
-    market_regime = get_market_regime(frames)
-    top_sectors, _ = compute_sector_rankings(frames)
-    result = analyze_swing_symbol(formatted_symbol, frames.get(formatted_symbol), market_regime, top_sectors)
+def build_portfolio_report(portfolio):
+    frames = get_market_frames(
+        list(portfolio["stocks"])
+    ) if portfolio["stocks"] else {}
 
-    if not result:
-        return f"ไม่สามารถวิเคราะห์ {display_symbol(formatted_symbol)} ได้"
-
-    equity, _ = estimate_portfolio_equity(portfolio, frames)
-    profile = get_risk_profile(portfolio, equity)
-    open_risk = calculate_open_risk(portfolio, frames)
-    quantity, size_note = calculate_position_size(
-        portfolio, equity, result["entry_price"], result["stop_loss"], profile, open_risk,
+    equity, stock_value, missing = portfolio_equity(
+        portfolio, frames
     )
-
-    reason_text = "\n".join(f"- {r}" for r in result["reasons"])
-    return (
-        f"วิเคราะห์ {display_symbol(formatted_symbol)} [{result['sector']}]\n"
-        f"ตลาดรวม: {market_regime['message']}\n"
-        f"สถานะ: {result['action']} | คะแนน {result['score']}/100\n"
-        f"รูปแบบ: {result['setup_label']} | Squeeze: {result['is_squeeze']}\n"
-        f"ราคา: {result['price']:.2f} | RSI: {result['rsi']:.1f} | Volume: {result['volume_ratio']:.2f}x\n"
-        f"จุดเข้า: {result['entry_price']:.2f} | Stop: {result['stop_loss']:.2f} | เป้า: {result['target_price']:.2f}\n"
-        f"จำนวนที่เหมาะสม: {quantity} หุ้น ({size_note})\n"
-        f"เหตุผลเชิงเทคนิค:\n{reason_text}\n\n"
-        "ผลวิเคราะห์ไม่ใช่การรับประกันผลตอบแทน"
-    )
-
-
-def build_portfolio_report(user_id, update_trailing=False):
-    portfolio = get_user_portfolio(user_id)
-    stocks = portfolio.get("stocks", {})
-    symbols = list(stocks.keys())
-
-    frames = get_market_frames(symbols + [MARKET_INDEX_SYMBOL]) if symbols else {}
-    equity, stock_value = estimate_portfolio_equity(portfolio, frames)
-    cash = safe_float(portfolio.get("cash"), 0)
-    risk_status = portfolio_risk_status(portfolio, equity)
-    profile = get_risk_profile(portfolio, equity, risk_status["drawdown"])
 
     lines = [
         "สถานะพอร์ต",
-        f"เงินสด: {cash:,.2f} ฿ | หุ้น: {stock_value:,.2f} ฿ | รวม: {equity:,.2f} ฿",
-        f"Drawdown: {risk_status['drawdown'] * 100:.2f}% | โหมด: {profile['label']}",
+        f"เงินสด {float(portfolio['cash']):,.2f} บาท",
     ]
 
-    if not stocks:
-        lines.extend(["", "ยังไม่มีหุ้นในพอร์ต"])
-        update_user_portfolio(user_id, portfolio)
-        return "\n".join(lines)
+    if equity is None:
+        lines.append(
+            "ราคาหุ้นบางตัวไม่พร้อม "
+            "จึงไม่สรุปมูลค่าพอร์ตรวม"
+        )
+        lines.append(
+            "ข้อมูลที่ขาด: "
+            + ", ".join(display_symbol(s) for s in missing)
+        )
+    else:
+        lines.extend([
+            f"มูลค่าหุ้นประมาณ {stock_value:,.2f} บาท",
+            f"มูลค่ารวมประมาณ {equity:,.2f} บาท",
+        ])
 
-    lines.extend(["", "รายการหุ้น"])
-    for symbol, info in stocks.items():
-        shares = int(info.get("shares", 0))
-        average_cost = safe_float(info.get("average_cost"), 0)
+    if not portfolio["stocks"]:
+        lines.append("ยังไม่มีหุ้นในพอร์ต")
+
+    for symbol, info in portfolio["stocks"].items():
         frame = frames.get(symbol)
-        price = average_cost
-        is_live_price = True
-        
-        if frame is not None and not frame.empty:
-            snap = calculate_snapshot(frame)
-            if snap:
-                price = snap["price"]
-            else:
-                is_live_price = False
+
+        if frame_recent(frame):
+            price_text = (
+                f"{float(frame['Close'].iloc[-1]):.2f} บาท "
+                f"({frame.index[-1].date()})"
+            )
         else:
-            is_live_price = False
+            price_text = "ราคาไม่พร้อม"
 
-        pnl = (price - average_cost) * shares
-        pnl_pct = ((price - average_cost) / average_cost * 100) if average_cost > 0 else 0
-        price_note = "" if is_live_price else " (ใช้ราคาอ้างอิงเดิม)"
-        lines.append(f"- {display_symbol(symbol)}: {shares} หุ้น | ต้นทุน {average_cost:.2f} | ล่าสุด {price:.2f}{price_note} ({pnl_pct:+.2f}%)")
+        lines.append(
+            f"- {display_symbol(symbol)} "
+            f"{int(info['shares'])} หุ้น "
+            f"| ต้นทุน {float(info.get('average_cost', 0)):.2f} "
+            f"| {price_text}"
+        )
 
-    update_user_portfolio(user_id, portfolio)
+    return "\n".join(lines)
+
+
+def build_plan_report(portfolio):
+    frames = get_market_frames(
+        list(portfolio["stocks"])
+    ) if portfolio["stocks"] else {}
+
+    equity, _, _ = portfolio_equity(
+        portfolio, frames
+    )
+    plan = portfolio["financial_plan"]
+
+    target = float(plan.get("target_value", 20000))
+    months = int(plan.get("target_months", 3))
+
+    lines = [
+        "แผนการเงิน",
+        f"เป้าหมาย {target:,.2f} บาท "
+        f"ภายใน {months} เดือน",
+    ]
+
+    if equity is None:
+        lines.append("ข้อมูลราคาไม่ครบ ยังประเมินความคืบหน้าไม่ได้")
+    else:
+        lines.extend([
+            f"มูลค่าพอร์ตประมาณ {equity:,.2f} บาท",
+            f"ส่วนต่างถึงเป้า "
+            f"{max(0, target - equity):,.2f} บาท",
+        ])
+
+    lines.append(
+        "เป้าหมายไม่ใช่ผลตอบแทนที่รับประกัน"
+    )
+
+    return "\n".join(lines)
+
+
+def trade_statistics(portfolio):
+    sells = [
+        item for item in portfolio["transactions"]
+        if item.get("type") == "SELL"
+    ]
+
+    if not sells:
+        return "ยังไม่มีรายการขายที่บันทึก"
+
+    values = [
+        float(item.get("realized_pnl", 0))
+        for item in sells
+    ]
+    wins = sum(value > 0 for value in values)
+    losses = sum(value < 0 for value in values)
+
+    return "\n".join([
+        "สถิติรายการขายที่บันทึก",
+        f"ขาย {len(sells)} รายการ "
+        f"| กำไร {wins} "
+        f"| ขาดทุน {losses}",
+        f"รายการที่กำไร "
+        f"{wins / len(sells) * 100:.1f}%",
+        f"P/L สุทธิรวม "
+        f"{sum(values):+,.2f} บาท",
+        "การขายบางส่วนถูกนับเป็นคนละรายการ",
+    ])
+
+
+def build_daily_plan(portfolio):
+    buy_report, selected = build_buy_today_report(portfolio)
+
+    sections = [buy_report]
+    alerts = check_sell_alerts(portfolio)
+
+    if alerts:
+        sections.append("ตรวจจุดขาย\n" + alerts)
+
+    sections.append(build_plan_report(portfolio))
+
+    return (
+        "\n\n--------------------\n\n".join(sections),
+        selected,
+    )
+
+
+def build_scan_report(portfolio, requested, title, limit):
+    frames = get_market_frames(
+        UNIVERSE
+        + list(requested)
+        + list(portfolio["stocks"])
+        + [INDEX_SYMBOL]
+    )
+    context = market_context(frames)
+
+    selected, issue = scan_candidates(
+        portfolio, frames, context, requested, limit
+    )
+
+    lines = [
+        title,
+        market_text(context),
+        f"แท่งราคาอ้างอิง "
+        f"{context['date'] or 'ไม่พร้อม'}",
+    ]
+
+    if issue:
+        lines.append(issue)
+
+    if not selected:
+        lines.append("ยังไม่มีหุ้นผ่านเกณฑ์เสนอซื้อใหม่")
+
+    for item in selected:
+        lines.extend([
+            "",
+            f"- {display_symbol(item['symbol'])}: "
+            f"{item['score']}/100 [{item['setup']}]",
+            f"  ราคา {item['price']:.2f} "
+            f"| Stop {item['stop']:.2f} "
+            f"| เป้า {item['target']:.2f}",
+            f"  จำนวนตามงบ {item['quantity']} หุ้น",
+        ])
+
+    lines.append(
+        "คำสั่งสแกนนี้ไม่บันทึกสัญญาณ "
+        "ใช้ ควรซื้อวันนี้ หรือ แผนเทรดวันนี้ "
+        "เมื่อต้องการเริ่มติดตามผล"
+    )
+
+    return "\n".join(lines)
+
+
+def build_single_report(portfolio, symbol):
+    frames = get_market_frames(
+        UNIVERSE
+        + list(portfolio["stocks"])
+        + [symbol, INDEX_SYMBOL]
+    )
+    context = market_context(frames)
+    result = analyze_symbol(
+        symbol, frames.get(symbol), context
+    )
+
+    if result is None:
+        return (
+            f"ข้อมูล {display_symbol(symbol)} "
+            "ไม่พอหรือเก่าเกินเกณฑ์"
+        )
+
+    lines = [
+        f"วิเคราะห์ {display_symbol(symbol)}",
+        market_text(context),
+        f"ราคาอ้างอิง {result['price']:.2f} "
+        f"({result['date']})",
+        f"คะแนนตามกฎ {result['score']}/100",
+        f"รูปแบบ {result['setup'] or 'ยังไม่มี'}",
+        f"RSI {result['rsi']:.1f} "
+        f"| Volume {result['volume_ratio']:.2f} เท่า",
+    ]
+
+    if symbol in portfolio["stocks"]:
+        lines.append(
+            "หุ้นนี้อยู่ในพอร์ตแล้ว "
+            "ให้ใช้ Stop/เป้าที่บันทึกในพอร์ต"
+        )
+    elif symbol in active_symbols(portfolio):
+        lines.append(
+            "มีสัญญาณเดิมกำลังติดตามอยู่"
+        )
+    elif result["passes"]:
+        lines.append(
+            f"Stop สำหรับพิจารณา {result['stop']:.2f} "
+            f"| เป้า {result['target']:.2f}"
+        )
+    else:
+        lines.append(
+            "ยังไม่ผ่านเงื่อนไขเสนอซื้อครบ"
+        )
+
+    lines.extend(
+        "- " + reason
+        for reason in result["reasons"][:4]
+    )
+    lines.append(
+        "การวิเคราะห์รายตัวไม่บันทึกในผลการแนะนำย้อนหลัง"
+    )
+
     return "\n".join(lines)
 
 
 # =========================================================
-# BACKGROUND QUEUE & COMMANDS
+# MANUAL TRANSACTIONS
 # =========================================================
 
-executor = ThreadPoolExecutor(max_workers=2)
-pending_jobs = set()
-pending_jobs_lock = threading.RLock()
-
-
-def run_scan_job(user_id, job_type, payload=None):
-    try:
-        portfolio = get_user_portfolio(user_id)
-        if job_type == "summary":
-            result = build_swing_report(portfolio, combined_universe(portfolio), "สรุปหุ้นวันนี้ (Top 5)", limit=5)
-        elif job_type == "buy_today":
-            result = build_buy_today_report(portfolio)
-            update_user_portfolio(user_id, portfolio)
-        elif job_type == "daily_plan":
-            result = build_daily_plan_report(portfolio)
-            update_user_portfolio(user_id, portfolio)
-        elif job_type == "sell_check":
-            alerts = check_portfolio_sell_alerts(portfolio)
-            result = "🚨 แจ้งเตือนจุดขาย\n\n" + alerts if alerts else "ตรวจสอบแล้ว หุ้นในพอร์ตยังอยู่ในเกณฑ์ปกติ"
-        elif job_type == "performance":
-            result = build_performance_report(portfolio)
-        elif job_type == "scan":
-            result = build_swing_report(portfolio, combined_universe(portfolio), "ผลสแกนหุ้นขั้นสูง", limit=10)
-        elif job_type == "set50":
-            result = build_swing_report(portfolio, SET50_UNIVERSE, "ผลสแกน SET50", limit=10)
-        elif job_type == "single":
-            result = build_single_stock_report(portfolio, payload)
-        else:
-            result = "ไม่รู้จักประเภทการสแกน"
-
-        push_long_message(user_id, result)
-    except Exception:
-        logger.exception("Background scan failed")
-        push_long_message(user_id, "ระบบสแกนขัดข้องชั่วคราว")
-    finally:
-        with pending_jobs_lock:
-            pending_jobs.discard((user_id, job_type, payload or ""))
-
-
-def queue_scan(user_id, job_type, payload=None):
-    job_key = (user_id, job_type, payload or "")
-    with pending_jobs_lock:
-        if job_key in pending_jobs:
-            return False
-        pending_jobs.add(job_key)
-    executor.submit(run_scan_job, user_id, job_type, payload)
-    return True
-
-
-def process_buy(portfolio, symbol, shares, price, fee=None):
-    symbol = format_symbol(symbol)
-    shares = positive_int(shares, "จำนวนหุ้น")
-    price = positive_float(price, "ราคา")
+def record_buy(portfolio, symbol, shares, price, fee):
     gross = shares * price
-    fee = calculate_commission(gross) if fee in (None, "") else non_negative_float(fee, "ค่าธรรมเนียม")
-    total_cost = gross + fee
-    cash = safe_float(portfolio.get("cash"), 0)
+    actual_fee = commission(gross) if fee is None else fee
+    total = gross + actual_fee
+    cash = float(portfolio["cash"])
 
-    if total_cost > cash:
-        raise ValueError(f"เงินสดไม่พอ ต้องใช้ {total_cost:,.2f} ฿ แต่มี {cash:,.2f} ฿")
+    if total > cash:
+        raise ValueError(
+            f"เงินสดไม่พอ ต้องใช้ {total:,.2f} บาท"
+        )
 
-    frames = get_market_frames([symbol, MARKET_INDEX_SYMBOL])
-    market_regime = get_market_regime(frames)
-    analysis = analyze_swing_symbol(symbol, frames.get(symbol), market_regime)
-    stop_loss = analysis["stop_loss"] if analysis else round(price * 0.95, 2)
-
-    stocks = portfolio.setdefault("stocks", {})
+    stocks = portfolio["stocks"]
     old = stocks.get(symbol)
+
     if old:
-        new_shares = int(old["shares"]) + shares
-        new_total_cost = safe_float(old.get("total_cost"), 0) + total_cost
-        new_average = new_total_cost / new_shares
+        old_shares = int(old["shares"])
+        old_cost = float(
+            old.get(
+                "total_cost",
+                float(old.get("average_cost", 0))
+                * old_shares,
+            )
+        )
+
+        new_shares = old_shares + shares
+        new_cost = old_cost + total
+
+        old["shares"] = new_shares
+        old["total_cost"] = new_cost
+        old["average_cost"] = new_cost / new_shares
+
+        note = (
+            "คง Stop/เป้าเดิมไว้ "
+            "กรุณาทบทวนแผนหลังซื้อเพิ่ม"
+        )
+        average = old["average_cost"]
+
     else:
-        new_shares = shares
-        new_total_cost = total_cost
-        new_average = total_cost / shares
+        average = total / shares
+        stop = round(price * 0.95, 2)
 
-    if stop_loss <= 0 or stop_loss >= new_average:
-        stop_loss = round(new_average * 0.95, 2)
+        if stop <= 0:
+            stop = max(price * 0.95, 0.01)
 
-    r_unit = max(new_average - stop_loss, new_average * 0.015)
-    stocks[symbol] = {
-        "shares": new_shares, "total_cost": new_total_cost, "average_cost": new_average,
-        "initial_stop": stop_loss, "stop_loss": stop_loss, "r_unit": r_unit,
-        "target_price": round(new_average + (2 * r_unit), 2),
-        "highest_price": max(price, new_average), "tp1_done": False, "opened_at": utc_now_text(),
-    }
-    portfolio["cash"] = cash - total_cost
-    portfolio["fees_total"] = safe_float(portfolio.get("fees_total"), 0) + fee
-    portfolio.setdefault("transactions", []).append({
-        "type": "BUY", "symbol": symbol, "shares": shares, "price": price, "fee": fee, "net_amount": total_cost, "date": utc_now_text(),
+        risk_unit = max(average - stop, 0.01)
+
+        stocks[symbol] = {
+            "shares": shares,
+            "total_cost": total,
+            "average_cost": average,
+            "initial_stop": stop,
+            "stop_loss": stop,
+            "r_unit": risk_unit,
+            "target_price": round(
+                average + 2 * risk_unit, 2
+            ),
+            "highest_price": max(price, average),
+            "opened_at": utc_text(),
+        }
+
+        note = (
+            "Stop เริ่มต้นเป็นค่าประมาณ "
+            "ไม่ใช่แนวรับที่ยืนยันจากตลาด"
+        )
+
+    portfolio["cash"] = cash - total
+    portfolio["fees_total"] = (
+        float(portfolio["fees_total"]) + actual_fee
+    )
+
+    portfolio["transactions"].append({
+        "type": "BUY",
+        "symbol": symbol,
+        "shares": shares,
+        "price": price,
+        "fee": actual_fee,
+        "net_amount": total,
+        "date": utc_text(),
     })
-    return f"บันทึกซื้อ {display_symbol(symbol)} {shares} หุ้น สำเร็จ (ต้นทุนเฉลี่ย {new_average:.2f} ฿)"
+
+    return (
+        f"บันทึกซื้อ {display_symbol(symbol)} "
+        f"{shares} หุ้นแล้ว\n"
+        f"ต้นทุนเฉลี่ย {average:.2f} บาท\n"
+        f"{note}\n"
+        "ไม่ได้ส่งคำสั่งซื้อจริง"
+    )
 
 
-def process_sell(portfolio, symbol, shares, price, fee=None):
-    symbol = format_symbol(symbol)
-    shares = positive_int(shares, "จำนวนหุ้น")
-    price = positive_float(price, "ราคา")
-    stocks = portfolio.setdefault("stocks", {})
+def record_sell(portfolio, symbol, shares, price, fee):
+    stocks = portfolio["stocks"]
 
     if symbol not in stocks:
-        raise ValueError(f"ไม่พบ {display_symbol(symbol)} ในพอร์ต")
+        raise ValueError("ไม่พบหุ้นนี้ในพอร์ต")
 
     info = stocks[symbol]
-    old_shares = int(info.get("shares", 0))
+    old_shares = int(info["shares"])
+
     if shares > old_shares:
-        raise ValueError(f"มีหุ้นเพียง {old_shares} หุ้น ไม่พอขาย")
+        raise ValueError(
+            f"มีหุ้นเพียง {old_shares} หุ้น"
+        )
 
-    gross = price * shares
-    fee = calculate_commission(gross) if fee in (None, "") else non_negative_float(fee, "ค่าธรรมเนียม")
-    old_total_cost = safe_float(info.get("total_cost"), 0)
-    average_cost = old_total_cost / old_shares
-    net_income = gross - fee
-    realized_pnl = net_income - (average_cost * shares)
+    gross = shares * price
+    actual_fee = commission(gross) if fee is None else fee
 
-    portfolio["cash"] = safe_float(portfolio.get("cash"), 0) + net_income
-    portfolio["realized_pnl_total"] = safe_float(portfolio.get("realized_pnl_total"), 0) + realized_pnl
-    portfolio["fees_total"] = safe_float(portfolio.get("fees_total"), 0) + fee
+    if actual_fee > gross:
+        raise ValueError(
+            "ค่าธรรมเนียมสูงกว่ามูลค่าขาย"
+        )
+
+    total_cost = float(
+        info.get(
+            "total_cost",
+            float(info.get("average_cost", 0))
+            * old_shares,
+        )
+    )
+
+    allocated = total_cost * shares / old_shares
+    received = gross - actual_fee
+    pnl = received - allocated
+
+    portfolio["cash"] = (
+        float(portfolio["cash"]) + received
+    )
+    portfolio["fees_total"] = (
+        float(portfolio["fees_total"]) + actual_fee
+    )
+    portfolio["realized_pnl_total"] = (
+        float(portfolio["realized_pnl_total"]) + pnl
+    )
 
     remaining = old_shares - shares
+
     if remaining == 0:
         del stocks[symbol]
     else:
         info["shares"] = remaining
-        info["total_cost"] = old_total_cost - (average_cost * shares)
+        info["total_cost"] = total_cost - allocated
+        info["average_cost"] = (
+            info["total_cost"] / remaining
+        )
 
-    portfolio.setdefault("transactions", []).append({
-        "type": "SELL", "symbol": symbol, "shares": shares, "price": price, "fee": fee, "realized_pnl": realized_pnl, "date": utc_now_text(),
+    portfolio["transactions"].append({
+        "type": "SELL",
+        "symbol": symbol,
+        "shares": shares,
+        "price": price,
+        "fee": actual_fee,
+        "realized_pnl": pnl,
+        "date": utc_text(),
     })
-    return f"บันทึกขาย {display_symbol(symbol)} {shares} หุ้น สำเร็จ กำไรสุทธิ {realized_pnl:+,.2f} ฿"
+
+    return (
+        f"บันทึกขาย {display_symbol(symbol)} "
+        f"{shares} หุ้นแล้ว\n"
+        f"P/L สุทธิ {pnl:+,.2f} บาท\n"
+        "ไม่ได้ส่งคำสั่งขายจริง"
+    )
 
 
 # =========================================================
-# SCHEDULER
+# COMMANDS
+# =========================================================
+
+HELP_TEXT = """คำสั่งบอต
+
+ดูข้อมูล
+• ดูพอร์ต / วิเคราะห์พอร์ต
+• แผนเทรดวันนี้ / แผนวันนี้
+• ควรซื้อวันนี้ / ซื้อวันนี้
+• เช็กจุดขาย
+• ผลการแนะนำ / เช็กผลย้อนหลัง
+• แผนการเงิน
+• สถิติการเทรด
+
+วิเคราะห์หุ้น
+• สรุปหุ้นวันนี้
+• สแกนหุ้น / สแกน SET50
+• วิเคราะห์ PTT / สแกน PTT
+
+บันทึกและตั้งค่า
+• ซื้อ PTT 100 35.50
+• ขาย PTT 100 38.00
+• ฝากเงิน 1000
+• ตั้งจุดขาย PTT 33 40
+• โหมดเสี่ยง balanced
+• ตั้งเป้าหมาย 20000 3
+• ติดตาม PTT / เลิกติดตาม PTT
+• รายการติดตาม
+
+บอตไม่ส่งคำสั่งซื้อขายให้โบรกเกอร์"""
+
+
+executor = ThreadPoolExecutor(max_workers=2)
+pending_users = set()
+pending_lock = threading.Lock()
+
+
+def reserve_user(user_id):
+    with pending_lock:
+        if user_id in pending_users or len(pending_users) >= 32:
+            return False
+
+        pending_users.add(user_id)
+        return True
+
+
+def release_user(user_id):
+    with pending_lock:
+        pending_users.discard(user_id)
+
+
+def run_background(user_id, kind, payload=None):
+    try:
+        portfolio = get_portfolio(user_id)
+        selected = []
+
+        if kind == "buy_today":
+            text, selected = build_buy_today_report(portfolio)
+
+        elif kind == "daily_plan":
+            text, selected = build_daily_plan(portfolio)
+
+        elif kind == "performance":
+            text = build_performance_report(user_id)
+
+        elif kind == "sell_check":
+            alert = check_sell_alerts(portfolio)
+            text = (
+                "ตรวจจุดขาย\n"
+                + (
+                    alert
+                    if alert else
+                    "ยังไม่มีจุดขายที่ตรวจพบ"
+                )
+            )
+
+        elif kind == "summary":
+            text = build_scan_report(
+                portfolio,
+                combined_universe(portfolio),
+                "สรุปหุ้นวันนี้",
+                5,
+            )
+
+        elif kind == "scan":
+            text = build_scan_report(
+                portfolio,
+                combined_universe(portfolio),
+                "ผลสแกนหุ้น",
+                10,
+            )
+
+        elif kind == "set50":
+            text = build_scan_report(
+                portfolio,
+                UNIVERSE,
+                "ผลสแกนชุดหุ้นอ้างอิง",
+                10,
+            )
+
+        elif kind == "single":
+            text = build_single_report(portfolio, payload)
+
+        else:
+            text = "ไม่รู้จักประเภทงาน"
+
+        ids = prepare_signals(
+            user_id, selected
+        ) if selected else []
+
+        # หากการส่งไม่สำเร็จ รายการจะคง DELIVERY_UNKNOWN
+        # และไม่ถูกนับเป็นผลการแนะนำ
+        push_long_message(user_id, text)
+
+        if ids:
+            confirm_delivery(user_id, ids)
+
+    except StorageError:
+        logger.exception("อ่าน/บันทึกพอร์ตไม่สำเร็จ")
+        try:
+            push_long_message(
+                user_id,
+                "ข้อมูลพอร์ตมีปัญหา "
+                "ระบบไม่ได้รีเซ็ตข้อมูล "
+                "กรุณาตรวจ Log และไฟล์สำรอง",
+            )
+        except Exception:
+            logger.exception("ส่งข้อความแจ้งข้อผิดพลาดไม่สำเร็จ")
+
+    except Exception:
+        logger.exception("งานเบื้องหลังไม่สำเร็จ")
+        try:
+            push_long_message(
+                user_id,
+                "ประมวลผลหรือส่งรายงานไม่สำเร็จ "
+                "กรุณาตรวจ Log",
+            )
+        except Exception:
+            logger.exception("ส่งข้อความแจ้งข้อผิดพลาดไม่สำเร็จ")
+
+    finally:
+        release_user(user_id)
+
+
+def queue_background(user_id, kind, payload=None):
+    if not reserve_user(user_id):
+        return False
+
+    try:
+        executor.submit(
+            run_background,
+            user_id,
+            kind,
+            payload,
+        )
+    except Exception:
+        release_user(user_id)
+        raise
+
+    return True
+
+
+def command_reply(user_id, text, event_id):
+    parts = text.split()
+
+    if text in {"ช่วยเหลือ", "help", "คำสั่ง"}:
+        return HELP_TEXT
+
+    if text == "ดูพอร์ต":
+        return build_portfolio_report(
+            get_portfolio(user_id)
+        )
+
+    if text == "วิเคราะห์พอร์ต":
+        portfolio = get_portfolio(user_id)
+        alert = check_sell_alerts(portfolio)
+
+        return (
+            build_portfolio_report(portfolio)
+            + "\n\nตรวจจุดขาย\n"
+            + (alert or "ยังไม่มีจุดขายที่ตรวจพบ")
+        )
+
+    if text in {"แผนเทรดวันนี้", "แผนวันนี้"}:
+        return (
+            "กำลังจัดทำแผน..."
+            if queue_background(user_id, "daily_plan")
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if text in {"ควรซื้อวันนี้", "ซื้อวันนี้"}:
+        return (
+            "กำลังคัดกรองหุ้น..."
+            if queue_background(user_id, "buy_today")
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if text in {"ผลการแนะนำ", "เช็กผลย้อนหลัง", "ตรวจสอบผล"}:
+        return (
+            "กำลังตรวจผลคำแนะนำเดิม..."
+            if queue_background(user_id, "performance")
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if text in {"เช็กจุดขาย", "เช็คจุดขาย"}:
+        return (
+            "กำลังตรวจจุดขาย..."
+            if queue_background(user_id, "sell_check")
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if text in {"แผนการเงิน", "ความคืบหน้า"}:
+        return build_plan_report(get_portfolio(user_id))
+
+    if text == "สถิติการเทรด":
+        return trade_statistics(get_portfolio(user_id))
+
+    scan_kinds = {
+        "สรุปหุ้นวันนี้": "summary",
+        "สแกนหุ้น": "scan",
+        "สแกน SET50": "set50",
+    }
+
+    if text in scan_kinds:
+        return (
+            "กำลังสแกนหุ้น..."
+            if queue_background(
+                user_id, scan_kinds[text]
+            )
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if parts and parts[0] in {"สแกน", "วิเคราะห์"}:
+        if len(parts) != 2:
+            raise ValueError("ใช้: วิเคราะห์ PTT")
+
+        symbol = format_symbol(parts[1])
+
+        return (
+            f"กำลังวิเคราะห์ {display_symbol(symbol)}..."
+            if queue_background(
+                user_id, "single", symbol
+            )
+            else "มีงานของคุณกำลังประมวลผล"
+        )
+
+    if parts and parts[0] in {"ซื้อ", "ขาย"}:
+        if len(parts) not in {4, 5}:
+            raise ValueError(
+                "ใช้: ซื้อ PTT 100 35.50 [ค่าธรรมเนียม]"
+            )
+
+        symbol = format_symbol(parts[1])
+
+        if symbol.startswith("^"):
+            raise ValueError(
+                "คำสั่งนี้ใช้กับหุ้น ไม่ใช่ดัชนี"
+            )
+
+        shares = positive_int(parts[2], "จำนวนหุ้น")
+        price = positive_number(parts[3], "ราคา")
+        fee = (
+            number(parts[4], "ค่าธรรมเนียม")
+            if len(parts) == 5 else None
+        )
+
+        operation = (
+            record_buy
+            if parts[0] == "ซื้อ"
+            else record_sell
+        )
+
+        return mutate_portfolio(
+            user_id,
+            lambda portfolio: operation(
+                portfolio, symbol, shares, price, fee
+            ),
+            event_id,
+        )
+
+    if parts and parts[0] == "ฝากเงิน":
+        if len(parts) != 2:
+            raise ValueError("ใช้: ฝากเงิน 1000")
+
+        amount = positive_number(
+            parts[1], "จำนวนเงิน"
+        )
+
+        def deposit(portfolio):
+            portfolio["cash"] = (
+                float(portfolio["cash"]) + amount
+            )
+            portfolio["contributions_total"] = (
+                float(portfolio["contributions_total"])
+                + amount
+            )
+            portfolio["high_water_mark"] = (
+                float(portfolio["high_water_mark"])
+                + amount
+            )
+            portfolio["transactions"].append({
+                "type": "DEPOSIT",
+                "amount": amount,
+                "date": utc_text(),
+            })
+            return (
+                f"บันทึกฝากเงิน "
+                f"{amount:,.2f} บาทแล้ว"
+            )
+
+        return mutate_portfolio(
+            user_id, deposit, event_id
+        )
+
+    if parts and parts[0] == "ตั้งจุดขาย":
+        if len(parts) != 4:
+            raise ValueError(
+                "ใช้: ตั้งจุดขาย PTT 33 40"
+            )
+
+        symbol = format_symbol(parts[1])
+        stop = positive_number(parts[2], "Stop")
+        target = positive_number(parts[3], "เป้า")
+
+        if stop >= target:
+            raise ValueError("Stop ต้องต่ำกว่าเป้า")
+
+        def set_levels(portfolio):
+            if symbol not in portfolio["stocks"]:
+                raise ValueError("ไม่มีหุ้นนี้ในพอร์ต")
+
+            info = portfolio["stocks"][symbol]
+            info["stop_loss"] = stop
+            info["target_price"] = target
+
+            return (
+                f"บันทึกแผน {display_symbol(symbol)} "
+                f"Stop {stop:.2f} | เป้า {target:.2f}"
+            )
+
+        return mutate_portfolio(
+            user_id, set_levels, event_id
+        )
+
+    if parts and parts[0] == "โหมดเสี่ยง":
+        if (
+            len(parts) != 2
+            or parts[1].lower() not in RISK_PROFILES
+        ):
+            raise ValueError(
+                "ใช้: โหมดเสี่ยง "
+                "conservative / balanced / aggressive"
+            )
+
+        mode = parts[1].lower()
+
+        def set_mode(portfolio):
+            portfolio["risk_mode"] = mode
+            return (
+                "ตั้งโหมด "
+                + RISK_PROFILES[mode]["label"]
+                + " แล้ว"
+            )
+
+        return mutate_portfolio(
+            user_id, set_mode, event_id
+        )
+
+    if parts and parts[0] == "ตั้งเป้าหมาย":
+        if len(parts) != 3:
+            raise ValueError(
+                "ใช้: ตั้งเป้าหมาย 20000 3"
+            )
+
+        target = positive_number(parts[1], "เป้าหมาย")
+        months = positive_int(parts[2], "จำนวนเดือน")
+
+        def set_target(portfolio):
+            plan = portfolio["financial_plan"]
+            plan["target_value"] = target
+            plan["target_months"] = months
+
+            return (
+                f"ตั้งเป้าหมาย {target:,.2f} บาท "
+                f"ภายใน {months} เดือนแล้ว"
+            )
+
+        return mutate_portfolio(
+            user_id, set_target, event_id
+        )
+
+    if parts and parts[0] in {"ติดตาม", "เลิกติดตาม"}:
+        if len(parts) != 2:
+            raise ValueError(
+                f"ใช้: {parts[0]} PTT"
+            )
+
+        symbol = format_symbol(parts[1])
+
+        if symbol.startswith("^"):
+            raise ValueError(
+                "Watchlist นี้ใช้กับหุ้น"
+            )
+
+        def update_watchlist(portfolio):
+            values = portfolio["watchlist"]
+
+            if parts[0] == "ติดตาม":
+                if symbol not in values:
+                    values.append(symbol)
+            else:
+                portfolio["watchlist"] = [
+                    item for item in values
+                    if item != symbol
+                ]
+
+            return (
+                f"บันทึก {parts[0]} "
+                f"{display_symbol(symbol)} แล้ว"
+            )
+
+        return mutate_portfolio(
+            user_id, update_watchlist, event_id
+        )
+
+    if text == "รายการติดตาม":
+        values = get_portfolio(user_id)["watchlist"]
+
+        return (
+            "รายการติดตาม\n"
+            + (
+                ", ".join(
+                    display_symbol(s) for s in values
+                )
+                or "ยังไม่มี"
+            )
+        )
+
+    return "ไม่รู้จักคำสั่ง พิมพ์ ช่วยเหลือ"
+
+
+# =========================================================
+# SCHEDULER AND WEBHOOK
 # =========================================================
 
 def scheduled_daily_plan():
-    for uid in get_registered_users():
-        queue_scan(uid, "daily_plan")
+    try:
+        users = registered_users()
+    except StorageError:
+        logger.exception(
+            "อ่านรายชื่อผู้ใช้สำหรับรายงานเช้าไม่สำเร็จ"
+        )
+        return
+
+    for user_id in users:
+        queue_background(user_id, "daily_plan")
 
 
 scheduler = None
+
 if ENABLE_SCHEDULER:
-    try:
-        scheduler = BackgroundScheduler(timezone=TIMEZONE_NAME)
-        scheduler.add_job(
-            scheduled_daily_plan,
-            CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=TIMEZONE_NAME),
-            id="daily-plan", replace_existing=True,
-        )
-        scheduler.start()
-        logger.info("เปิด Scheduler เรียบร้อย")
-    except Exception:
-        logger.exception("เริ่ม Scheduler ไม่สำเร็จ")
+    scheduler = BackgroundScheduler(
+        timezone="Asia/Bangkok"
+    )
+    scheduler.add_job(
+        scheduled_daily_plan,
+        "cron",
+        day_of_week="mon-fri",
+        hour=8,
+        minute=30,
+        id="daily-plan",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.start()
 
-
-# =========================================================
-# FLASK & LINE WEBHOOK
-# =========================================================
 
 @app.route("/", methods=["GET", "HEAD"])
 def health():
-    return jsonify({"status": "ok", "service": "Advanced Tech Stock Bot", "version": SCHEMA_VERSION})
+    return jsonify({
+        "status": "ok",
+        "service": "Portfolio Bot",
+        "version": VERSION,
+    })
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get(
+        "X-Line-Signature", ""
+    )
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(
+    MessageEvent,
+    message=TextMessage,
+)
 def handle_message(event):
-    text = event.message.text.strip()
+    if getattr(event.source, "type", None) != "user":
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="กรุณาใช้คำสั่งพอร์ตในแชตส่วนตัว"
+            ),
+        )
+        return
+
     user_id = getattr(event.source, "user_id", None)
     if not user_id:
         return
 
-    portfolio = get_user_portfolio(user_id)
-    parts = text.split()
-    reply_text = ""
+    text = " ".join(event.message.text.split())
+    if not text:
+        return
+
+    event_id = getattr(
+        event, "webhook_event_id", None
+    )
+
+    if not event_id:
+        message_id = getattr(
+            event.message, "id", None
+        )
+        if message_id:
+            event_id = f"{user_id}:{message_id}"
 
     try:
-        if text == "ดูพอร์ต":
-            reply_text = build_portfolio_report(user_id, update_trailing=False)
-        elif text == "วิเคราะห์พอร์ต":
-            reply_text = build_portfolio_report(user_id, update_trailing=True)
-        elif text in {"แผนเทรดวันนี้", "แผนวันนี้"}:
-            queue_scan(user_id, "daily_plan")
-            reply_text = "กำลังประมวลผลแผนเทรดขั้นสูง..."
-        elif text in {"ควรซื้อวันนี้", "ซื้อวันนี้"}:
-            queue_scan(user_id, "buy_today")
-            reply_text = "กำลังคัดกรองหุ้นด้วย 5 เทคนิคขั้นสูง..."
-        elif text in {"เช็กจุดขาย", "เช็คจุดขาย"}:
-            queue_scan(user_id, "sell_check")
-            reply_text = "กำลังตรวจสอบจุดขาย..."
-        elif text in {"ผลการแนะนำ", "เช็กผลย้อนหลัง", "ตรวจสอบผล"}:
-            queue_scan(user_id, "performance")
-            reply_text = "กำลังตรวจสอบผลการแนะนำย้อนหลังเชิงลึก..."
-        elif text in {"แผนการเงิน", "ความคืบหน้า"}:
-            reply_text = build_plan_report(portfolio)
-        elif text == "สรุปหุ้นวันนี้":
-            queue_scan(user_id, "summary")
-            reply_text = "กำลังจัดทำสรุปหุ้น..."
-        elif text == "สแกนหุ้น":
-            queue_scan(user_id, "scan")
-            reply_text = "กำลังสแกนหุ้น..."
-        elif text == "สแกน SET50":
-            queue_scan(user_id, "set50")
-            reply_text = "กำลังสแกน SET50..."
-        elif text.startswith("สแกน ") or (text.startswith("วิเคราะห์ ") and text != "วิเคราะห์พอร์ต"):
-            symbol = format_symbol(parts[1])
-            queue_scan(user_id, "single", symbol)
-            reply_text = f"กำลังวิเคราะห์ {display_symbol(symbol)} ด้วย 5 เทคนิค..."
-        elif text == "สถิติการเทรด":
-            reply_text = calculate_trade_statistics(portfolio)
-        elif text.startswith("ซื้อ "):
-            if len(parts) < 4:
-                raise ValueError("รูปแบบคำสั่งไม่ถูกต้อง กรุณาใช้: ซื้อ [หุ้น] [จำนวน] [ราคา]")
-            fee = parts[4] if len(parts) >= 5 else None
-            with storage_lock:
-                reply_text = process_buy(portfolio, parts[1], parts[2], parts[3], fee)
-                update_user_portfolio(user_id, portfolio)
-        elif text.startswith("ขาย "):
-            if len(parts) < 4:
-                raise ValueError("รูปแบบคำสั่งไม่ถูกต้อง กรุณาใช้: ขาย [หุ้น] [จำนวน] [ราคา]")
-            fee = parts[4] if len(parts) >= 5 else None
-            with storage_lock:
-                reply_text = process_sell(portfolio, parts[1], parts[2], parts[3], fee)
-                update_user_portfolio(user_id, portfolio)
-        elif text.startswith("ฝากเงิน "):
-            amount = positive_float(parts[1], "จำนวนเงิน")
-            with storage_lock:
-                portfolio = get_user_portfolio(user_id)
-                portfolio["cash"] = safe_float(portfolio.get("cash"), 0) + amount
-                portfolio["contributions_total"] = safe_float(portfolio.get("contributions_total"), 0) + amount
-                portfolio.setdefault("transactions", []).append({
-                    "type": "DEPOSIT", "amount": amount, "date": utc_now_text(),
-                })
-                update_user_portfolio(user_id, portfolio)
-            reply_text = f"ฝากเงิน {amount:,.2f} ฿ สำเร็จ"
-        elif text in {"ช่วยเหลือ", "help", "คำสั่ง"}:
-            reply_text = (
-                "คำสั่งบอต (ระบบ 5 เทคนิคขั้นสูง):\n"
-                "1. ดูพอร์ต / วิเคราะห์พอร์ต\n"
-                "2. แผนเทรดวันนี้\n"
-                "3. ควรซื้อวันนี้ (สแกน 5 เทคนิค)\n"
-                "4. เช็กจุดขาย\n"
-                "5. ผลการแนะนำ (เช็กผลย้อนหลัง)\n"
-                "6. แผนการเงิน\n"
-                "7. สรุปหุ้นวันนี้ / สแกนหุ้น / สแกน SET50\n"
-                "8. วิเคราะห์ PTT\n"
-                "9. ซื้อ / ขาย PTT [จำนวน] [ราคา]\n"
-                "10. ฝากเงิน [จำนวน]"
-            )
-        else:
-            reply_text = "ไม่รู้จักคำสั่ง พิมพ์ 'ช่วยเหลือ'"
+        reply = command_reply(
+            user_id,
+            text,
+            str(event_id) if event_id else None,
+        )
     except ValueError as error:
-        reply_text = f"ข้อมูลไม่ถูกต้อง: {error}"
+        reply = f"ข้อมูลไม่ถูกต้อง: {error}"
+    except StorageError:
+        logger.exception("ข้อมูลพอร์ตมีปัญหา")
+        reply = (
+            "ข้อมูลพอร์ตมีปัญหา "
+            "ระบบไม่ได้รีเซ็ตข้อมูล "
+            "กรุณาตรวจ Log และไฟล์สำรอง"
+        )
     except Exception:
-        logger.exception("Error handling message")
-        reply_text = "ระบบขัดข้องชั่วคราว"
+        logger.exception("ประมวลผลคำสั่งไม่สำเร็จ")
+        reply = "ระบบขัดข้องชั่วคราว กรุณาตรวจ Log"
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text[:MAX_LINE_TEXT]))
+    line_api.reply_message(
+        event.reply_token,
+        TextSendMessage(
+            text=reply[:MAX_LINE_TEXT]
+        ),
+    )
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+    )
