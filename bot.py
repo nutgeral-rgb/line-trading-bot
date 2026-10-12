@@ -4174,20 +4174,13 @@ def command_reply(
         )
 
     if text in {
+        "แผนเทรดวันนี้",
+        "แผนวันนี้",
         "ควรซื้อวันนี้",
         "ซื้อวันนี้",
     }:
-        return (
-            "กำลังคัดกรองหุ้น..."
-            if queue_background(
-                user_id,
-                "buy_today",
-            )
-            else (
-                "มีงานของคุณ"
-                "กำลังประมวลผล"
-            )
-        )
+        return read_overnight_plan(user_id)
+
 
     if text in {
         "ผลการแนะนำ",
