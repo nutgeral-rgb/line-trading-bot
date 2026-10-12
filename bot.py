@@ -4696,6 +4696,276 @@ def scheduled_daily_plan():
         )
 
 
+# =========================================================
+# OVERNIGHT PLAN
+# =========================================================
+
+# ใส่วันหยุดตลาดจาก SET ใน Environment Variable:
+# SET_HOLIDAYS=YYYY-MM-DD,YYYY-MM-DD,...
+_holiday_text = os.getenv("SET_HOLIDAYS", "").strip()
+
+try:
+    SET_HOLIDAYS = {
+        datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        for value in _holiday_text.split(",")
+        if value.strip()
+    }
+except ValueError as error:
+    raise RuntimeError(
+        "SET_HOLIDAYS ต้องใช้รูปแบบ YYYY-MM-DD คั่นด้วยจุลภาค"
+    ) from error
+
+
+def is_set_session(day):
+    return day.weekday() < 5 and day not in SET_HOLIDAYS
+
+
+def next_set_session(day):
+    candidate = day + timedelta(days=1)
+
+    for _ in range(15):
+        if is_set_session(candidate):
+            return candidate
+        candidate += timedelta(days=1)
+
+    raise RuntimeError("หาวันซื้อขายถัดไปไม่สำเร็จ")
+
+
+def read_overnight_plan(user_id):
+    """คำสั่ง LINE อ่านแผนที่เตรียมไว้ ไม่สแกนหุ้นใหม่ตอนเช้า"""
+    plan = get_portfolio(user_id).get("overnight_plan")
+
+    if not isinstance(plan, dict):
+        return (
+            "ยังไม่มีแผนที่ประมวลผลหลังตลาดปิด\n"
+            "บอตจะตรวจข้อมูลหลังปิดตลาดในวันซื้อขาย "
+            "และเตรียมแผนสำหรับเช้าวันซื้อขายถัดไป"
+        )
+
+    today = now_bkk().date().isoformat()
+    delivery_day = plan.get("delivery_day")
+    status = plan.get("status")
+
+    if delivery_day != today:
+        if status == "READY" and delivery_day > today:
+            return (
+                f"เตรียมแผนจากราคาปิด {plan['data_date']} แล้ว\n"
+                f"รอส่งเช้าวันซื้อขาย {delivery_day}"
+            )
+
+        return (
+            "ยังไม่มีแผนที่ตรวจสอบได้สำหรับวันนี้ "
+            "จึงไม่ใช้แผนเก่ามาแนะนำซื้อ"
+        )
+
+    if status == "READY":
+        return (
+            "แผนสำหรับวันนี้เตรียมแล้ว "
+            "แต่ยังไม่ถึงรอบส่งอัตโนมัติ 08:30–09:05 น."
+        )
+
+    if status == "DELIVERY_UNKNOWN":
+        return (
+            "สถานะการส่งอัตโนมัติไม่แน่ชัด "
+            "บอตจึงไม่ส่งซ้ำเพื่อป้องกันข้อความซ้ำ\n\n"
+            + plan["text"]
+        )
+
+    if status == "SENT":
+        return (
+            f"แผนสำหรับวันซื้อขาย {delivery_day}\n"
+            f"ใช้ราคาปิด {plan['data_date']}\n\n"
+            + plan["text"]
+        )
+
+    return "ยังไม่มีแผนที่ใช้ได้สำหรับวันนี้"
+
+
+def prepare_overnight_plans():
+    """ลองเตรียมแผนหลังปิดตลาด; ข้อมูลไม่ครบให้รอรอบถัดไป"""
+    current_day = now_bkk().date()
+
+    if not is_set_session(current_day):
+        return
+
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อเตรียมแผนไม่สำเร็จ")
+        return
+
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            previous = portfolio.get("overnight_plan")
+
+            # ไม่สร้างซ้ำหากเตรียมแผนจากราคาปิดวันนี้แล้ว
+            if (
+                isinstance(previous, dict)
+                and previous.get("data_date") == current_day.isoformat()
+            ):
+                continue
+
+            symbols = combined_universe(portfolio)
+            frames = get_market_frames(
+                UNIVERSE
+                + symbols
+                + list(portfolio["stocks"])
+                + [INDEX_SYMBOL]
+            )
+            context = market_context(frames)
+
+            # ต้องมีข้อมูลหุ้นอ้างอิงและดัชนีของวันนี้จริง
+            # ตลาดไม่ผ่านเกณฑ์ซื้อยังทำรายงานได้
+            # แต่ข้อมูลขาด/เก่า ห้ามทำเป็นแผนของวันนี้
+            if (
+                not context["sufficient"]
+                or context["date"] != current_day.isoformat()
+            ):
+                logger.warning(
+                    "ข้อมูลตลาดหลังปิดยังไม่ครบ จะรอรอบถัดไป"
+                )
+                continue
+
+            report, selected = build_daily_plan(
+                portfolio,
+                frames=frames,
+            )
+
+            new_plan = {
+                "data_date": current_day.isoformat(),
+                "delivery_day": next_set_session(
+                    current_day
+                ).isoformat(),
+                "prepared_at": utc_text(),
+                "status": "READY",
+                "text": report,
+                "selected": selected,
+            }
+
+            def save_plan(p):
+                old = p.get("overnight_plan")
+
+                if (
+                    isinstance(old, dict)
+                    and old.get("data_date")
+                    == current_day.isoformat()
+                ):
+                    return "มีแผนรอบนี้แล้ว"
+
+                p["overnight_plan"] = new_plan
+                return "เตรียมแผนแล้ว"
+
+            mutate_portfolio(user_id, save_plan)
+
+        except Exception:
+            logger.exception("เตรียมแผนผู้ใช้หนึ่งรายไม่สำเร็จ")
+
+
+def send_overnight_plans():
+    """ส่งแผนเดิมตอนเช้า ไม่ดาวน์โหลดหุ้นมาสแกนใหม่"""
+    current = now_bkk()
+    today = current.date()
+
+    if not _holiday_text:
+        logger.error(
+            "ยังไม่ตั้ง SET_HOLIDAYS: งดส่งแผนอัตโนมัติ "
+            "เพื่อป้องกันการส่งในวันหยุดตลาด"
+        )
+        return
+
+    if not is_set_session(today):
+        return
+
+    if not (
+        (current.hour == 8 and current.minute >= 30)
+        or (current.hour == 9 and current.minute <= 5)
+    ):
+        return
+
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อส่งแผนไม่สำเร็จ")
+        return
+
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            plan = portfolio.get("overnight_plan")
+
+            if not isinstance(plan, dict):
+                continue
+
+            if (
+                plan.get("delivery_day") != today.isoformat()
+                or plan.get("status") != "READY"
+            ):
+                continue
+
+            # จองสิทธิ์ส่งก่อนเรียก LINE
+            # หากส่งแล้วแต่ตอบกลับไม่ชัด จะไม่ส่งซ้ำอัตโนมัติ
+            def claim(p):
+                current_plan = p.get("overnight_plan")
+
+                if (
+                    not isinstance(current_plan, dict)
+                    or current_plan.get("delivery_day")
+                    != today.isoformat()
+                    or current_plan.get("status") != "READY"
+                ):
+                    return "SKIP"
+
+                current_plan["status"] = "DELIVERY_UNKNOWN"
+                current_plan["send_attempt_at"] = utc_text()
+                return "CLAIMED"
+
+            if mutate_portfolio(user_id, claim) != "CLAIMED":
+                continue
+
+            signal_ids = (
+                prepare_signals(user_id, plan["selected"])
+                if plan["selected"]
+                else []
+            )
+
+            push_long_message(
+                user_id,
+                (
+                    f"แผนเช้าวันซื้อขาย {today.isoformat()}\n"
+                    f"ข้อมูลราคาปิด {plan['data_date']}\n"
+                    "ราคาเปิดอาจเปลี่ยน ต้องตรวจราคาจริง"
+                    "ก่อนตัดสินใจ\n\n"
+                    + plan["text"]
+                ),
+            )
+
+            if signal_ids:
+                confirm_delivery(user_id, signal_ids)
+
+            def mark_sent(p):
+                current_plan = p.get("overnight_plan")
+
+                if (
+                    isinstance(current_plan, dict)
+                    and current_plan.get("delivery_day")
+                    == today.isoformat()
+                    and current_plan.get("status")
+                    == "DELIVERY_UNKNOWN"
+                ):
+                    current_plan["status"] = "SENT"
+                    current_plan["sent_at"] = utc_text()
+
+                return "บันทึกสถานะส่งแล้ว"
+
+            mutate_portfolio(user_id, mark_sent)
+
+        except Exception:
+            logger.exception(
+                "ส่งแผนผู้ใช้หนึ่งรายไม่สำเร็จ "
+                "ระบบจะไม่ส่งซ้ำโดยอัตโนมัติ"
+            )
+
 scheduler = None
 
 if ENABLE_SCHEDULER:
