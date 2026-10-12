@@ -3252,22 +3252,16 @@ def trade_statistics(
     ])
 
 
-def build_daily_plan(
-    portfolio,
-):
-    # ดาวน์โหลดชุดข้อมูลเพียงครั้งเดียวต่อรายงาน
-    symbols = combined_universe(
-        portfolio
-    )
+def build_daily_plan(portfolio, frames=None):
+    symbols = combined_universe(portfolio)
 
-    frames = get_market_frames(
-        UNIVERSE
-        + symbols
-        + list(
-            portfolio["stocks"]
+    if frames is None:
+        frames = get_market_frames(
+            UNIVERSE
+            + symbols
+            + list(portfolio["stocks"])
+            + [INDEX_SYMBOL]
         )
-        + [INDEX_SYMBOL]
-    )
 
     context = market_context(
         frames
