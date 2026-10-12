@@ -4962,19 +4962,44 @@ def send_overnight_plans():
 scheduler = None
 
 if ENABLE_SCHEDULER:
-    scheduler = (
-        BackgroundScheduler(
-            timezone="Asia/Bangkok"
-        )
+    scheduler = BackgroundScheduler(
+        timezone="Asia/Bangkok"
     )
 
+    # หลังปิดตลาด ลองซ้ำ 3 รอบเผื่อข้อมูลราคายังมาไม่ครบ
     scheduler.add_job(
-        scheduled_daily_plan,
+        prepare_overnight_plans,
+        "cron",
+        day_of_week="mon-fri",
+        hour="19,20,21",
+        minute=15,
+        id="prepare-overnight-plan",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # เช้าวันซื้อขาย: ตรวจซ้ำทุก 5 นาที
+    # แต่แต่ละแผนถูกจองสิทธิ์ส่งก่อน จึงไม่ส่งซ้ำ
+    scheduler.add_job(
+        send_overnight_plans,
         "cron",
         day_of_week="mon-fri",
         hour=8,
-        minute=30,
-        id="daily-plan",
+        minute="30,35,40,45,50,55",
+        id="send-overnight-plan-8",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
+        send_overnight_plans,
+        "cron",
+        day_of_week="mon-fri",
+        hour=9,
+        minute="0,5",
+        id="send-overnight-plan-9",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
