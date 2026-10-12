@@ -1,12 +1,1 @@
-"financial_plan": {
-    "target_value": 20000.0,
-    "target_months": 3,
-    "monthly_contribution": 1000.0,
-    "risk_level": "high",
-    "max_portfolio_drawdown_pct": 0.20,
-    "trading_paused_at_value": 8000.0,
-    "risk_per_trade_pct": 0.02,
-    "max_stock_weight_pct": 0.25,
-    "default_stop_loss_pct": 0.05,
-    "risk_reward_ratio": 2.0
-}
+"financial_plan": {}
