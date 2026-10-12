@@ -4853,13 +4853,7 @@ def send_overnight_plans():
     current = now_bkk()
     today = current.date()
 
-    if not _holiday_text:
-        logger.error(
-            "ยังไม่ตั้ง SET_HOLIDAYS: งดส่งแผนอัตโนมัติ "
-            "เพื่อป้องกันการส่งในวันหยุดตลาด"
-        )
-        return
-
+  
     if not is_set_session(today):
         return
 
