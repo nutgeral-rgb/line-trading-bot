@@ -4699,31 +4699,22 @@ def scheduled_daily_plan():
 # SET_HOLIDAYS=YYYY-MM-DD,YYYY-MM-DD,...
 _holiday_text = os.getenv("SET_HOLIDAYS", "").strip()
 
-try:
-    SET_HOLIDAYS = {
-        datetime.strptime(value.strip(), "%Y-%m-%d").date()
-        for value in _holiday_text.split(",")
-        if value.strip()
-    }
-except ValueError as error:
-    raise RuntimeError(
-        "SET_HOLIDAYS ต้องใช้รูปแบบ YYYY-MM-DD คั่นด้วยจุลภาค"
-    ) from error
-
-
 def is_set_session(day):
-    return day.weekday() < 5 and day not in SET_HOLIDAYS
+    try:
+        calendar = xcals.get_calendar("XBKK")
+        return bool(calendar.is_session(day.isoformat()))
+    except Exception:
+        logger.exception("ตรวจวันซื้อขาย SET ไม่สำเร็จ")
+        return False
 
 
 def next_set_session(day):
+    calendar = xcals.get_calendar("XBKK")
     candidate = day + timedelta(days=1)
-
-    for _ in range(15):
-        if is_set_session(candidate):
-            return candidate
-        candidate += timedelta(days=1)
-
-    raise RuntimeError("หาวันซื้อขายถัดไปไม่สำเร็จ")
+    return calendar.date_to_session(
+        candidate.isoformat(),
+        direction="next",
+    ).date()
 
 
 def read_overnight_plan(user_id):
