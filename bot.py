@@ -623,7 +623,7 @@ def command_reply(user_id, text):
             return f"ไม่พบ {sym} ในรายการติดตาม"
         return mutate_portfolio(user_id, remove_w)
 
-    return "ไม่รู้จักคำสั่งนี้\\n\\n" + help_text()
+    return "ไม่รู้จักคำสั่งนี้" + chr(10) + chr(10) + help_text()
 
 
 # =========================================================
