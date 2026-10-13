@@ -112,6 +112,9 @@ UNIVERSE = [
 
 MAX_POSITIONS = 5
 MIN_UNIVERSE_COVERAGE = 0.80
+MOMENTUM_LOOKBACK = 63
+VOLATILITY_LOOKBACK = 20
+MIN_AVG_DAILY_VALUE_BAHT = 5_000_000
 
 # =========================================================
 # CALENDAR FUNCTIONS (exchange_calendars XBKK)
@@ -247,7 +250,7 @@ def get_stock_history(symbol, period="3mo"):
 def get_market_frames(symbols):
     frames = {}
     for sym in symbols:
-        df = get_stock_history(sym, period="3mo")
+        df = get_stock_history(sym, period="6mo")
         if df is not None and len(df) >= 20:
             frames[sym] = df
     return frames
@@ -270,6 +273,39 @@ def _close_and_sma20(df, as_of):
     if not pd.notna(close) or not pd.notna(sma20) or sma20 <= 0:
         return None
     return close, sma20
+
+
+def _selection_metrics(df, as_of):
+    """Return risk-adjusted momentum, return, volatility, and liquidity."""
+    if df is None or "Volume" not in df.columns:
+        return None
+    history = df.loc[df.index.strftime("%Y-%m-%d") <= as_of].copy()
+    if history.empty or history.index[-1].strftime("%Y-%m-%d") != as_of:
+        return None
+    close_col = "Adj Close" if "Adj Close" in history.columns else "Close"
+    closes = pd.to_numeric(history[close_col], errors="coerce").dropna()
+    if len(closes) < MOMENTUM_LOOKBACK + 1:
+        return None
+    recent = history.loc[closes.index].tail(MOMENTUM_LOOKBACK + 1)
+    recent_close = pd.to_numeric(recent[close_col], errors="coerce")
+    returns = recent_close.pct_change().dropna()
+    if len(returns) < MOMENTUM_LOOKBACK:
+        return None
+    momentum = float(recent_close.iloc[-1] / recent_close.iloc[0] - 1)
+    volatility = float(returns.tail(VOLATILITY_LOOKBACK).std(ddof=1) * np.sqrt(252))
+    traded_value = (
+        pd.to_numeric(recent["Close"], errors="coerce")
+        * pd.to_numeric(recent["Volume"], errors="coerce")
+    ).tail(VOLATILITY_LOOKBACK)
+    valid_traded_value = traded_value.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(valid_traded_value) < VOLATILITY_LOOKBACK:
+        return None
+    avg_value = float(valid_traded_value.median())
+    if not all(np.isfinite(x) for x in (momentum, volatility, avg_value)):
+        return None
+    if volatility <= 0 or avg_value <= 0:
+        return None
+    return momentum / volatility, momentum, volatility, avg_value
 
 
 def market_context(frames):
@@ -334,18 +370,26 @@ def build_daily_plan(portfolio, frames=None):
         ranked = []
         for sym in symbols:
             values = _close_and_sma20(frames.get(sym), data_date)
-            if values is None:
+            metrics = _selection_metrics(frames.get(sym), data_date)
+            if values is None or metrics is None:
                 continue
             close, sma20 = values
-            if close > sma20:
-                score = close / sma20 - 1
-                ranked.append((score, sym))
+            score, momentum, volatility, avg_value = metrics
+            if close > sma20 and momentum > 0 and avg_value >= MIN_AVG_DAILY_VALUE_BAHT:
+                ranked.append((score, sym, momentum, volatility, avg_value))
 
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        selected = [sym for _, sym in ranked[:MAX_POSITIONS]]
+        selected_rows = ranked[:MAX_POSITIONS]
+        selected = [row[1] for row in selected_rows]
         if selected:
             weight = 100 / len(selected)
-            report_lines.append(f"หุ้นเรียงตามโมเมนตัมเหนือ SMA20: {', '.join(selected)}")
+            report_lines.append("หุ้นที่ผ่านแนวโน้มและสภาพคล่อง เรียงตามโมเมนตัมต่อความผันผวน:")
+            for score, sym, momentum, volatility, avg_value in selected_rows:
+                report_lines.append(
+                    f"- {sym}: ผลตอบแทน 63 วัน {momentum * 100:.1f}% | "
+                    f"ความผันผวน 20 วันต่อปี {volatility * 100:.1f}% | "
+                    f"มูลค่าซื้อขายมัธยฐาน {avg_value:,.0f} บาท/วัน"
+                )
             report_lines.append(f"น้ำหนักเป้าหมายแบบเท่ากัน: หุ้นละ {weight:.1f}%")
             report_lines.append(
                 "กติกาหมุนทุน: ใช้สัญญาณราคาปิดวันนี้สำหรับวันซื้อขายถัดไป; "
