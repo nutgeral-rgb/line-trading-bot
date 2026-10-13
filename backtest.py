@@ -17,6 +17,9 @@ import numpy as np
 import pandas as pd
 
 INDEX_SYMBOL = "SET.BK"
+MOMENTUM_LOOKBACK = 63
+VOLATILITY_LOOKBACK = 20
+MIN_AVG_DAILY_VALUE_BAHT = 5_000_000
 UNIVERSE = [
     "ADVANC.BK", "AOT.BK", "AWC.BK", "BANPU.BK", "BBL.BK", "BCP.BK",
     "BDMS.BK", "BEM.BK", "BH.BK", "BJC.BK", "CCET.BK", "COM7.BK",
@@ -38,6 +41,7 @@ def select_targets(
     sma_days: int = 20,
     breadth_threshold: float = 50.0,
     min_coverage: float = 0.80,
+    min_avg_daily_value: float = MIN_AVG_DAILY_VALUE_BAHT,
 ) -> tuple[list[str], float, float]:
     """Return targets, breadth percentage, and valid-universe coverage."""
     symbols = list(universe)
@@ -51,7 +55,8 @@ def select_targets(
         if frame is None or "Close" not in frame:
             continue
         frame = frame.sort_index()
-        history = frame.loc[frame.index.date <= as_of_day, "Close"].dropna()
+        dated = frame.loc[frame.index.date <= as_of_day]
+        history = _field(dated, "Close").dropna()
         if len(history) < sma_days or history.index[-1].date() != as_of_day:
             continue
         close = float(history.iloc[-1])
@@ -67,11 +72,29 @@ def select_targets(
     if breadth < breadth_threshold:
         return [], breadth, coverage
 
-    ranked = [
-        (close / average - 1.0, symbol)
-        for symbol, (close, average) in valid.items()
-        if close > average
-    ]
+    ranked = []
+    for symbol, (close, average) in valid.items():
+        frame = frames[symbol].sort_index()
+        dated = frame.loc[frame.index.date <= as_of_day]
+        closes = _field(dated, "Close").dropna()
+        if len(closes) < MOMENTUM_LOOKBACK + 1 or "Volume" not in dated:
+            continue
+        recent = dated.loc[closes.index].tail(MOMENTUM_LOOKBACK + 1)
+        recent_close = _field(recent, "Close")
+        returns = recent_close.pct_change().dropna()
+        if len(returns) < MOMENTUM_LOOKBACK:
+            continue
+        momentum = float(recent_close.iloc[-1] / recent_close.iloc[0] - 1.0)
+        volatility = float(returns.tail(VOLATILITY_LOOKBACK).std(ddof=1) * math.sqrt(252))
+        traded_value = (_field(recent, "Close") * _field(recent, "Volume")).tail(VOLATILITY_LOOKBACK)
+        valid_traded_value = traded_value.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(valid_traded_value) < VOLATILITY_LOOKBACK:
+            continue
+        avg_value = float(valid_traded_value.median())
+        if not all(math.isfinite(x) for x in (momentum, volatility, avg_value)):
+            continue
+        if close > average and momentum > 0 and volatility > 0 and avg_value >= min_avg_daily_value:
+            ranked.append((momentum / volatility, symbol))
     ranked.sort(key=lambda item: (-item[0], item[1]))
     return [symbol for _, symbol in ranked[:top_n]], breadth, coverage
 
@@ -89,6 +112,7 @@ def backtest(
     sma_days: int = 20,
     breadth_threshold: float = 50.0,
     min_coverage: float = 0.80,
+    min_avg_daily_value: float = MIN_AVG_DAILY_VALUE_BAHT,
     commission_rate: float = 0.0025,
     vat_rate: float = 0.07,
     slippage_bps: float = 10.0,
@@ -122,7 +146,7 @@ def backtest(
         previous_day, day = pd.Timestamp(dates[i - 1]), pd.Timestamp(dates[i])
         targets, breadth, coverage = select_targets(
             frames, previous_day, universe, top_n, sma_days,
-            breadth_threshold, min_coverage,
+            breadth_threshold, min_coverage, min_avg_daily_value,
         )
 
         # Existing holdings earn the overnight close-to-open move.
@@ -250,16 +274,22 @@ def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFram
 
 
 def _self_test() -> None:
-    days = pd.bdate_range("2024-01-01", periods=22)
-    signal_days = days[:21]
+    days = pd.bdate_range("2024-01-01", periods=72)
+    signal_days = days[:70]
     universe = ["AAA.BK", "BBB.BK", "CCC.BK", "DDD.BK"]
     closes = {
-        "AAA.BK": [100.0] * 20 + [112.0],
-        "BBB.BK": [100.0] * 20 + [108.0],
-        "CCC.BK": [100.0] * 20 + [104.0],
-        "DDD.BK": [100.0] * 20 + [95.0],
+        "AAA.BK": [100.0] * 69 + [112.0],
+        "BBB.BK": [100.0] * 69 + [108.0],
+        "CCC.BK": [100.0] * 69 + [104.0],
+        "DDD.BK": [100.0] * 69 + [95.0],
     }
-    frames = {s: pd.DataFrame({"Close": values}, index=signal_days) for s, values in closes.items()}
+    frames = {
+        symbol: pd.DataFrame(
+            {"Close": values, "Volume": [100_000] * len(values)},
+            index=signal_days,
+        )
+        for symbol, values in closes.items()
+    }
     targets, breadth, coverage = select_targets(
         frames, signal_days[-1], universe, top_n=2, min_coverage=0.75,
     )
@@ -280,11 +310,11 @@ def _self_test() -> None:
     assert targets == [] and coverage == 0.75, (targets, coverage)
 
     close_values = {
-        "AAA.BK": [100.0] * 19 + [112.0, 113.0, 114.0],
-        "BBB.BK": [100.0] * 19 + [108.0, 109.0, 110.0],
-        "CCC.BK": [100.0] * 19 + [104.0, 104.0, 105.0],
-        "DDD.BK": [100.0] * 19 + [95.0, 96.0, 97.0],
-        INDEX_SYMBOL: [100.0] * 22,
+        "AAA.BK": [100.0] * 69 + [112.0, 113.0, 114.0],
+        "BBB.BK": [100.0] * 69 + [108.0, 109.0, 110.0],
+        "CCC.BK": [100.0] * 69 + [104.0, 104.0, 105.0],
+        "DDD.BK": [100.0] * 69 + [95.0, 96.0, 97.0],
+        INDEX_SYMBOL: [100.0] * 72,
     }
     trading_frames = {}
     for symbol, values in close_values.items():
@@ -292,6 +322,7 @@ def _self_test() -> None:
         trading_frames[symbol] = pd.DataFrame({
             "Open": close.shift(1).fillna(close),
             "Close": close,
+            "Volume": [100_000] * len(close),
         })
     _, metrics = backtest(
         trading_frames, universe=universe, top_n=2, min_coverage=0.75,
@@ -299,8 +330,7 @@ def _self_test() -> None:
     )
     assert metrics["final_equity"] > 10_000, metrics
     assert metrics["average_daily_turnover"] > 0, metrics
-    print("Self-test passed: ranking, same-date coverage, cash fallback, and trade accounting.")
-
+    print("Self-test passed: risk-adjusted ranking, coverage, liquidity, and accounting.")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -310,6 +340,7 @@ def main() -> None:
     parser.add_argument("--sma", type=int, default=20)
     parser.add_argument("--breadth", type=float, default=50.0)
     parser.add_argument("--min-coverage", type=float, default=0.80)
+    parser.add_argument("--min-avg-daily-value", type=float, default=MIN_AVG_DAILY_VALUE_BAHT, help="Minimum median traded value in baht/day")
     parser.add_argument("--commission", type=float, default=0.0025, help="Commission rate per side (default 0.25%; set to your broker's rate)")
     parser.add_argument("--vat", type=float, default=0.07, help="VAT charged on commission")
     parser.add_argument("--slippage-bps", type=float, default=10.0, help="Estimated slippage per side in basis points")
@@ -337,6 +368,7 @@ def main() -> None:
         sma_days=args.sma,
         breadth_threshold=args.breadth,
         min_coverage=args.min_coverage,
+        min_avg_daily_value=args.min_avg_daily_value,
         commission_rate=args.commission,
         vat_rate=args.vat,
         slippage_bps=args.slippage_bps,
