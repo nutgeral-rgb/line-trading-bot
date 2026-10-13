@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from fundamental_analysis import analyze_fundamentals
 from set100_constituents import SET100_SYMBOLS
 
 # =========================================================
@@ -343,16 +344,27 @@ def build_daily_plan(portfolio, frames=None):
         ranked.sort(key=lambda item: (-item[0], item[1]))
         selected_rows = ranked[:MAX_POSITIONS]
         selected = [row[1] for row in selected_rows]
+        fundamentals = {}
+        if selected_rows:
+            with ThreadPoolExecutor(max_workers=min(5, len(selected_rows))) as executor:
+                fundamentals = dict(zip(
+                    selected,
+                    executor.map(analyze_fundamentals, selected),
+                ))
         report_lines.append("")
         if selected:
             weight = 100 / len(selected)
             report_lines.append(f"✅ หุ้นที่ผ่านเกณฑ์ ({len(selected)} ตัว)")
             for index, (_, sym, momentum, volatility, avg_value) in enumerate(selected_rows, 1):
+                fundamental_text = fundamentals.get(sym, {}).get(
+                    "summary", "ข้อมูลพื้นฐานไม่พร้อม"
+                )
                 report_lines.append(
                     f"{index}. 📈 {sym}\n"
                     f"   ผลตอบแทน 63 วัน: {momentum * 100:+.1f}%\n"
                     f"   ความผันผวนต่อปี: {volatility * 100:.1f}%\n"
-                    f"   มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน"
+                    f"   มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน\n"
+                    f"   พื้นฐาน: {fundamental_text}"
                 )
             report_lines.append("")
             report_lines.append(f"⚖️ น้ำหนักเป้าหมาย: หุ้นละ {weight:.1f}%")
