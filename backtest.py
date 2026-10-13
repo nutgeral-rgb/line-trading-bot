@@ -25,9 +25,6 @@ MIN_AVG_DAILY_VALUE_BAHT = 5_000_000
 UNIVERSE = SET100_SYMBOLS
 
 
-def select_targets]
-
-
 def select_targets(
     frames: dict[str, pd.DataFrame],
     as_of: pd.Timestamp,
