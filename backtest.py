@@ -277,18 +277,22 @@ def _self_test() -> None:
     days = pd.bdate_range("2024-01-01", periods=72)
     signal_days = days[:70]
     universe = ["AAA.BK", "BBB.BK", "CCC.BK", "DDD.BK"]
-    closes = {
-        "AAA.BK": [100.0] * 69 + [112.0],
-        "BBB.BK": [100.0] * 69 + [108.0],
-        "CCC.BK": [100.0] * 69 + [104.0],
-        "DDD.BK": [100.0] * 69 + [95.0],
-    }
+
+    def prices(length: int) -> dict[str, list[float]]:
+        return {
+            "AAA.BK": [100 + 0.30 * i + 0.10 * math.sin(i) for i in range(length)],
+            "BBB.BK": [100 + 0.20 * i + 0.20 * math.sin(i) for i in range(length)],
+            "CCC.BK": [100 + 0.10 * i + 0.30 * math.sin(i) for i in range(length)],
+            "DDD.BK": [100 - 0.10 * i + 0.10 * math.sin(i) for i in range(length)],
+        }
+
+    signal_prices = prices(len(signal_days))
     frames = {
         symbol: pd.DataFrame(
             {"Close": values, "Volume": [100_000] * len(values)},
             index=signal_days,
         )
-        for symbol, values in closes.items()
+        for symbol, values in signal_prices.items()
     }
     targets, breadth, coverage = select_targets(
         frames, signal_days[-1], universe, top_n=2, min_coverage=0.75,
@@ -309,15 +313,10 @@ def _self_test() -> None:
     )
     assert targets == [] and coverage == 0.75, (targets, coverage)
 
-    close_values = {
-        "AAA.BK": [100.0] * 69 + [112.0, 113.0, 114.0],
-        "BBB.BK": [100.0] * 69 + [108.0, 109.0, 110.0],
-        "CCC.BK": [100.0] * 69 + [104.0, 104.0, 105.0],
-        "DDD.BK": [100.0] * 69 + [95.0, 96.0, 97.0],
-        INDEX_SYMBOL: [100.0] * 72,
-    }
+    trading_prices = prices(len(days))
+    trading_prices[INDEX_SYMBOL] = [100.0] * len(days)
     trading_frames = {}
-    for symbol, values in close_values.items():
+    for symbol, values in trading_prices.items():
         close = pd.Series(values, index=days)
         trading_frames[symbol] = pd.DataFrame({
             "Open": close.shift(1).fillna(close),
