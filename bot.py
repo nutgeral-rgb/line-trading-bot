@@ -360,10 +360,10 @@ def build_daily_plan(portfolio, frames=None):
                     "summary", "ข้อมูลพื้นฐานไม่พร้อม"
                 )
                 report_lines.append(
-                    f"{index}. 📈 {sym}\\n"
-                    f"   ผลตอบแทน 63 วัน: {momentum * 100:+.1f}%\\n"
-                    f"   ความผันผวนต่อปี: {volatility * 100:.1f}%\\n"
-                    f"   มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน\\n"
+                    f"{index}. 📈 {sym}\n"
+                    f"   ผลตอบแทน 63 วัน: {momentum * 100:+.1f}%\n"
+                    f"   ความผันผวนต่อปี: {volatility * 100:.1f}%\n"
+                    f"   มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน\n"
                     f"   พื้นฐาน: {fundamental_text}"
                 )
             report_lines.append("")
