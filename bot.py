@@ -110,6 +110,9 @@ UNIVERSE = [
     "WHA.BK",
 ]
 
+MAX_POSITIONS = 5
+MIN_UNIVERSE_COVERAGE = 0.80
+
 # =========================================================
 # CALENDAR FUNCTIONS (exchange_calendars XBKK)
 # =========================================================
@@ -224,14 +227,18 @@ def get_stock_history(symbol, period="3mo"):
         result = res["chart"]["result"][0]
         timestamp = result["timestamp"]
         quote = result["indicators"]["quote"][0]
+        adjusted = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose")
+        close = quote.get("close")
         df = pd.DataFrame({
             "Open": quote.get("open"),
             "High": quote.get("high"),
             "Low": quote.get("low"),
-            "Close": quote.get("close"),
+            "Close": close,
+            "Adj Close": adjusted if adjusted is not None else close,
             "Volume": quote.get("volume"),
         }, index=pd.to_datetime(timestamp, unit="s"))
-        df.dropna(subset=["Close"], inplace=True)
+        df.sort_index(inplace=True)
+        df.dropna(subset=["Close", "Adj Close"], inplace=True)
         return df if not df.empty else None
     except Exception:
         return None
@@ -248,73 +255,107 @@ def get_market_frames(symbols):
 
 def combined_universe(portfolio):
     custom = portfolio.get("watchlist", [])
-    return list(set(UNIVERSE + custom))
+    return sorted(set(UNIVERSE + custom))
+
+
+def _close_and_sma20(df, as_of):
+    if df is None or len(df) < 20 or df.index[-1].strftime("%Y-%m-%d") != as_of:
+        return None
+    close_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    closes = df[close_col].dropna()
+    if len(closes) < 20 or closes.index[-1].strftime("%Y-%m-%d") != as_of:
+        return None
+    close = float(closes.iloc[-1])
+    sma20 = float(closes.rolling(20).mean().iloc[-1])
+    if not pd.notna(close) or not pd.notna(sma20) or sma20 <= 0:
+        return None
+    return close, sma20
 
 
 def market_context(frames):
-    if INDEX_SYMBOL not in frames:
-        return {"sufficient": False, "date": "", "breadth": 0, "pass": False}
-    idx_df = frames[INDEX_SYMBOL]
-    latest_date = idx_df.index[-1].strftime("%Y-%m-%d")
-    
-    above_count = 0
-    total_checked = 0
-    for sym, df in frames.items():
-        if sym == INDEX_SYMBOL:
-            continue
-        if len(df) >= 20:
-            total_checked += 1
-            close = df["Close"].iloc[-1]
-            sma20 = df["Close"].rolling(20).mean().iloc[-1]
-            if close > sma20:
-                above_count += 1
-                
-    breadth = (above_count / total_checked * 100) if total_checked > 0 else 0
-    market_pass = breadth >= 50.0
+    idx_df = frames.get(INDEX_SYMBOL)
+    if idx_df is None or len(idx_df) < 20:
+        return {
+            "sufficient": False, "date": "", "breadth": 0,
+            "coverage": 0, "pass": False,
+        }
+
+    as_of = idx_df.index[-1].strftime("%Y-%m-%d")
+    valid = {}
+    for sym in UNIVERSE:
+        values = _close_and_sma20(frames.get(sym), as_of)
+        if values is not None:
+            valid[sym] = values
+
+    coverage = len(valid) / len(UNIVERSE) if UNIVERSE else 0
+    if coverage < MIN_UNIVERSE_COVERAGE:
+        return {
+            "sufficient": False, "date": as_of, "breadth": 0,
+            "coverage": coverage, "pass": False,
+        }
+
+    above_count = sum(close > sma20 for close, sma20 in valid.values())
+    breadth = above_count / len(valid) * 100
     return {
         "sufficient": True,
-        "date": latest_date,
+        "date": as_of,
         "breadth": breadth,
-        "pass": market_pass,
+        "coverage": coverage,
+        "pass": breadth >= 50.0,
     }
 
 
 def build_daily_plan(portfolio, frames=None):
     symbols = combined_universe(portfolio)
     if frames is None:
-        frames = get_market_frames(UNIVERSE + symbols + list(portfolio["stocks"]) + [INDEX_SYMBOL])
-    
+        symbols_to_load = sorted(set(UNIVERSE + symbols + list(portfolio["stocks"]) + [INDEX_SYMBOL]))
+        frames = get_market_frames(symbols_to_load)
+
     ctx = market_context(frames)
     report_lines = []
     selected = []
-    
     now_str = now_bkk().strftime("%Y-%m-%d %H:%M")
-    data_date = ctx["date"] if ctx["sufficient"] else "ไม่ทราบ"
-    
+    data_date = ctx["date"] if ctx["date"] else "ไม่ทราบ"
+
     report_lines.append(f"เวลาใช้งานรายงาน {now_str}")
     report_lines.append(f"แท่งราคาล่าสุด {data_date}")
-    report_lines.append(f"ตลาด {'ผ่านเกณฑ์' if ctx['pass'] else 'ไม่ผ่านเกณฑ์'} | Breadth {ctx['breadth']:.1f}%")
-    
+    report_lines.append(
+        f"ข้อมูลจักรวาลหลัก {ctx['coverage'] * 100:.0f}% | "
+        f"ตลาด {'ผ่านเกณฑ์' if ctx['pass'] else 'ไม่ผ่านเกณฑ์'} | "
+        f"Breadth {ctx['breadth']:.1f}%"
+    )
+
     if not ctx["sufficient"]:
-        report_lines.append("เหตุผล: ข้อมูลดัชนีไม่พร้อมหรือเก่าเกินเกณฑ์")
-    
-    if ctx["pass"] and ctx["sufficient"]:
-        candidates = []
+        report_lines.append(
+            f"ข้อมูลหุ้นไม่ครบเกณฑ์ (ต้องมีอย่างน้อย {MIN_UNIVERSE_COVERAGE:.0%} "
+            "ของจักรวาลหลักในวันเดียวกัน) จึงงดสร้างสัญญาณ"
+        )
+    elif ctx["pass"]:
+        ranked = []
         for sym in symbols:
-            if sym in frames:
-                df = frames[sym]
-                close = df["Close"].iloc[-1]
-                sma20 = df["Close"].rolling(20).mean().iloc[-1]
-                if close > sma20:
-                    candidates.append(sym)
-        if candidates:
-            selected = candidates[:5]
-            report_lines.append(f"หุ้นน่าสนใจ: {', '.join(selected)}")
+            values = _close_and_sma20(frames.get(sym), data_date)
+            if values is None:
+                continue
+            close, sma20 = values
+            if close > sma20:
+                score = close / sma20 - 1
+                ranked.append((score, sym))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        selected = [sym for _, sym in ranked[:MAX_POSITIONS]]
+        if selected:
+            weight = 100 / len(selected)
+            report_lines.append(f"หุ้นเรียงตามโมเมนตัมเหนือ SMA20: {', '.join(selected)}")
+            report_lines.append(f"น้ำหนักเป้าหมายแบบเท่ากัน: หุ้นละ {weight:.1f}%")
+            report_lines.append(
+                "กติกาหมุนทุน: ใช้สัญญาณราคาปิดวันนี้สำหรับวันซื้อขายถัดไป; "
+                "พิจารณาขายเมื่อหลุด 5 อันดับแรกหรือปิดต่ำกว่า SMA20"
+            )
         else:
-            report_lines.append("ยังไม่มีหุ้นเข้าเกณฑ์ซื้อ")
+            report_lines.append("ยังไม่มีหุ้นเข้าเกณฑ์ จึงถือเงินสด")
     else:
-        report_lines.append("ยังไม่เสนอซื้อใหม่เพราะตลาดรวมไม่ผ่านเกณฑ์")
-        
+        report_lines.append("ตลาดไม่ผ่านเกณฑ์ Breadth จึงถือเงินสดและงดเปิดสถานะใหม่")
+
     return "\n".join(report_lines), selected
 
 
