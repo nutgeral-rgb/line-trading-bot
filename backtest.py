@@ -171,6 +171,7 @@ def backtest(
                 for symbol, weight in target_weights.items()
             )
         equity = equity_after_cost * close_factor
+        weights = target_weights
         curve.append({
             "Date": day.strftime("%Y-%m-%d"),
             "Equity": equity,
