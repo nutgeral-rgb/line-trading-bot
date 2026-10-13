@@ -15,7 +15,6 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 INDEX_SYMBOL = "SET.BK"
 UNIVERSE = [
@@ -210,6 +209,8 @@ def backtest(
 
 
 def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFrame]:
+    import yfinance as yf
+
     raw = yf.download(
         tickers=symbols,
         start=start,
