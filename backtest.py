@@ -251,6 +251,7 @@ def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFram
 
 def _self_test() -> None:
     days = pd.bdate_range("2024-01-01", periods=22)
+    signal_days = days[:21]
     universe = ["AAA.BK", "BBB.BK", "CCC.BK", "DDD.BK"]
     closes = {
         "AAA.BK": [100.0] * 20 + [112.0],
@@ -258,9 +259,9 @@ def _self_test() -> None:
         "CCC.BK": [100.0] * 20 + [104.0],
         "DDD.BK": [100.0] * 20 + [95.0],
     }
-    frames = {s: pd.DataFrame({"Close": values}, index=days) for s, values in closes.items()}
+    frames = {s: pd.DataFrame({"Close": values}, index=signal_days) for s, values in closes.items()}
     targets, breadth, coverage = select_targets(
-        frames, days[-1], universe, top_n=2, min_coverage=0.75,
+        frames, signal_days[-1], universe, top_n=2, min_coverage=0.75,
     )
     assert targets == ["AAA.BK", "BBB.BK"], targets
     assert breadth == 75.0 and coverage == 1.0, (breadth, coverage)
@@ -268,13 +269,13 @@ def _self_test() -> None:
     stale = dict(frames)
     stale["DDD.BK"] = stale["DDD.BK"].iloc[:-1]
     targets, breadth, coverage = select_targets(
-        stale, days[-1], universe, top_n=2, min_coverage=0.75,
+        stale, signal_days[-1], universe, top_n=2, min_coverage=0.75,
     )
     assert targets == ["AAA.BK", "BBB.BK"], targets
     assert coverage == 0.75, coverage
 
     targets, _, coverage = select_targets(
-        stale, days[-1], universe, top_n=2, min_coverage=0.80,
+        stale, signal_days[-1], universe, top_n=2, min_coverage=0.80,
     )
     assert targets == [] and coverage == 0.75, (targets, coverage)
 
