@@ -353,19 +353,23 @@ def build_daily_plan(portfolio, frames=None):
     now_str = now_bkk().strftime("%Y-%m-%d %H:%M")
     data_date = ctx["date"] if ctx["date"] else "ไม่ทราบ"
 
-    report_lines.append(f"เวลาใช้งานรายงาน {now_str}")
-    report_lines.append(f"แท่งราคาล่าสุด {data_date}")
+    report_lines.append(f"📊 แผนหมุนทุน | จัดทำ {now_str}")
+    report_lines.append(f"📅 วันที่ข้อมูลราคา: {data_date}")
     report_lines.append(
-        f"ข้อมูลจักรวาลหลัก {ctx['coverage'] * 100:.0f}% | "
-        f"ตลาด {'ผ่านเกณฑ์' if ctx['pass'] else 'ไม่ผ่านเกณฑ์'} | "
-        f"Breadth {ctx['breadth']:.1f}%"
+        f"🌐 ภาพตลาด: {'ผ่านเกณฑ์' if ctx['pass'] else 'ยังไม่ผ่านเกณฑ์'}"
+    )
+    report_lines.append(
+        f"   Breadth {ctx['breadth']:.1f}%  •  "
+        f"ข้อมูลครบ {ctx['coverage'] * 100:.0f}%"
     )
 
     if not ctx["sufficient"]:
+        report_lines.append("")
         report_lines.append(
-            f"ข้อมูลหุ้นไม่ครบเกณฑ์ (ต้องมีอย่างน้อย {MIN_UNIVERSE_COVERAGE:.0%} "
-            "ของจักรวาลหลักในวันเดียวกัน) จึงงดสร้างสัญญาณ"
+            f"⚠️ ข้อมูลหุ้นไม่ครบ (ต้องมีอย่างน้อย {MIN_UNIVERSE_COVERAGE:.0%} "
+            "ของหุ้นหลักในวันเดียวกัน)"
         )
+        report_lines.append("จึงยังไม่สร้างสัญญาณ และควรรอข้อมูลรอบถัดไป")
     elif ctx["pass"]:
         ranked = []
         for sym in symbols:
@@ -381,26 +385,31 @@ def build_daily_plan(portfolio, frames=None):
         ranked.sort(key=lambda item: (-item[0], item[1]))
         selected_rows = ranked[:MAX_POSITIONS]
         selected = [row[1] for row in selected_rows]
+        report_lines.append("")
         if selected:
             weight = 100 / len(selected)
-            report_lines.append("หุ้นที่ผ่านแนวโน้มและสภาพคล่อง เรียงตามโมเมนตัมต่อความผันผวน:")
-            for score, sym, momentum, volatility, avg_value in selected_rows:
+            report_lines.append(f"✅ หุ้นที่ผ่านเกณฑ์ ({len(selected)} ตัว)")
+            for index, (_, sym, momentum, volatility, avg_value) in enumerate(selected_rows, 1):
                 report_lines.append(
-                    f"- {sym}: ผลตอบแทน 63 วัน {momentum * 100:.1f}% | "
-                    f"ความผันผวน 20 วันต่อปี {volatility * 100:.1f}% | "
-                    f"มูลค่าซื้อขายมัธยฐาน {avg_value:,.0f} บาท/วัน"
+                    f"{index}. 📈 {sym}\n"
+                    f"   ผลตอบแทน 63 วัน: {momentum * 100:+.1f}%\n"
+                    f"   ความผันผวนต่อปี: {volatility * 100:.1f}%\n"
+                    f"   มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน"
                 )
-            report_lines.append(f"น้ำหนักเป้าหมายแบบเท่ากัน: หุ้นละ {weight:.1f}%")
-            report_lines.append(
-                "กติกาหมุนทุน: ใช้สัญญาณราคาปิดวันนี้สำหรับวันซื้อขายถัดไป; "
-                "พิจารณาขายเมื่อหลุด 5 อันดับแรกหรือปิดต่ำกว่า SMA20"
-            )
+            report_lines.append("")
+            report_lines.append(f"⚖️ น้ำหนักเป้าหมาย: หุ้นละ {weight:.1f}%")
+            report_lines.append("🔁 ใช้สัญญาณราคาปิดเพื่อวางแผนวันซื้อขายถัดไป")
+            report_lines.append("ทบทวนขายเมื่อหลุด 5 อันดับแรกหรือปิดต่ำกว่า SMA20")
         else:
-            report_lines.append("ยังไม่มีหุ้นเข้าเกณฑ์ จึงถือเงินสด")
+            report_lines.append("💵 ยังไม่มีหุ้นผ่านเกณฑ์ จึงแนะนำถือเงินสด")
     else:
-        report_lines.append("ตลาดไม่ผ่านเกณฑ์ Breadth จึงถือเงินสดและงดเปิดสถานะใหม่")
+        report_lines.append("")
+        report_lines.append("🛡️ ตลาดไม่ผ่านเกณฑ์ Breadth")
+        report_lines.append("แนะนำถือเงินสดและงดเปิดสถานะใหม่")
 
     return "\n".join(report_lines), selected
+
+
 
 
 # =========================================================
@@ -557,17 +566,21 @@ def handle_message(event):
 
 def help_text():
     return (
-        "📊 Portfolio Bot — เมนูคำสั่ง\n\n"
+        "📊 PORTFOLIO BOT\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📈 แผนหุ้น\n"
         "แผนวันนี้ — ดูแผนหุ้นสำหรับวันซื้อขายนี้\n"
-        "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึกไว้\n"
-        "รายการติดตาม — ดูหุ้นที่เพิ่มไว้\n"
-        "ติดตาม AOT — เพิ่ม AOT ในหุ้นที่ใช้พิจารณาแผน\n"
-        "เลิกติดตาม AOT — นำ AOT ออกจากรายการ\n"
-        "เมนู หรือ ช่วยเหลือ — แสดงรายการคำสั่งนี้\n\n"
-        "แผนหุ้นอิงข้อมูลตลาดและเกณฑ์ของบอต; หากข้อมูลไม่ครบหรือตลาดไม่ผ่านเกณฑ์ "
-        "บอตอาจแนะนำให้ถือเงินสด\n"
-        "หมายเหตุ: บอตยังไม่ส่งคำสั่งซื้อขายจริง และคำสั่งติดตามไม่ได้ซื้อหุ้นให้"
+        "หรือพิมพ์: แผนเทรดวันนี้ / ควรซื้อวันนี้ / ซื้อวันนี้\n\n"
+        "💼 พอร์ตและรายการติดตาม\n"
+        "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
+        "รายการติดตาม — ดูหุ้นที่ติดตาม\n"
+        "ติดตาม AOT — เพิ่มหุ้นในรายการและใช้พิจารณาแผน\n"
+        "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n\n"
+        "❔ เมนูคำสั่ง\n"
+        "พิมพ์: เมนู หรือ ช่วยเหลือ\n\n"
+        "หมายเหตุ: บอตให้ข้อมูลประกอบการตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง"
     )
+
 
 
 def command_reply(user_id, text):
@@ -582,23 +595,44 @@ def command_reply(user_id, text):
     if text == "ดูพอร์ต":
         cash = portfolio["cash"]
         stocks = portfolio["stocks"]
-        total_stock_val = sum(s["shares"] * s["avg_price"] for s in stocks.values())
-        total_val = cash + total_stock_val
-        lines = [f"เงินสด: {cash:,.2f} บาท", f"มูลค่าหุ้น: {total_stock_val:,.2f} บาท", f"รวมทั้งหมด: {total_val:,.2f} บาท"]
+        total_stock_cost = sum(
+            stock["shares"] * stock["avg_price"] for stock in stocks.values()
+        )
+        total_value = cash + total_stock_cost
+        lines = [
+            "💼 สรุปพอร์ต",
+            "━━━━━━━━━━━━━━━━━━",
+            f"💵 เงินสด: {cash:,.2f} บาท",
+            f"📦 มูลค่าหุ้นตามต้นทุนเฉลี่ย: {total_stock_cost:,.2f} บาท",
+            f"💰 รวมตามข้อมูลที่บันทึก: {total_value:,.2f} บาท",
+            "",
+        ]
         if stocks:
-            lines.append("หุ้นในพอร์ต:")
+            lines.append("📌 หุ้นที่บันทึกไว้")
             for sym, info in stocks.items():
-                lines.append(f"- {sym}: {info['shares']} หุ้น (@{info['avg_price']:.2f})")
+                lines.append(
+                    f"• {sym}  |  {info['shares']} หุ้น  |  "
+                    f"ต้นทุนเฉลี่ย {info['avg_price']:.2f} บาท"
+                )
         else:
-            lines.append("ยังไม่มีหุ้นในพอร์ต")
+            lines.append("📌 ยังไม่มีหุ้นที่บันทึกไว้")
+        lines.extend([
+            "",
+            "หมายเหตุ: มูลค่าหุ้นคำนวณจากต้นทุนเฉลี่ย ไม่ใช่ราคาตลาดปัจจุบัน",
+        ])
         return "\n".join(lines)
-        
+
     if text == "รายการติดตาม":
         watchlist = portfolio.get("watchlist", [])
         if not watchlist:
-            return "ยังไม่มีรายการติดตาม (เพิ่มได้ด้วยคำสั่ง 'ติดตาม <ชื่อหุ้น>')"
-        return "รายการติดตาม:\n" + ", ".join(watchlist)
-        
+            return (
+                "🔎 รายการติดตามยังว่างอยู่\n"
+                "ลองพิมพ์: ติดตาม AOT"
+            )
+        return "🔎 หุ้นที่ติดตาม\n" + "\n".join(
+            f"• {symbol}" for symbol in watchlist
+        )
+
     if text.startswith("ติดตาม "):
         sym = text.replace("ติดตาม", "").strip().upper()
         if not sym.endswith(".BK"):
