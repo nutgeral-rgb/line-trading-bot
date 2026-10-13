@@ -93,6 +93,7 @@ def backtest(
     vat_rate: float = 0.07,
     slippage_bps: float = 10.0,
     initial_cash: float = 100_000.0,
+    evaluation_start: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Run daily close-signal / next-open rotation with cash and trading costs."""
     if INDEX_SYMBOL not in frames:
@@ -102,6 +103,14 @@ def backtest(
         raise ValueError("Not enough benchmark history for the selected SMA period")
 
     cost_rate = commission_rate * (1.0 + vat_rate) + slippage_bps / 10_000.0
+    start_index = 1
+    if evaluation_start:
+        requested_start = pd.Timestamp(evaluation_start)
+        start_index = next((i for i, day in enumerate(dates) if pd.Timestamp(day) >= requested_start), len(dates))
+        start_index = max(1, start_index)
+        if start_index >= len(dates):
+            raise ValueError("No benchmark sessions on or after --start")
+
     equity = float(initial_cash)
     weights: dict[str, float] = {}
     curve: list[dict[str, float | str]] = []
@@ -109,7 +118,7 @@ def backtest(
     rebalance_count = 0
     previous_targets: tuple[str, ...] = ()
 
-    for i in range(1, len(dates)):
+    for i in range(start_index, len(dates)):
         previous_day, day = pd.Timestamp(dates[i - 1]), pd.Timestamp(dates[i])
         targets, breadth, coverage = select_targets(
             frames, previous_day, universe, top_n, sma_days,
@@ -182,15 +191,17 @@ def backtest(
         })
 
     result = pd.DataFrame(curve).set_index("Date")
-    benchmark = frames[INDEX_SYMBOL]["Close"].reindex(pd.to_datetime(result.index)).dropna()
+    benchmark_dates = pd.to_datetime(dates[start_index - 1:])
+    benchmark = frames[INDEX_SYMBOL]["Close"].reindex(benchmark_dates).dropna()
     benchmark_return = float(benchmark.iloc[-1] / benchmark.iloc[0] - 1) if len(benchmark) > 1 else 0.0
 
     daily_returns = result["DailyReturn"].astype(float)
     years = len(daily_returns) / 252.0
     total_return = equity / initial_cash - 1.0
     cagr = (equity / initial_cash) ** (1 / years) - 1 if years > 0 and equity > 0 else -1.0
-    peaks = result["Equity"].astype(float).cummax()
-    max_drawdown = float((result["Equity"].astype(float) / peaks - 1.0).min())
+    equity_values = result["Equity"].astype(float).to_numpy()
+    peaks = np.maximum.accumulate(np.concatenate(([initial_cash], equity_values)))[1:]
+    max_drawdown = float((equity_values / peaks - 1.0).min()) if len(equity_values) else 0.0
     volatility = float(daily_returns.std(ddof=1) * math.sqrt(252)) if len(daily_returns) > 1 else 0.0
     sharpe = float(daily_returns.mean() / daily_returns.std(ddof=1) * math.sqrt(252)) if len(daily_returns) > 1 and daily_returns.std(ddof=1) > 0 else 0.0
     metrics = {
@@ -239,7 +250,7 @@ def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFram
 
 
 def _self_test() -> None:
-    days = pd.bdate_range("2024-01-01", periods=21)
+    days = pd.bdate_range("2024-01-01", periods=22)
     universe = ["AAA.BK", "BBB.BK", "CCC.BK", "DDD.BK"]
     closes = {
         "AAA.BK": [100.0] * 20 + [112.0],
@@ -266,7 +277,28 @@ def _self_test() -> None:
         stale, days[-1], universe, top_n=2, min_coverage=0.80,
     )
     assert targets == [] and coverage == 0.75, (targets, coverage)
-    print("Self-test passed: ranking, same-date coverage, and cash fallback.")
+
+    close_values = {
+        "AAA.BK": [100.0] * 19 + [112.0, 113.0, 114.0],
+        "BBB.BK": [100.0] * 19 + [108.0, 109.0, 110.0],
+        "CCC.BK": [100.0] * 19 + [104.0, 104.0, 105.0],
+        "DDD.BK": [100.0] * 19 + [95.0, 96.0, 97.0],
+        INDEX_SYMBOL: [100.0] * 22,
+    }
+    trading_frames = {}
+    for symbol, values in close_values.items():
+        close = pd.Series(values, index=days)
+        trading_frames[symbol] = pd.DataFrame({
+            "Open": close.shift(1).fillna(close),
+            "Close": close,
+        })
+    _, metrics = backtest(
+        trading_frames, universe=universe, top_n=2, min_coverage=0.75,
+        commission_rate=0, vat_rate=0, slippage_bps=0, initial_cash=10_000,
+    )
+    assert metrics["final_equity"] > 10_000, metrics
+    assert metrics["average_daily_turnover"] > 0, metrics
+    print("Self-test passed: ranking, same-date coverage, cash fallback, and trade accounting.")
 
 
 def main() -> None:
@@ -292,7 +324,9 @@ def main() -> None:
         parser.error("--top must be positive, --sma at least 2, and --min-coverage between 0 and 1")
 
     symbols = sorted(set(UNIVERSE + [INDEX_SYMBOL]))
-    frames = _download(args.start, args.end, symbols)
+    warmup_days = max(90, args.sma * 3)
+    download_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warmup_days)).date().isoformat()
+    frames = _download(download_start, args.end, symbols)
     if INDEX_SYMBOL not in frames:
         raise SystemExit(f"Could not download benchmark {INDEX_SYMBOL}")
 
@@ -306,6 +340,7 @@ def main() -> None:
         vat_rate=args.vat,
         slippage_bps=args.slippage_bps,
         initial_cash=args.cash,
+        evaluation_start=args.start,
     )
     curve.to_csv(args.output)
     print(f"Period: {curve.index[0]} to {curve.index[-1]}")
