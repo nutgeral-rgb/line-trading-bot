@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import json
 import logging
@@ -31,6 +32,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from set100_constituents import SET100_SYMBOLS
+
 # =========================================================
 # CONFIGURATION & LOGGING
 # =========================================================
@@ -55,60 +58,9 @@ handler = WebhookHandler(CHANNEL_SECRET)
 PORTFOLIO_FILE = "portfolio.json"
 
 INDEX_SYMBOL = "SET.BK"
-UNIVERSE = [
-    "ADVANC.BK",
-    "AOT.BK",
-    "AWC.BK",
-    "BANPU.BK",
-    "BBL.BK",
-    "BCP.BK",
-    "BDMS.BK",
-    "BEM.BK",
-    "BH.BK",
-    "BJC.BK",
-    "CCET.BK",
-    "COM7.BK",
-    "CPALL.BK",
-    "CPF.BK",
-    "CPN.BK",
-    "CRC.BK",
-    "DELTA.BK",
-    "EGCO.BK",
-    "GPSC.BK",
-    "GULF.BK",
-    "HMPRO.BK",
-    "IVL.BK",
-    "KBANK.BK",
-    "KCE.BK",
-    "KKP.BK",
-    "KTB.BK",
-    "KTC.BK",
-    "LH.BK",
-    "MINT.BK",
-    "MRDIYT.BK",
-    "MTC.BK",
-    "OR.BK",
-    "OSP.BK",
-    "PTT.BK",
-    "PTTEP.BK",
-    "PTTGC.BK",
-    "RATCH.BK",
-    "SCB.BK",
-    "SCC.BK",
-    "SCGP.BK",
-    "TCAP.BK",
-    "TFG.BK",
-    "THAI.BK",
-    "TIDLOR.BK",
-    "TISCO.BK",
-    "TLI.BK",
-    "TOP.BK",
-    "TRUE.BK",
-    "TTB.BK",
-    "TU.BK",
-    "VGI.BK",
-    "WHA.BK",
-]
+UNIVERSE = SET100_SYMBOLS
+
+MAX_POSITIONS = 5]
 
 MAX_POSITIONS = 5
 MIN_UNIVERSE_COVERAGE = 0.80
@@ -248,11 +200,19 @@ def get_stock_history(symbol, period="3mo"):
 
 
 def get_market_frames(symbols):
+    unique_symbols = sorted(set(symbols))
+    if not unique_symbols:
+        return {}
+
+    def fetch_one(sym):
+        return sym, get_stock_history(sym, period="6mo")
+
     frames = {}
-    for sym in symbols:
-        df = get_stock_history(sym, period="6mo")
-        if df is not None and len(df) >= 20:
-            frames[sym] = df
+    worker_count = min(8, len(unique_symbols))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for sym, df in executor.map(fetch_one, unique_symbols):
+            if df is not None and len(df) >= 20:
+                frames[sym] = df
     return frames
 
 
@@ -451,26 +411,39 @@ def prepare_overnight_plans():
     current_day = now_bkk().date()
     if not is_set_session(current_day):
         return
-        
+
     try:
         users = registered_users()
     except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้ไม่สำเร็จ")
         return
-        
+
+    pending = {}
     for user_id in users:
         try:
             portfolio = get_portfolio(user_id)
             previous = portfolio.get("overnight_plan")
-            if isinstance(previous, dict) and previous.get("data_date") == current_day.isoformat():
-                continue
-                
-            symbols = combined_universe(portfolio)
-            frames = get_market_frames(UNIVERSE + symbols + list(portfolio["stocks"]) + [INDEX_SYMBOL])
-            ctx = market_context(frames)
-            
-            if not ctx["sufficient"] or ctx["date"] != current_day.isoformat():
-                continue
-                
+            if not isinstance(previous, dict) or previous.get("data_date") != current_day.isoformat():
+                pending[user_id] = portfolio
+        except Exception:
+            logger.exception("อ่านพอร์ตเพื่อเตรียมแผนไม่สำเร็จ")
+
+    if not pending:
+        return
+
+    symbols = set(UNIVERSE + [INDEX_SYMBOL])
+    for portfolio in pending.values():
+        symbols.update(combined_universe(portfolio))
+        symbols.update(portfolio.get("stocks", {}).keys())
+
+    frames = get_market_frames(symbols)
+    ctx = market_context(frames)
+    if not ctx["sufficient"] or ctx["date"] != current_day.isoformat():
+        logger.info("ยังไม่มีข้อมูล SET100 ครบพอสำหรับสร้างแผนวันที่ %s", current_day)
+        return
+
+    for user_id, portfolio in pending.items():
+        try:
             report, selected = build_daily_plan(portfolio, frames=frames)
             new_plan = {
                 "data_date": current_day.isoformat(),
@@ -480,14 +453,14 @@ def prepare_overnight_plans():
                 "text": report,
                 "selected": selected,
             }
-            
+
             def save_plan(p):
                 p["overnight_plan"] = new_plan
                 return "เตรียมแผนแล้ว"
-                
+
             mutate_portfolio(user_id, save_plan)
         except Exception:
-            logger.exception("เตรียมแผนล้มเหลว")
+            logger.exception("เตรียมแผนล้มเหลวสำหรับผู้ใช้")
 
 
 def send_overnight_plans():
