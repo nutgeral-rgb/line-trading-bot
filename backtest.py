@@ -16,21 +16,13 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from set100_constituents import SET100_SYMBOLS
+
 INDEX_SYMBOL = "SET.BK"
 MOMENTUM_LOOKBACK = 63
 VOLATILITY_LOOKBACK = 20
 MIN_AVG_DAILY_VALUE_BAHT = 5_000_000
-UNIVERSE = [
-    "ADVANC.BK", "AOT.BK", "AWC.BK", "BANPU.BK", "BBL.BK", "BCP.BK",
-    "BDMS.BK", "BEM.BK", "BH.BK", "BJC.BK", "CCET.BK", "COM7.BK",
-    "CPALL.BK", "CPF.BK", "CPN.BK", "CRC.BK", "DELTA.BK", "EGCO.BK",
-    "GPSC.BK", "GULF.BK", "HMPRO.BK", "IVL.BK", "KBANK.BK", "KCE.BK",
-    "KKP.BK", "KTB.BK", "KTC.BK", "LH.BK", "MINT.BK", "MRDIYT.BK",
-    "MTC.BK", "OR.BK", "OSP.BK", "PTT.BK", "PTTEP.BK", "PTTGC.BK",
-    "RATCH.BK", "SCB.BK", "SCC.BK", "SCGP.BK", "TCAP.BK", "TFG.BK",
-    "THAI.BK", "TIDLOR.BK", "TISCO.BK", "TLI.BK", "TOP.BK", "TRUE.BK",
-    "TTB.BK", "TU.BK", "VGI.BK", "WHA.BK",
-]
+UNIVERSE = SET100_SYMBOLS
 
 
 def select_targets(
