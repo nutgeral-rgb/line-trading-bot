@@ -390,12 +390,51 @@ def read_overnight_plan(user_id):
     plan = portfolio.get("overnight_plan")
     
     if not isinstance(plan, dict):
-        return (
-            "ยังไม่มีแผนที่ประมวลผลหลังตลาดปิด\n"
-            "บอตจะตรวจข้อมูลหลังปิดตลาดในวันซื้อขาย "
-            "และเตรียมแผนสำหรับเช้าวันซื้อขายถัดไป"
-        )
-    
+        # Recover on demand if the scheduled overnight job did not create a plan.
+        # Use the latest available completed market data; never place real orders.
+        logger.warning("ไม่พบแผนล่วงหน้าสำหรับผู้ใช้ จึงลองคำนวณแผนตามคำขอ")
+        try:
+            report, selected = build_daily_plan(portfolio)
+            if "ข้อมูลหุ้นไม่ครบ" in report:
+                return (
+                    "⚠️ ยังสร้างแผนที่เชื่อถือได้ไม่ได้ เพราะข้อมูลตลาดไม่ครบ\\n"
+                    "ระบบลองตรวจข้อมูลใหม่ตามคำขอแล้ว แต่ยังไม่แนะนำให้ซื้อจากข้อมูลชุดนี้\\n\\n"
+                    + report
+                )
+
+            data_date = "ไม่ทราบ"
+            for line in report.splitlines():
+                if line.startswith("📅 วันที่ข้อมูลราคา:"):
+                    data_date = line.split(":", 1)[1].strip()
+                    break
+
+            today = now_bkk().date()
+            recovered_plan = {
+                "data_date": data_date,
+                "delivery_day": today.isoformat(),
+                "prepared_at": utc_text(),
+                "status": "SENT",
+                "text": report,
+                "selected": selected,
+            }
+
+            def save_recovered_plan(p):
+                p["overnight_plan"] = recovered_plan
+                return None
+
+            mutate_portfolio(user_id, save_recovered_plan)
+            return (
+                "⚠️ ไม่พบแผนที่เตรียมไว้ตามเวลา จึงคำนวณใหม่จากข้อมูลล่าสุดที่มี "
+                "โปรดตรวจวันที่ข้อมูลก่อนตัดสินใจ\\n\\n"
+                + report
+            )
+        except Exception:
+            logger.exception("คำนวณแผนตามคำขอไม่สำเร็จ")
+            return (
+                "⚠️ ระบบคำนวณแผนใหม่ไม่สำเร็จ จึงยังไม่สามารถให้แผนซื้อวันนี้ได้\\n"
+                "โปรดลองอีกครั้งภายหลัง และตรวจ Logs ของบริการเพื่อดูข้อผิดพลาด"
+            )
+
     today = now_bkk().date().isoformat()
     delivery_day = plan.get("delivery_day")
     status = plan.get("status")
