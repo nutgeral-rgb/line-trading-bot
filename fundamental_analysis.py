@@ -6,8 +6,12 @@ reported as unavailable. Yahoo Finance data can be missing or delayed.
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 import math
 import re
+import time
+
+logger = logging.getLogger(__name__)
 
 # Debt/equity is not a useful comparable screen for banks and lenders.
 _FINANCIALS = {
@@ -43,12 +47,52 @@ def analyze_fundamentals(symbol):
     try:
         import yfinance as yf
 
-        ticker = yf.Ticker(symbol)
-        income = ticker.quarterly_income_stmt
-        cashflow = ticker.quarterly_cashflow
-        balance = ticker.quarterly_balance_sheet
-    except Exception:
-        return {"score": None, "available": 0, "summary": "ดึงข้อมูลงบไม่ได้"}
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(symbol)
+                income = ticker.quarterly_income_stmt
+                cashflow = ticker.quarterly_cashflow
+                balance = ticker.quarterly_balance_sheet
+                break
+            except Exception as exc:
+                is_rate_limited = (
+                    "ratelimit" in type(exc).__name__.lower()
+                    or "too many requests" in str(exc).lower()
+                    or "rate limited" in str(exc).lower()
+                )
+                if not is_rate_limited or attempt == 2:
+                    logger.warning(
+                        "ดึงข้อมูลงบไม่สำเร็จ: symbol=%s "
+                        "error_type=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+                    return {
+                        "score": None,
+                        "available": 0,
+                        "summary": "ดึงข้อมูลงบไม่ได้",
+                    }
+                delay = 2 ** (attempt + 1)
+                logger.info(
+                    "Yahoo Finance จำกัดคำขอข้อมูลงบ: "
+                    "symbol=%s retry=%d delay=%ds",
+                    symbol,
+                    attempt + 1,
+                    delay,
+                )
+                time.sleep(delay)
+    except Exception as exc:
+        logger.warning(
+            "เตรียมดึงข้อมูลงบไม่สำเร็จ: symbol=%s "
+            "error_type=%s",
+            symbol,
+            type(exc).__name__,
+        )
+        return {
+            "score": None,
+            "available": 0,
+            "summary": "ดึงข้อมูลงบไม่ได้",
+        }
 
     checks = []
     details = []
