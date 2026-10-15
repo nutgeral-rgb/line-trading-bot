@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
+import shutil
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -46,7 +48,13 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# ถ้ามี persistent disk จริง จึงค่อยตั้งค่านี้ให้ชี้ไปยังไฟล์บน disk
+# ตั้ง PORTFOLIO_FILE_PATH ให้ชี้ไปยัง Persistent Disk ของ Render
+# มิฉะนั้นไฟล์ในพื้นที่ของ Web Service อาจหายเมื่อ Deploy
+if not os.getenv("PORTFOLIO_FILE_PATH"):
+    logger.warning(
+        "ยังไม่ได้ตั้ง PORTFOLIO_FILE_PATH; "
+        "ข้อมูลพอร์ตอาจหายเมื่อ Deploy หรือรีสตาร์ต"
+    )
 PORTFOLIO_FILE = Path(
     os.getenv("PORTFOLIO_FILE_PATH", "portfolio.json")
 )
@@ -160,6 +168,13 @@ def _save_all_portfolios_unlocked(data):
             f.flush()
             os.fsync(f.fileno())
 
+        # เก็บไฟล์เดิมไว้กู้คืนก่อนแทนที่
+        if PORTFOLIO_FILE.exists():
+            backup_path = PORTFOLIO_FILE.with_name(
+                PORTFOLIO_FILE.name + ".bak"
+            )
+            shutil.copy2(PORTFOLIO_FILE, backup_path)
+
         # แทนที่ไฟล์จริงเมื่อเขียนไฟล์ใหม่สำเร็จแล้วเท่านั้น
         os.replace(temporary_path, PORTFOLIO_FILE)
         temporary_path = None
@@ -207,11 +222,40 @@ def get_stock_history(symbol, period="3mo"):
             f"{symbol}?range={period}&interval=1d"
         )
         headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200:
+        response = None
+        for attempt in range(3):
+            response = requests.get(
+                url, headers=headers, timeout=10
+            )
+            if response.status_code == 200:
+                break
+
+            retryable = (
+                response.status_code == 429
+                or response.status_code >= 500
+            )
+            if retryable and attempt < 2:
+                try:
+                    delay = float(
+                        response.headers.get(
+                            "Retry-After", ""
+                        )
+                    )
+                except (TypeError, ValueError):
+                    delay = 1.5 * (attempt + 1)
+                time.sleep(min(max(delay, 1), 5))
+                continue
+
+            logger.warning(
+                "ดึงราคาหุ้นไม่สำเร็จ: symbol=%s status=%d",
+                symbol,
+                response.status_code,
+            )
             return None
 
-        res = r.json()
+        if response is None or response.status_code != 200:
+            return None
+        res = response.json()
         result = res["chart"]["result"][0]
         timestamp = result["timestamp"]
         quote = result["indicators"]["quote"][0]
@@ -250,7 +294,8 @@ def get_market_frames(symbols):
         return sym, get_stock_history(sym, period="6mo")
 
     frames = {}
-    worker_count = min(8, len(unique_symbols))
+    # ลดคำขอพร้อมกันเพื่อลดโอกาสถูก Yahoo Finance จำกัด
+    worker_count = min(4, len(unique_symbols))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for sym, df in executor.map(fetch_one, unique_symbols):
             if df is not None and len(df) >= 20:
@@ -362,6 +407,9 @@ def market_context(frames):
             "breadth": 0,
             "coverage": 0,
             "pass": False,
+            "valid_count": 0,
+            "total_count": len(UNIVERSE),
+            "missing_symbols": list(UNIVERSE),
         }
 
     as_of = idx_df.index[-1].strftime("%Y-%m-%d")
@@ -381,6 +429,11 @@ def market_context(frames):
             "breadth": 0,
             "coverage": coverage,
             "pass": False,
+            "valid_count": len(valid),
+            "total_count": len(UNIVERSE),
+            "missing_symbols": [
+                sym for sym in UNIVERSE if sym not in valid
+            ],
         }
 
     above_count = sum(
@@ -393,6 +446,11 @@ def market_context(frames):
         "breadth": breadth,
         "coverage": coverage,
         "pass": breadth >= 50.0,
+        "valid_count": len(valid),
+        "total_count": len(UNIVERSE),
+        "missing_symbols": [
+            sym for sym in UNIVERSE if sym not in valid
+        ],
     }
 
 
@@ -484,7 +542,7 @@ def build_daily_plan(portfolio, frames=None):
         fundamentals = {}
         if selected_rows:
             with ThreadPoolExecutor(
-                max_workers=min(5, len(selected_rows))
+                max_workers=min(2, len(selected_rows))
             ) as executor:
                 fundamentals = dict(
                     zip(
@@ -577,6 +635,21 @@ def read_overnight_plan(user_id):
             "หลังตลาดปิดทำงานสำเร็จหรือไม่"
         )
 
+    if plan.get("status") == "NO_DATA":
+        diagnostic = plan.get("diagnostic", {})
+        coverage = float(
+            diagnostic.get("coverage", 0) or 0
+        )
+        return (
+            "⚠️ รอบล่าสุดยังสร้างแผนไม่ได้\n"
+            f"ข้อมูลราคา: {plan.get('data_date', 'ไม่ทราบ')} "
+            f"| ครบ {coverage:.0%} "
+            f"({diagnostic.get('valid_count', 0)}/"
+            f"{diagnostic.get('total_count', len(UNIVERSE))} ตัว)\n"
+            f"สาเหตุ: {diagnostic.get('reason', 'ข้อมูลไม่ครบ')}\n"
+            "ระบบจะลองใหม่ในรอบเตรียมแผนถัดไป"
+        )
+
     today = now_bkk().date().isoformat()
     delivery_day = plan.get("delivery_day")
     status = plan.get("status")
@@ -650,10 +723,17 @@ def prepare_overnight_plans():
                 previous = portfolio.get(
                     "overnight_plan"
                 )
-                if (
-                    not isinstance(previous, dict)
-                    or previous.get("data_date")
-                    != current_day.isoformat()
+                reusable_statuses = {
+                    "READY",
+                    "SENT",
+                    "DELIVERY_UNKNOWN",
+                }
+                if not (
+                    isinstance(previous, dict)
+                    and previous.get("data_date")
+                    == current_day.isoformat()
+                    and previous.get("status")
+                    in reusable_statuses
                 ):
                     pending[user_id] = portfolio
             except Exception:
@@ -695,15 +775,72 @@ def prepare_overnight_plans():
             or ctx["date"]
             != current_day.isoformat()
         ):
+            missing = ctx.get("missing_symbols", [])
+            reason = (
+                "ไม่มีข้อมูลดัชนี SET"
+                if not ctx["date"]
+                else (
+                    "ข้อมูลหุ้นหลักไม่ครบ"
+                    if not ctx["sufficient"]
+                    else "วันที่ราคายังไม่ตรงกับวันที่ต้องใช้"
+                )
+            )
+            diagnostic = {
+                "reason": reason,
+                "coverage": ctx["coverage"],
+                "valid_count": ctx.get("valid_count", 0),
+                "total_count": ctx.get(
+                    "total_count", len(UNIVERSE)
+                ),
+                "missing_count": len(missing),
+                "missing_sample": missing[:5],
+                "actual_date": ctx["date"],
+            }
             logger.warning(
                 "ยังสร้างแผนไม่ได้: expected_date=%s "
-                "actual_date=%s coverage=%.1f%% "
-                "sufficient=%s frames=%d",
+                "actual_date=%s reason=%s coverage=%.1f%% "
+                "valid=%d/%d missing=%d sample=%s frames=%d",
                 current_day,
                 ctx["date"],
+                reason,
                 ctx["coverage"] * 100,
-                ctx["sufficient"],
+                diagnostic["valid_count"],
+                diagnostic["total_count"],
+                diagnostic["missing_count"],
+                ",".join(diagnostic["missing_sample"]),
                 len(frames),
+            )
+
+            save_failed = 0
+            delivery_day = next_set_session(
+                current_day
+            ).isoformat()
+            failure_plan = {
+                "data_date": current_day.isoformat(),
+                "delivery_day": delivery_day,
+                "prepared_at": utc_text(),
+                "status": "NO_DATA",
+                "diagnostic": diagnostic,
+            }
+            for user_id in pending:
+                try:
+                    mutate_portfolio(
+                        user_id,
+                        lambda portfolio: portfolio.update(
+                            {"overnight_plan": failure_plan}
+                        ),
+                    )
+                except Exception:
+                    save_failed += 1
+                    logger.exception(
+                        "บันทึกสถานะข้อมูลไม่ครบ"
+                        "ของหนึ่งพอร์ตไม่สำเร็จ"
+                    )
+            logger.info(
+                "บันทึกสถานะแผนไม่มีข้อมูล: users=%d "
+                "save_failed=%d",
+                len(pending),
+                save_failed,
             )
             return
 
@@ -940,6 +1077,7 @@ def help_text():
         "━━━━━━━━━━━━━━━━━━\n"
         "📈 แผนหุ้น\n"
         "แผนวันนี้ — ดูแผนหุ้นสำหรับวันซื้อขายนี้\n"
+        "สถานะแผน — ดูวันที่ข้อมูลและสถานะเตรียมแผน\n"
         "หรือพิมพ์: แผนเทรดวันนี้ / "
         "ควรซื้อวันนี้ / ซื้อวันนี้\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
@@ -1083,6 +1221,40 @@ def command_reply(user_id, text):
     }:
         return read_overnight_plan(
             user_id
+        )
+
+    if text == "สถานะแผน":
+        plan = portfolio.get("overnight_plan")
+        if not isinstance(plan, dict):
+            return (
+                "ℹ️ ยังไม่มีประวัติการเตรียมแผน\n"
+                "ระบบจะเตรียมแผนในรอบหลังตลาดปิด "
+                "เมื่อมีข้อมูลราคาเพียงพอ"
+            )
+        status = plan.get("status", "UNKNOWN")
+        if status == "NO_DATA":
+            return read_overnight_plan(user_id)
+        if status == "READY":
+            return (
+                "✅ เตรียมแผนแล้ว\n"
+                f"วันที่ข้อมูล: {plan.get('data_date', 'ไม่ทราบ')}\n"
+                f"วันใช้แผน: {plan.get('delivery_day', 'ไม่ทราบ')}\n"
+                f"เวลาเตรียม: {plan.get('prepared_at', 'ไม่ทราบ')}"
+            )
+        if status in ("SENT", "DELIVERY_UNKNOWN"):
+            delivery_note = (
+                "ส่งแล้ว"
+                if status == "SENT"
+                else "ยังยืนยันผลการส่งไม่ได้"
+            )
+            return (
+                f"📨 สถานะแผน: {delivery_note}\n"
+                f"วันที่ข้อมูล: {plan.get('data_date', 'ไม่ทราบ')}\n"
+                f"วันใช้แผน: {plan.get('delivery_day', 'ไม่ทราบ')}"
+            )
+        return (
+            f"สถานะแผน: {status}\n"
+            f"วันที่ข้อมูล: {plan.get('data_date', 'ไม่ทราบ')}"
         )
 
     if text == "ดูพอร์ต":
