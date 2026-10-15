@@ -596,6 +596,7 @@ def help_text():
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
         "รายการติดตาม — ดูหุ้นที่ติดตาม\n"
+        "วิเคราะห์ COM7 — ดูแนวโน้มราคาและข้อมูลงบรายตัว\n"
         "ติดตาม AOT — เพิ่มหุ้นในรายการและใช้พิจารณาแผน\n"
         "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n\n"
         "❔ เมนูคำสั่ง\n"
@@ -608,6 +609,42 @@ def help_text():
 def command_reply(user_id, text):
     if text in {"เมนู", "ช่วยเหลือ", "คำสั่ง", "menu", "help"}:
         return help_text()
+
+    if text.startswith("วิเคราะห์ "):
+        raw_symbol = text[len("วิเคราะห์ "):].strip().upper()
+        symbol = raw_symbol if raw_symbol.endswith(".BK") else raw_symbol + ".BK"
+        base_symbol = symbol[:-3]
+        if not base_symbol.isalnum() or len(base_symbol) > 10:
+            return "รูปแบบชื่อหุ้นไม่ถูกต้อง ลองพิมพ์: วิเคราะห์ COM7"
+        frame = get_stock_history(symbol, period="6mo")
+        lines = [f"📊 วิเคราะห์ {symbol}", "━━━━━━━━━━━━━━━━━━"]
+        if frame is not None and not frame.empty:
+            data_date = frame.index[-1].strftime("%Y-%m-%d")
+            values = _close_and_sma20(frame, data_date)
+            if values:
+                close, sma20 = values
+                lines.append(f"📅 ราคาปิด {data_date}: {close:.2f} บาท")
+                lines.append(
+                    f"📈 เทียบ SMA20 {sma20:.2f}: "
+                    + ("อยู่เหนือแนวโน้มเฉลี่ย" if close > sma20 else "อยู่ต่ำกว่าแนวโน้มเฉลี่ย")
+                )
+            metrics = _selection_metrics(frame, data_date)
+            if metrics:
+                _, momentum, volatility, avg_value = metrics
+                lines.append(f"📐 ผลตอบแทน 63 วัน: {momentum * 100:+.1f}%")
+                lines.append(f"ความผันผวนต่อปี: {volatility * 100:.1f}%")
+                lines.append(f"มูลค่าซื้อขายมัธยฐาน: {avg_value:,.0f} บาท/วัน")
+            else:
+                lines.append("ข้อมูลราคา/ปริมาณซื้อขายย้อนหลังยังไม่ครบสำหรับคำนวณ")
+        else:
+            lines.append("ไม่พบข้อมูลราคาล่าสุดจากผู้ให้บริการ")
+        fundamental = analyze_fundamentals(symbol)
+        lines.append("")
+        lines.append("🏢 ข้อมูลงบรายไตรมาส")
+        lines.append(fundamental.get("summary", "ข้อมูลพื้นฐานไม่พร้อม"))
+        lines.append("")
+        lines.append("หมายเหตุ: เป็นข้อมูลประกอบ ไม่ใช่คำสั่งซื้อขาย")
+        return "\n".join(lines)
 
     portfolio = get_portfolio(user_id)
     
