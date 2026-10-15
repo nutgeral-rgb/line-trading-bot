@@ -23,6 +23,8 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import numpy as np
 import pandas as pd
+import psycopg
+from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
@@ -48,17 +50,21 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# ตั้ง PORTFOLIO_FILE_PATH ให้ชี้ไปยัง Persistent Disk ของ Render
-# มิฉะนั้นไฟล์ในพื้นที่ของ Web Service อาจหายเมื่อ Deploy
-if not os.getenv("PORTFOLIO_FILE_PATH"):
+# ใช้ฐานข้อมูล PostgreSQL ภายนอกได้ด้วย DATABASE_URL
+# หากไม่ตั้งค่า จะใช้ไฟล์ในเครื่อง ซึ่งอาจหายเมื่อ Render Free รีสตาร์ต
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PORTFOLIO_FILE_PATH = os.getenv("PORTFOLIO_FILE_PATH", "").strip()
+if not DATABASE_URL and not PORTFOLIO_FILE_PATH:
     logger.warning(
-        "ยังไม่ได้ตั้ง PORTFOLIO_FILE_PATH; "
+        "ยังไม่ได้ตั้ง DATABASE_URL หรือ PORTFOLIO_FILE_PATH; "
         "ข้อมูลพอร์ตอาจหายเมื่อ Deploy หรือรีสตาร์ต"
     )
 PORTFOLIO_FILE = Path(
-    os.getenv("PORTFOLIO_FILE_PATH", "portfolio.json")
+    PORTFOLIO_FILE_PATH or "portfolio.json"
 )
 _portfolio_lock = threading.RLock()
+_portfolio_database_lock = threading.Lock()
+_portfolio_database_ready = False
 
 INDEX_SYMBOL = "SET.BK"
 UNIVERSE = SET100_SYMBOLS
@@ -129,7 +135,7 @@ def _new_portfolio():
     }
 
 
-def _load_all_portfolios_unlocked():
+def _load_portfolios_file_unlocked():
     if not PORTFOLIO_FILE.exists():
         return {}
 
@@ -144,12 +150,93 @@ def _load_all_portfolios_unlocked():
     return data
 
 
+def _connect_portfolio_database():
+    global _portfolio_database_ready
+    if not DATABASE_URL:
+        raise RuntimeError("ยังไม่ได้ตั้ง DATABASE_URL")
+
+    connection = psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+    )
+    if not _portfolio_database_ready:
+        try:
+            with _portfolio_database_lock:
+                if not _portfolio_database_ready:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS line_bot_portfolios (
+                            user_id TEXT PRIMARY KEY,
+                            portfolio JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL
+                                DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    connection.commit()
+                    _portfolio_database_ready = True
+        except Exception:
+            connection.close()
+            raise
+    return connection
+
+
+def _load_all_portfolios_unlocked():
+    if not DATABASE_URL:
+        return _load_portfolios_file_unlocked()
+
+    with _connect_portfolio_database() as connection:
+        rows = connection.execute(
+            "SELECT user_id, portfolio FROM line_bot_portfolios"
+        ).fetchall()
+        if rows:
+            return {
+                user_id: portfolio
+                for user_id, portfolio in rows
+            }
+
+        # ย้ายข้อมูลไฟล์เดิมเข้า DB ครั้งแรก หากไฟล์นั้นยังมีข้อมูล
+        data = _load_portfolios_file_unlocked()
+        if data:
+            connection.executemany(
+                """
+                INSERT INTO line_bot_portfolios (user_id, portfolio)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET portfolio = EXCLUDED.portfolio,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    (user_id, Jsonb(portfolio))
+                    for user_id, portfolio in data.items()
+                ],
+            )
+        return data
+
+
 def load_all_portfolios():
     with _portfolio_lock:
         return _load_all_portfolios_unlocked()
 
 
 def _save_all_portfolios_unlocked(data):
+    if DATABASE_URL:
+        with _connect_portfolio_database() as connection:
+            connection.executemany(
+                """
+                INSERT INTO line_bot_portfolios (user_id, portfolio)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET portfolio = EXCLUDED.portfolio,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    (user_id, Jsonb(portfolio))
+                    for user_id, portfolio in data.items()
+                ],
+            )
+        return
+
     PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
 
