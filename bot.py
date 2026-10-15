@@ -640,14 +640,29 @@ def read_overnight_plan(user_id):
         coverage = float(
             diagnostic.get("coverage", 0) or 0
         )
-        return (
+        actual_date = (
+            diagnostic.get("actual_date")
+            or "ไม่พบข้อมูลดัชนี"
+        )
+        missing_sample = diagnostic.get(
+            "missing_sample", []
+        )
+        response = (
             "⚠️ รอบล่าสุดยังสร้างแผนไม่ได้\n"
-            f"ข้อมูลราคา: {plan.get('data_date', 'ไม่ทราบ')} "
-            f"| ครบ {coverage:.0%} "
+            f"วันที่ราคาที่พบ: {actual_date}\n"
+            f"ข้อมูลหุ้นครบ {coverage:.0%} "
             f"({diagnostic.get('valid_count', 0)}/"
             f"{diagnostic.get('total_count', len(UNIVERSE))} ตัว)\n"
-            f"สาเหตุ: {diagnostic.get('reason', 'ข้อมูลไม่ครบ')}\n"
-            "ระบบจะลองใหม่ในรอบเตรียมแผนถัดไป"
+            f"สาเหตุ: {diagnostic.get('reason', 'ข้อมูลไม่ครบ')}"
+        )
+        if missing_sample:
+            response += (
+                "\nตัวอย่างหุ้นที่ข้อมูลขาด: "
+                + ", ".join(missing_sample[:5])
+            )
+        return (
+            response
+            + "\nระบบจะลองใหม่ในรอบเตรียมแผนถัดไป"
         )
 
     today = now_bkk().date().isoformat()
