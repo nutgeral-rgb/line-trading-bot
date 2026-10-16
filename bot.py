@@ -724,7 +724,7 @@ def build_daily_plan(portfolio, frames=None):
             )
             report_lines.append(
                 "กรอบทดลอง: ถือประมาณ 1–4 สัปดาห์ "
-                f"และเสี่ยงตาม Stop ไม่เกิน {RISK_PER_TRADE:.0%} "
+                f"และตั้งงบขาดทุนตาม Stop ประมาณ {RISK_PER_TRADE:.0%} "
                 "ของพอร์ตต่อรายการ"
             )
             for index, (
@@ -762,7 +762,7 @@ def build_daily_plan(portfolio, frames=None):
                         close, stop = reference
                         cash, equity = portfolio_value
                         estimate = estimate_position(
-                            equity, cash, close, stop, len(selected),
+                            equity, cash, close, stop, 1,
                             risk_fraction=RISK_PER_TRADE,
                         )
                         if estimate["shares"]:
@@ -781,7 +781,8 @@ def build_daily_plan(portfolio, frames=None):
             report_lines.append("")
             report_lines.append(
                 "ขนาดซื้อเป็นเพียงประมาณการจากราคาปิด "
-                "ต้องคำนวณใหม่ที่ราคาเปิดจริง"
+                "ของหุ้นแต่ละตัวแยกกัน ห้ามนำจำนวนซื้อทุกตัวมารวมกัน "
+                "ต้องคำนวณใหม่ที่ราคาเปิดจริงและหลังซื้อแต่ละครั้ง"
             )
             report_lines.append(
                 "🔁 ใช้สัญญาณราคาปิดเพื่อวางแผน"
