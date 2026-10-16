@@ -1,7 +1,8 @@
-"""Quarterly fundamental checks for SET candidates using Yahoo Finance.
+"""Quarterly fundamentals and valuation context for SET candidates.
 
-This is an informational overlay, not a buy/sell filter. Incomplete data is
-reported as unavailable. Yahoo Finance data can be missing or delayed.
+This is a screening aid, not a valuation model or buy/sell instruction.
+Yahoo Finance data can be missing, stale, or inconsistent; unavailable data
+must never be treated as a positive result.
 """
 from __future__ import annotations
 
@@ -43,21 +44,35 @@ def _latest_values(frame, aliases, count):
     return []
 
 
+def _number(info, *keys):
+    for key in keys:
+        try:
+            value = float(info.get(key))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return None
+
+
 def analyze_fundamentals(symbol):
-    """Refresh the informational overlay once per Bangkok calendar day."""
+    """Refresh fundamentals/valuation context once per Bangkok calendar day."""
     day = datetime.now(ZoneInfo("Asia/Bangkok")).date().isoformat()
     return _analyze_fundamentals_for_day(symbol, day)
 
 
 @lru_cache(maxsize=200)
 def _analyze_fundamentals_for_day(symbol, day):
-    """Return a simple evidence score and compact Thai summary."""
+    """Return explicit pass/fail/unavailable evidence and valuation context."""
+    is_financial = symbol in _FINANCIALS
+    required = 3 if is_financial else 4
     try:
         import yfinance as yf
 
+        ticker = yf.Ticker(symbol)
+        income = cashflow = balance = None
         for attempt in range(3):
             try:
-                ticker = yf.Ticker(symbol)
                 income = ticker.quarterly_income_stmt
                 cashflow = ticker.quarterly_cashflow
                 balance = ticker.quarterly_balance_sheet
@@ -70,49 +85,47 @@ def _analyze_fundamentals_for_day(symbol, day):
                 )
                 if not is_rate_limited or attempt == 2:
                     logger.warning(
-                        "ดึงข้อมูลงบไม่สำเร็จ: symbol=%s "
-                        "error_type=%s",
-                        symbol,
-                        type(exc).__name__,
+                        "ดึงข้อมูลงบไม่สำเร็จ: symbol=%s error_type=%s",
+                        symbol, type(exc).__name__,
                     )
-                    return {
-                        "score": None,
-                        "available": 0,
-                        "summary": "ดึงข้อมูลงบไม่ได้",
-                    }
+                    income = cashflow = balance = None
+                    break
                 delay = 2 ** (attempt + 1)
                 logger.info(
-                    "Yahoo Finance จำกัดคำขอข้อมูลงบ: "
-                    "symbol=%s retry=%d delay=%ds",
-                    symbol,
-                    attempt + 1,
-                    delay,
+                    "Yahoo Finance จำกัดคำขอข้อมูลงบ: symbol=%s retry=%d delay=%ds",
+                    symbol, attempt + 1, delay,
                 )
                 time.sleep(delay)
+        try:
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.info(
+                "ดึง valuation metadata ไม่สำเร็จ: symbol=%s error_type=%s",
+                symbol, type(exc).__name__,
+            )
+            info = {}
     except Exception as exc:
         logger.warning(
-            "เตรียมดึงข้อมูลงบไม่สำเร็จ: symbol=%s "
-            "error_type=%s",
-            symbol,
-            type(exc).__name__,
+            "เตรียมดึงข้อมูลงบไม่สำเร็จ: symbol=%s error_type=%s",
+            symbol, type(exc).__name__,
         )
         return {
-            "score": None,
-            "available": 0,
-            "summary": "ดึงข้อมูลงบไม่ได้",
+            "score": None, "available": 0, "required": required,
+            "checks": {}, "sector": None, "valuation": {},
+            "valuation_concern": None, "summary": "ดึงข้อมูลงบไม่ได้",
         }
 
-    checks = []
+    checks = {}
     details = []
 
     revenue = _latest_values(income, ("Total Revenue", "Operating Revenue"), 5)
-    if len(revenue) >= 5:
-        growth = revenue[0] / revenue[4] - 1 if revenue[4] else math.nan
+    if len(revenue) >= 5 and revenue[4] != 0:
+        growth = revenue[0] / revenue[4] - 1
         if math.isfinite(growth):
-            checks.append(growth > 0)
-            details.append("รายได้ YoY " + ("เพิ่ม" if growth > 0 else "ลด/ทรงตัว"))
+            checks["revenue_growth"] = growth > 0
+            details.append(f"รายได้ YoY {growth * 100:+.1f}%")
     else:
-        details.append("รายได้ YoY ไม่มีข้อมูล")
+        details.append("รายได้ YoY: ไม่มีข้อมูล")
 
     profits = _latest_values(
         income,
@@ -121,8 +134,8 @@ def _analyze_fundamentals_for_day(symbol, day):
     )
     if len(profits) >= 4:
         profitable = sum(value > 0 for value in profits)
-        checks.append(sum(profits) > 0 and profitable >= 3)
-        details.append(f"กำไร {profitable}/4 ไตรมาส")
+        checks["earnings"] = sum(profits) > 0 and profitable >= 3
+        details.append(f"กำไรบวก {profitable}/4 ไตรมาส")
     else:
         details.append("กำไร: งบไม่ครบ 4 ไตรมาส")
 
@@ -132,12 +145,13 @@ def _analyze_fundamentals_for_day(symbol, day):
         4,
     )
     if len(operating_cash) >= 4:
-        checks.append(sum(operating_cash) > 0)
-        details.append("กระแสเงินสดดำเนินงาน " + ("บวก" if sum(operating_cash) > 0 else "ลบ"))
+        cashflow_positive = sum(operating_cash) > 0
+        checks["operating_cashflow"] = cashflow_positive
+        details.append("กระแสเงินสดดำเนินงาน " + ("บวก" if cashflow_positive else "ลบ"))
     else:
         details.append("กระแสเงินสด: ข้อมูลไม่ครบ")
 
-    if symbol in _FINANCIALS:
+    if is_financial:
         details.append("ไม่ใช้หนี้/ทุนกับธุรกิจการเงิน")
     else:
         debt = _latest_values(balance, ("Total Debt",), 1)
@@ -148,23 +162,62 @@ def _analyze_fundamentals_for_day(symbol, day):
         )
         if debt and equity and equity[0] > 0:
             ratio = debt[0] / equity[0]
-            checks.append(math.isfinite(ratio) and ratio <= 2.0)
+            checks["leverage"] = math.isfinite(ratio) and ratio <= 2.0
             details.append(f"หนี้/ทุน {ratio:.1f} เท่า")
         else:
             details.append("หนี้/ทุน: ข้อมูลไม่ครบ")
 
-    score = sum(checks)
-    available = len(checks)
-    if available < 2:
-        label = "ข้อมูลไม่พอ"
-    elif score == available:
-        label = "สัญญาณพื้นฐานบวก"
-    elif score == 0:
-        label = "ควรตรวจความเสี่ยง"
+    # Valuation multiples are a review flag only: sector/accounting differences
+    # make these coarse thresholds unsuitable as a fair-value estimate.
+    try:
+        sector = info.get("sector") or info.get("industry")
+    except Exception:
+        sector = None
+    pe = _number(info, "trailingPE")
+    pb = _number(info, "priceToBook")
+    roe = None
+    try:
+        raw_roe = float(info.get("returnOnEquity"))
+        if math.isfinite(raw_roe):
+            roe = raw_roe
+    except (TypeError, ValueError, OverflowError):
+        pass
+    valuation = {"trailing_pe": pe, "price_to_book": pb, "return_on_equity": roe}
+    elevated = []
+    if pe is not None and pe > 35:
+        elevated.append("P/E สูงกว่า 35")
+    pb_limit = 2.5 if is_financial else 5.0
+    if pb is not None and pb > pb_limit:
+        elevated.append(f"P/B สูงกว่า {pb_limit:g}")
+    valuation_concern = len(elevated)
+    if pe is None and pb is None:
+        details.append("มูลค่า P/E, P/B: ไม่มีข้อมูล (ต้องตรวจเพิ่ม)")
     else:
-        label = "ผสม"
-    summary = f"{label} ({score}/{available})"
-    if details:
-        summary += " | " + "; ".join(details)
-    return {"score": score if available else None, "available": available, "summary": summary}
+        multiples = []
+        multiples.append(f"P/E {pe:.1f}" if pe is not None else "P/E ไม่มีข้อมูล")
+        multiples.append(f"P/B {pb:.2f}" if pb is not None else "P/B ไม่มีข้อมูล")
+        details.append("มูลค่าเบื้องต้น " + ", ".join(multiples))
+    if roe is not None:
+        details.append(f"ROE {roe * 100:.1f}%")
+    if elevated:
+        details.append("ควรทบทวนมูลค่า: " + ", ".join(elevated))
 
+    score = sum(checks.values())
+    available = len(checks)
+    if available < required:
+        label = f"ข้อมูลพื้นฐานไม่ครบ ({available}/{required})"
+    elif score == required:
+        label = "ผ่านเกณฑ์พื้นฐานครบ"
+    else:
+        label = f"พื้นฐานผ่าน {score}/{required}"
+    summary = label + (" | " + "; ".join(details) if details else "")
+    return {
+        "score": score if available else None,
+        "available": available,
+        "required": required,
+        "checks": checks,
+        "sector": sector,
+        "valuation": valuation,
+        "valuation_concern": valuation_concern if pe is not None or pb is not None else None,
+        "summary": summary,
+    }
