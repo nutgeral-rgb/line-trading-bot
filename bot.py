@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import hashlib
 import logging
@@ -860,7 +860,7 @@ def queue_on_demand_plan(user_id):
         scheduler.add_job(
             _prepare_on_demand,
             "date",
-            run_date=now_bkk() + timedelta(seconds=1),
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
             args=[user_id, data_day],
             id=job_id,
             replace_existing=True,
