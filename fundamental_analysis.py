@@ -6,10 +6,12 @@ reported as unavailable. Yahoo Finance data can be missing or delayed.
 from __future__ import annotations
 
 from functools import lru_cache
+from datetime import datetime
 import logging
 import math
 import re
 import time
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +43,14 @@ def _latest_values(frame, aliases, count):
     return []
 
 
-@lru_cache(maxsize=200)
 def analyze_fundamentals(symbol):
+    """Refresh the informational overlay once per Bangkok calendar day."""
+    day = datetime.now(ZoneInfo("Asia/Bangkok")).date().isoformat()
+    return _analyze_fundamentals_for_day(symbol, day)
+
+
+@lru_cache(maxsize=200)
+def _analyze_fundamentals_for_day(symbol, day):
     """Return a simple evidence score and compact Thai summary."""
     try:
         import yfinance as yf
@@ -159,3 +167,4 @@ def analyze_fundamentals(symbol):
     if details:
         summary += " | " + "; ".join(details)
     return {"score": score if available else None, "available": available, "summary": summary}
+
