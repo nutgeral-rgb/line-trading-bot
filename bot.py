@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote as url_quote
 import tempfile
 import threading
 import time
@@ -325,7 +325,7 @@ def get_stock_history(symbol, period="3mo"):
     try:
         url = (
             "https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{quote(symbol, safe='')}?range={period}&interval=1d"
+            f"{url_quote(symbol, safe='')}?range={period}&interval=1d"
         )
         headers = {"User-Agent": "Mozilla/5.0"}
         response = None
