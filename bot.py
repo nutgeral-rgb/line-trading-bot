@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -70,6 +71,7 @@ INDEX_SYMBOL = "SET.BK"
 UNIVERSE = SET100_SYMBOLS
 
 MAX_POSITIONS = 5
+MAX_WATCHLIST = 20
 MIN_UNIVERSE_COVERAGE = 0.80
 MOMENTUM_LOOKBACK = 63
 VOLATILITY_LOOKBACK = 20
@@ -390,8 +392,20 @@ def get_market_frames(symbols):
     return frames
 
 
+def normalize_stock_symbol(value):
+    if not isinstance(value, str):
+        return None
+    base = value.strip().upper().removesuffix(".BK")
+    if not re.fullmatch(r"[A-Z0-9]{1,10}", base):
+        return None
+    return base + ".BK"
+
+
 def combined_universe(portfolio):
-    custom = portfolio.get("watchlist", [])
+    custom = [
+        symbol for value in portfolio.get("watchlist", [])[:MAX_WATCHLIST]
+        if (symbol := normalize_stock_symbol(value)) is not None
+    ]
     return sorted(set(UNIVERSE + custom))
 
 
@@ -1188,7 +1202,7 @@ def help_text():
         "วิเคราะห์ COM7 — ดูแนวโน้มราคา"
         "และข้อมูลงบรายตัว\n"
         "ติดตาม AOT — เพิ่มหุ้นในรายการ"
-        "และใช้พิจารณาแผน\n"
+        f"และใช้พิจารณาแผน (สูงสุด {MAX_WATCHLIST} หุ้น)\n"
         "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n\n"
         "❔ เมนูคำสั่ง\n"
         "พิมพ์: เมนู หรือ ช่วยเหลือ\n\n"
@@ -1208,19 +1222,8 @@ def command_reply(user_id, text):
         return help_text()
 
     if text.startswith("วิเคราะห์ "):
-        raw_symbol = text[
-            len("วิเคราะห์ "):
-        ].strip().upper()
-        symbol = (
-            raw_symbol
-            if raw_symbol.endswith(".BK")
-            else raw_symbol + ".BK"
-        )
-        base_symbol = symbol[:-3]
-        if (
-            not base_symbol.isalnum()
-            or len(base_symbol) > 10
-        ):
+        symbol = normalize_stock_symbol(text[len("วิเคราะห์ "):])
+        if symbol is None:
             return (
                 "รูปแบบชื่อหุ้นไม่ถูกต้อง "
                 "ลองพิมพ์: วิเคราะห์ COM7"
@@ -1428,15 +1431,15 @@ def command_reply(user_id, text):
         )
 
     if text.startswith("ติดตาม "):
-        sym = text.replace(
-            "ติดตาม", ""
-        ).strip().upper()
-        if not sym.endswith(".BK"):
-            sym += ".BK"
+        sym = normalize_stock_symbol(text[len("ติดตาม "):])
+        if sym is None:
+            return "รูปแบบชื่อหุ้นไม่ถูกต้อง ลองพิมพ์: ติดตาม AOT"
 
         def add_w(p):
             if "watchlist" not in p:
                 p["watchlist"] = []
+            if sym not in p["watchlist"] and len(p["watchlist"]) >= MAX_WATCHLIST:
+                return f"รายการติดตามเต็มแล้ว (สูงสุด {MAX_WATCHLIST} หุ้น)"
             if (
                 sym
                 not in p["watchlist"]
@@ -1460,11 +1463,9 @@ def command_reply(user_id, text):
     if text.startswith(
         "เลิกติดตาม "
     ):
-        sym = text.replace(
-            "เลิกติดตาม", ""
-        ).strip().upper()
-        if not sym.endswith(".BK"):
-            sym += ".BK"
+        sym = normalize_stock_symbol(text[len("เลิกติดตาม "):])
+        if sym is None:
+            return "รูปแบบชื่อหุ้นไม่ถูกต้อง ลองพิมพ์: เลิกติดตาม AOT"
 
         def remove_w(p):
             if sym in p.get(
@@ -1543,3 +1544,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
     )
+
