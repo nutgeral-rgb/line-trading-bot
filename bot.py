@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
+from position_risk import estimate_position
 from set100_constituents import SET100_SYMBOLS
 
 
@@ -72,6 +73,8 @@ UNIVERSE = SET100_SYMBOLS
 
 MAX_POSITIONS = 5
 MAX_WATCHLIST = 20
+RISK_PER_TRADE = 0.01
+MAX_HOLDING_SESSIONS = 20
 MIN_UNIVERSE_COVERAGE = 0.80
 MOMENTUM_LOOKBACK = 63
 VOLATILITY_LOOKBACK = 20
@@ -499,6 +502,62 @@ def _selection_metrics(df, as_of):
     )
 
 
+def _risk_reference(df, as_of):
+    """Use completed raw-price bars for an indicative two-ATR stop."""
+    if df is None or not {"High", "Low", "Close"}.issubset(df.columns):
+        return None
+    history = df.loc[df.index.strftime("%Y-%m-%d") <= as_of]
+    if len(history) < 15 or history.index[-1].strftime("%Y-%m-%d") != as_of:
+        return None
+    prices = history[["High", "Low", "Close"]].tail(15).apply(
+        pd.to_numeric, errors="coerce"
+    )
+    if prices.isna().any().any():
+        return None
+    prior_close = prices["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            prices["High"] - prices["Low"],
+            (prices["High"] - prior_close).abs(),
+            (prices["Low"] - prior_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1).iloc[1:]
+    close = float(prices["Close"].iloc[-1])
+    atr = float(true_range.mean())
+    stop = close - 2 * atr
+    if not all(np.isfinite(value) for value in (close, atr, stop)):
+        return None
+    return (close, stop) if close > 0 and atr > 0 and stop > 0 else None
+
+
+def _portfolio_market_value(portfolio, frames, as_of):
+    """Return cash and marked equity only when every holding has current data."""
+    try:
+        cash = float(portfolio["cash"])
+        if not np.isfinite(cash) or cash < 0:
+            return None
+        equity = cash
+        for symbol, holding in portfolio.get("stocks", {}).items():
+            shares = float(holding["shares"])
+            if not np.isfinite(shares) or shares < 0:
+                return None
+            if shares == 0:
+                continue
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                return None
+            if frame.index[-1].strftime("%Y-%m-%d") != as_of:
+                return None
+            price = float(frame["Close"].iloc[-1])
+            if not np.isfinite(price) or price <= 0:
+                return None
+            equity += shares * price
+        return cash, equity
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def market_context(frames):
     idx_df = frames.get(INDEX_SYMBOL)
     if idx_df is None or len(idx_df) < 20:
@@ -657,9 +716,16 @@ def build_daily_plan(portfolio, frames=None):
 
         report_lines.append("")
         if selected:
-            weight = 100 / len(selected)
+            portfolio_value = _portfolio_market_value(
+                portfolio, frames, data_date
+            )
             report_lines.append(
                 f"✅ หุ้นที่ผ่านเกณฑ์ ({len(selected)} ตัว)"
+            )
+            report_lines.append(
+                "กรอบทดลอง: ถือประมาณ 1–4 สัปดาห์ "
+                f"และเสี่ยงตาม Stop ไม่เกิน {RISK_PER_TRADE:.0%} "
+                "ของพอร์ตต่อรายการ"
             )
             for index, (
                 _,
@@ -674,7 +740,7 @@ def build_daily_plan(portfolio, frames=None):
                         "ข้อมูลพื้นฐานไม่พร้อม",
                     )
                 )
-                report_lines.append(
+                detail = (
                     f"{index}. 📈 {sym}\n"
                     f"   ผลตอบแทน 63 วัน: "
                     f"{momentum * 100:+.1f}%\n"
@@ -684,9 +750,38 @@ def build_daily_plan(portfolio, frames=None):
                     f"{avg_value:,.0f} บาท/วัน\n"
                     f"   พื้นฐาน: {fundamental_text}"
                 )
+                if sym in portfolio.get("stocks", {}):
+                    detail += "\n   มีหุ้นอยู่ในพอร์ตแล้ว: ไม่คำนวณซื้อเพิ่ม"
+                elif portfolio_value is None:
+                    detail += "\n   ยังประเมินขนาดซื้อไม่ได้: มูลค่าพอร์ตหรือราคาหุ้นที่ถือไม่ครบ"
+                else:
+                    reference = _risk_reference(frames.get(sym), data_date)
+                    if reference is None:
+                        detail += "\n   ยังประเมิน Stop และขนาดซื้อไม่ได้: ข้อมูลราคาไม่ครบ"
+                    else:
+                        close, stop = reference
+                        cash, equity = portfolio_value
+                        estimate = estimate_position(
+                            equity, cash, close, stop, len(selected),
+                            risk_fraction=RISK_PER_TRADE,
+                        )
+                        if estimate["shares"]:
+                            detail += (
+                                f"\n   Stop อ้างอิงประมาณ {stop:.2f} บาท"
+                                f" | ขนาดสูงสุดประมาณ {estimate['shares']} หุ้น"
+                                f" | ขาดทุนตามแผนประมาณ "
+                                f"{estimate['estimated_loss']:,.0f} บาท"
+                            )
+                        else:
+                            detail += (
+                                "\n   งบเสี่ยง/เงินสดไม่พอสำหรับซื้อหนึ่งล็อต "
+                                "จึงไม่เสนอจำนวนซื้อ"
+                            )
+                report_lines.append(detail)
             report_lines.append("")
             report_lines.append(
-                f"⚖️ น้ำหนักเป้าหมาย: หุ้นละ {weight:.1f}%"
+                "ขนาดซื้อเป็นเพียงประมาณการจากราคาปิด "
+                "ต้องคำนวณใหม่ที่ราคาเปิดจริง"
             )
             report_lines.append(
                 "🔁 ใช้สัญญาณราคาปิดเพื่อวางแผน"
@@ -694,7 +789,12 @@ def build_daily_plan(portfolio, frames=None):
             )
             report_lines.append(
                 "ทบทวนขายเมื่อหลุด 5 อันดับแรก"
-                "หรือปิดต่ำกว่า SMA20"
+                "หรือปิดต่ำกว่า SMA20 และทบทวนเมื่อถือครบ "
+                f"{MAX_HOLDING_SESSIONS} วันซื้อขาย"
+            )
+            report_lines.append(
+                "Stop อาจขายได้ต่ำกว่าราคาที่วางไว้เมื่อราคาเปิดกระโดด "
+                "และบอตยังไม่บันทึกวันซื้อขายจริง"
             )
         else:
             report_lines.append(
