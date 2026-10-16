@@ -334,6 +334,17 @@ def export_portfolio_backup(user_id):
                 "cash": portfolio.get("cash", 0),
                 "stocks": portfolio.get("stocks", {}),
                 "watchlist": portfolio.get("watchlist", []),
+                "investment_strategy": (
+                    {
+                        "style": "LONG_TERM",
+                        "monthly_contribution_baht": portfolio.get(
+                            "investment_strategy", {}
+                        ).get("monthly_contribution_baht", 500.0),
+                    }
+                    if isinstance(portfolio.get("investment_strategy"), dict)
+                    and portfolio.get("investment_strategy", {}).get("style") == "LONG_TERM"
+                    else None
+                ),
             },
         },
         ensure_ascii=False,
@@ -427,6 +438,28 @@ def validate_portfolio_backup(raw_text):
         "watchlist": normalized_watchlist,
         "overnight_plan": None,
     }
+    strategy = portfolio.get("investment_strategy")
+    if strategy is not None:
+        if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+            raise ValueError("แผนลงทุนในไฟล์สำรองไม่ถูกต้อง")
+        contribution = strategy.get("monthly_contribution_baht", 500.0)
+        if (
+            isinstance(contribution, bool)
+            or not isinstance(contribution, (int, float))
+            or not np.isfinite(contribution)
+            or not 500 <= contribution <= 1000
+        ):
+            raise ValueError("ยอดเงินเติมรายเดือนในไฟล์สำรองต้องอยู่ระหว่าง 500–1,000 บาท")
+        restored["investment_strategy"] = {
+            "style": "LONG_TERM",
+            "starting_capital": 10000.0,
+            "max_temporary_loss_pct": 10.0,
+            "target_equity_pct": 30.0,
+            "target_cash_pct": 70.0,
+            "monthly_contribution_baht": float(contribution),
+            "market_scope": "TH",
+            "review_frequency": "on_demand",
+        }
     try:
         json.dumps(restored, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -1810,7 +1843,15 @@ def build_long_term_accumulation_plan(portfolio):
 
     total_value = cash + current_equity_value
     starting_capital = float(strategy.get("starting_capital", 10000.0))
-    target_equity = starting_capital * float(
+    # Scale the target with the actual recorded portfolio so real deposits
+    # increase the equity allowance proportionally instead of using a fixed $10k base.
+    target_equity = total_value * float(
+        strategy.get("target_equity_pct", 30.0)
+    ) / 100.0
+    planned_contribution = float(
+        strategy.get("monthly_contribution_baht", 500.0) or 500.0
+    )
+    planned_equity_contribution = planned_contribution * float(
         strategy.get("target_equity_pct", 30.0)
     ) / 100.0
     remaining_target = max(0.0, target_equity - current_equity_value)
@@ -1821,6 +1862,10 @@ def build_long_term_accumulation_plan(portfolio):
         f"📅 ราคาปิดข้อมูลล่าสุด: {ctx['date']}",
         f"📚 รายชื่อ SET100: {SET100_EFFECTIVE_FROM} ถึง {SET100_EFFECTIVE_TO} | "
         "ราคาจาก Yahoo Finance ไม่ใช่ feed โดยตรงจาก SET",
+        f"💰 แผนเติมเงิน {planned_contribution:,.0f} บาท/เดือน | "
+        f"ตามเป้าหมายหุ้นจัดสรรราว {planned_equity_contribution:,.0f} บาท "
+        f"ส่วนที่เหลือ {planned_contribution - planned_equity_contribution:,.0f} บาทเป็นเงินสดสำรอง",
+        "(ยังไม่นับเป็นเงินสดจนกว่าจะบันทึกยอดเงินจริง)",
         *(
             ["⚠️ ราคาปิดช้ากว่าวันซื้อขายล่าสุดหนึ่งรอบ ใช้เป็นข้อมูลคัดกรองแผนถือยาว"]
             if ctx["date"] != expected_session.isoformat()
@@ -1846,7 +1891,8 @@ def build_long_term_accumulation_plan(portfolio):
             header
             + [
                 "ยังไม่แนะนำสะสมเพิ่ม เพราะเงินสดที่บันทึกหรือวงเงินหุ้นเป้าหมายไม่เหลือ",
-                "ทบทวนพอร์ตอีกครั้งเดือนหน้า หรืออัปเดตยอดเงินจริงก่อน",
+                "เรียกแนะนำหุ้นสะสมใหม่ได้ทุกเมื่อหลังอัปเดตเงินสด/พอร์ต "
+                "ไม่ต้องรอเดือนหน้า",
             ]
         )
 
@@ -1894,7 +1940,7 @@ def build_long_term_accumulation_plan(portfolio):
             "avg_value": float(traded.median()),
         })
 
-    # Limit fundamental-data calls to a liquid, lower-volatility shortlist.
+    # Limit fundamental-data calls to the strongest trend/liquidity shortlist.
     eligible.sort(key=lambda item: (-item["six_month_return"], -item["avg_value"], item["volatility"]))
     shortlist = eligible[:15]
     if not shortlist:
@@ -1902,7 +1948,8 @@ def build_long_term_accumulation_plan(portfolio):
             header
             + [
                 "⚠️ รอบนี้ไม่มีหุ้นที่ผ่านเกณฑ์แนวโน้มราคาและสภาพคล่อง",
-                "ระบบไม่ฝืนเลือกหุ้น และจะให้ตรวจใหม่ในรอบเดือนถัดไป",
+                "ระบบไม่ฝืนเลือกหุ้นในตลาดที่ยังไม่ผ่านเกณฑ์ "
+                "พิมพ์ แนะนำหุ้นสะสม ซ้ำได้ทุกเมื่อหลังมีข้อมูลตลาดใหม่",
             ]
         )
 
@@ -1912,15 +1959,17 @@ def build_long_term_accumulation_plan(portfolio):
             [item["symbol"] for item in shortlist],
         ))
     candidates = []
+    watch_candidates = []
     for item, fundamental in zip(shortlist, fundamentals):
         available = int(fundamental.get("available", 0) or 0)
         score = fundamental.get("score")
         required = int(fundamental.get("required", 4) or 4)
         # Require every applicable fundamental check. Missing evidence is not a pass.
-        if available != required or score is None or int(score) != required:
-            continue
         item = dict(item)
         item["fundamental"] = fundamental
+        if available != required or score is None or int(score) != required:
+            watch_candidates.append(item)
+            continue
         candidates.append(item)
 
     candidates.sort(key=lambda item: (
@@ -1934,9 +1983,28 @@ def build_long_term_accumulation_plan(portfolio):
         return "\n".join(
             header
             + [
-                "⚠️ รอบนี้ไม่มีหุ้นที่ผ่านเกณฑ์พื้นฐานพร้อมข้อมูลอย่างน้อย 3 รายการ",
-                "ข้อมูลพื้นฐานที่ขาดจะไม่นับเป็นคะแนนผ่าน จึงงดแนะนำซื้อ",
+                "⚠️ รอบนี้ยังไม่มีหุ้นที่ผ่านครบทุกเกณฑ์พื้นฐาน "
+                "จึงงดแนะนำซื้อ",
+                "ข้อมูลที่ขาดหรือสัญญาณที่ไม่ผ่านจะไม่ถูกนับเป็นผ่าน "
+                "เรียกวิเคราะห์ซ้ำได้ทุกเมื่อ ไม่ต้องรอเดือนหน้า",
             ]
+            + (
+                [
+                    "หุ้นเฝ้าดูที่ผ่านแนวโน้ม/สภาพคล่อง แต่พื้นฐานยังไม่ครบหรือมีข้อที่ต้องทบทวน:",
+                ]
+                + [
+                    f"• {display_stock_symbol(item['symbol'])} {item['close']:.2f} บาท — "
+                    f"{item['fundamental']['summary']}"
+                    for item in sorted(
+                        watch_candidates,
+                        key=lambda candidate: (
+                            -int(candidate["fundamental"].get("available", 0) or 0),
+                            -(int(candidate["fundamental"].get("score", 0) or 0)),
+                        ),
+                    )[:3]
+                ]
+                if watch_candidates else []
+            )
         )
 
     # Keep at least two names to avoid turning the small equity allocation
@@ -2051,7 +2119,7 @@ def build_long_term_accumulation_plan(portfolio):
         )
 
     lines.extend([
-        "แนวทาง: ใช้เป็นรายการพิจารณาสะสมเดือนนี้ ไม่ใช่ให้ซื้อทุกตัวทันที "
+        "แนวทาง: ใช้เป็นรายการพิจารณาสะสมรอบนี้ ไม่ใช่ให้ซื้อทุกตัวทันที "
         "ตรวจงบล่าสุด ราคา ณ เวลาส่งคำสั่ง และ board lot/ค่าธรรมเนียมกับโบรกเกอร์",
         "P/E และ P/B เป็นเพียงธงเตือนเบื้องต้น ไม่ใช่มูลค่าเหมาะสม; "
         "ควรตรวจงบ/หมายเหตุและเปรียบเทียบกลุ่มธุรกิจ",
@@ -2124,7 +2192,8 @@ def help_text():
         "📈 แผนหุ้นและการลงทุน\n"
         "ตั้งแผนลงทุนระยะยาว — ตั้งเป้าหมายหุ้นไทย 30% "
         "และเงินสด/ความเสี่ยงต่ำ 70%\n"
-        "แนะนำหุ้นสะสม — คัดหุ้นเข้าพอร์ต (เรียกทบทวนเดือนละครั้ง)\n"
+        "แนะนำหุ้นสะสม — วิเคราะห์ใหม่ได้ทุกเมื่อเมื่อมีข้อมูลตลาด\n"
+        "ตั้งเงินเติมรายเดือน 500 — ตั้งแผนเติมเงิน 500–1,000 บาท/เดือน\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและกำไร/ขาดทุนที่ยังไม่รับรู้\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่บันทึกไว้\n"
         "แผนวันนี้ / ควรซื้อวันนี้ — แผนซื้อขายรายวัน "
@@ -2135,7 +2204,8 @@ def help_text():
         "สถานะข้อมูล — ดูว่าวิธีเก็บพอร์ตถาวรหรือไม่\n"
         "สำรองพอร์ต — รับ JSON สำหรับบันทึกเป็นไฟล์ .json\n"
         "กู้คืน — ส่งไฟล์สำรอง .json กลับเข้าแชต\n"
-        "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
+        "บันทึกเงินเติม 500 — เพิ่มเงินสดในบอตหลังฝากเงินจริง (ไม่เกิน 1,000 บาท/เดือน)\n"
+        "ตั้งเงินสด 10000 — แทนที่ยอดเงินสดในบอตให้ตรงกับบัญชีจริง\n"
         "ตั้งหุ้น AOT 100 35.50 — บันทึกจำนวนและต้นทุนเฉลี่ย\n"
         "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดออกจากพอร์ต\n"
         "รายการติดตาม — ดูหุ้นที่ติดตาม\n"
@@ -2268,20 +2338,23 @@ def command_reply(user_id, text):
                 "max_temporary_loss_pct": 10.0,
                 "target_equity_pct": 30.0,
                 "target_cash_pct": 70.0,
+                "monthly_contribution_baht": 500.0,
                 "market_scope": "TH",
-                "review_frequency": "monthly",
+                "review_frequency": "on_demand",
                 "updated_at": utc_text(),
             }
             p["overnight_plan"] = None
             return (
                 "✅ บันทึกแนวทางลงทุนระยะยาวแล้ว\n"
                 "เงินตั้งต้นอ้างอิง 10,000 บาท\n"
-                "เป้าหมายเบื้องต้น: หุ้นไทย 30% (3,000 บาท) "
-                "และเงินสด/สินทรัพย์ความเสี่ยงต่ำ 70% (7,000 บาท)\n"
-                "ปิดแผนซื้อขายรายวันและการแจ้งหุ้นรายเช้า "
-                "ทบทวนด้วยคำสั่ง ตรวจพอร์ตระยะยาว เดือนละครั้ง\n"
+                "เป้าหมาย: หุ้นไทย 30% ของมูลค่าพอร์ตที่บันทึก "
+                "และเงินสด/สินทรัพย์ความเสี่ยงต่ำ 70%\n"
+                "ตั้งแผนเติมเงินเริ่มต้น 500 บาท/เดือน "
+                "(ปรับได้ 500–1,000 บาท ด้วยคำสั่ง ตั้งเงินเติมรายเดือน)\n"
+                "ทบทวนได้ทุกเมื่อด้วยคำสั่ง แนะนำหุ้นสะสม; "
+                "บอตไม่ซื้อขายหรือฝากเงินแทน\n"
                 "⚠️ สัดส่วนนี้เป็นกรอบตั้งต้น ไม่รับประกันขาดทุนไม่เกิน 10% "
-                "บอตไม่ซื้อขายแทนและไม่ทราบสินทรัพย์นอกพอร์ตที่บันทึก"
+                "และไม่รวมสินทรัพย์นอกพอร์ตที่บันทึก"
             )
 
         return mutate_portfolio(user_id, enable_long_term)
@@ -2335,9 +2408,11 @@ def command_reply(user_id, text):
             f"เงินตั้งต้นอ้างอิง: {strategy.get('starting_capital', 10000):,.0f} บาท\n"
             f"หุ้นเป้าหมาย: {strategy.get('target_equity_pct', 30):.0f}% | "
             f"เงินสด/เสี่ยงต่ำ: {strategy.get('target_cash_pct', 70):.0f}%\n"
+            f"แผนเติมเงิน: {strategy.get('monthly_contribution_baht', 500):,.0f} บาท/เดือน "
+            "(บันทึกหลังเติมเงินจริงด้วยคำสั่ง บันทึกเงินเติม)\n"
             f"ระดับขาดทุนชั่วคราวที่ตั้งใจรับ: "
             f"{strategy.get('max_temporary_loss_pct', 10):.0f}%\n"
-            "รอบทบทวน: รายเดือน"
+            "ทบทวนได้ทุกเมื่อ: พิมพ์ แนะนำหุ้นสะสม ไม่ต้องรอเดือนหน้า"
         )
 
     if text == "ตรวจพอร์ตระยะยาว":
@@ -2406,7 +2481,7 @@ def command_reply(user_id, text):
             lines.append("ยังไม่มีหุ้นในพอร์ตที่บอตบันทึก")
         lines.extend([
             "",
-            "ทบทวนเดือนละครั้งก็เพียงพอสำหรับแนวทางนี้",
+            "ตรวจและขอคำแนะนำใหม่ได้ทุกเมื่อด้วยคำสั่ง แนะนำหุ้นสะสม",
             "ข้อมูลนี้ใช้เฉพาะเงินสด/หุ้นที่บันทึกในบอต "
             "และไม่ใช่การคำนวณ drawdown ของทั้งบัญชี",
             "การจำกัดขาดทุน 10% ทำไม่ได้ด้วยการเตือนอย่างเดียว "
@@ -2537,6 +2612,88 @@ def command_reply(user_id, text):
         )
         return "\n".join(lines)
 
+    if text.startswith("ตั้งเงินเติมรายเดือน "):
+        parts = text.split()
+        if len(parts) != 2:
+            return "รูปแบบ: ตั้งเงินเติมรายเดือน 500 (กำหนด 500–1,000 บาท)"
+        try:
+            amount = float(parts[1].replace(",", ""))
+        except ValueError:
+            return "ยอดเงินเติมรายเดือนต้องอยู่ระหว่าง 500–1,000 บาท"
+        if not np.isfinite(amount) or not 500 <= amount <= 1000:
+            return "ยอดเงินเติมรายเดือนต้องอยู่ระหว่าง 500–1,000 บาท"
+        configured_strategy = portfolio.get("investment_strategy")
+        if (
+            not isinstance(configured_strategy, dict)
+            or configured_strategy.get("style") != "LONG_TERM"
+        ):
+            return "เปิดแผนก่อนด้วยคำสั่ง ตั้งแผนลงทุนระยะยาว"
+        
+        def set_monthly_contribution(p):
+            strategy = p.setdefault("investment_strategy", {})
+            strategy["monthly_contribution_baht"] = amount
+            strategy["updated_at"] = utc_text()
+            return (
+                f"บันทึกแผนเติมเงิน {amount:,.0f} บาท/เดือนแล้ว "
+                "เป็นเพียงเป้าหมาย ไม่ได้เพิ่มเงินสดในบอตอัตโนมัติ "
+                "เมื่อฝากเงินจริง ให้พิมพ์ บันทึกเงินเติม ตามยอดที่ฝาก"
+            )
+
+        return mutate_portfolio(user_id, set_monthly_contribution)
+
+    if text.startswith("บันทึกเงินเติม "):
+        parts = text.split()
+        if len(parts) != 3:
+            return "รูปแบบ: บันทึกเงินเติม 500 (ใช้หลังฝากเงินจริงแล้ว)"
+        try:
+            amount = float(parts[2].replace(",", ""))
+        except ValueError:
+            return "ยอดเงินเติมต้องเป็นตัวเลขมากกว่า 0 บาท"
+        if not np.isfinite(amount) or amount <= 0:
+            return "ยอดเงินเติมต้องเป็นตัวเลขมากกว่า 0 บาท"
+
+        def record_contribution(p):
+            strategy = p.get("investment_strategy")
+            if not isinstance(strategy, dict):
+                strategy = {}
+            month = now_bkk().strftime("%Y-%m")
+            history = p.setdefault("history", [])
+            if strategy.get("style") == "LONG_TERM":
+                month_total = 0.0
+                for entry in history:
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("type") == "MONTHLY_CONTRIBUTION"
+                        and entry.get("month") == month
+                    ):
+                        try:
+                            month_total += float(entry.get("amount", 0) or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                if month_total + amount > 1000:
+                    remaining = max(0.0, 1000 - month_total)
+                    return (
+                        f"เดือนนี้บันทึกเงินเติมแล้ว {month_total:,.2f} บาท "
+                        f"บันทึกเพิ่มได้อีกไม่เกิน {remaining:,.2f} บาท "
+                        "ตามกรอบแผน 1,000 บาท/เดือน"
+                    )
+            p["cash"] = max(0.0, float(p.get("cash", 0) or 0)) + amount
+            history.append({
+                "type": "MONTHLY_CONTRIBUTION",
+                "amount": amount,
+                "month": month,
+                "recorded_at": utc_text(),
+            })
+            p["overnight_plan"] = None
+            return (
+                f"บันทึกเงินสดเพิ่ม {amount:,.2f} บาทแล้ว "
+                f"ยอดเงินสดในบอต {p['cash']:,.2f} บาท "
+                "(ต้องฝากเงินจริงก่อน บอตไม่ได้โอนเงิน) "
+                "พิมพ์ แนะนำหุ้นสะสม เพื่อคัดหุ้นใหม่ได้ทันที"
+            )
+
+        return mutate_portfolio(user_id, record_contribution)
+
     if text.startswith("ตั้งเงินสด "):
         parts = text.split()
         if len(parts) != 2:
@@ -2557,9 +2714,9 @@ def command_reply(user_id, text):
                 "recorded_at": utc_text(),
             })
             return (
-                f"บันทึกเงินสด {amount:,.2f} บาทแล้ว "
-                "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่การฝากเงินจริง) "
-                "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
+                f"ตั้งยอดเงินสดในบอตเป็น {amount:,.2f} บาทแล้ว "
+                "(กรอกยอดคงเหลือจริงทั้งหมด ไม่ใช่คำสั่งฝากเงิน) "
+                "พิมพ์ แนะนำหุ้นสะสม เพื่อวิเคราะห์ใหม่ได้ทันที"
             )
 
         return mutate_portfolio(user_id, set_cash)
