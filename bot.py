@@ -23,7 +23,7 @@ except ImportError:
 from flask import Flask, abort, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import FileMessage, MessageEvent, TextMessage, TextSendMessage
 import numpy as np
 import pandas as pd
 import psycopg
@@ -66,6 +66,31 @@ if not DATABASE_URL and not PORTFOLIO_FILE_PATH:
 PORTFOLIO_FILE = Path(
     PORTFOLIO_FILE_PATH or "portfolio.json"
 )
+ON_RENDER = bool(os.getenv("RENDER"))
+def portfolio_storage_status():
+    """Describe the configured portfolio storage without exposing secrets."""
+    if DATABASE_URL:
+        return (
+            "PostgreSQL",
+            "บันทึกในฐานข้อมูล ไม่ผูกกับไฟล์ชั่วคราวของ Web Service",
+        )
+    if PORTFOLIO_FILE_PATH:
+        if ON_RENDER:
+            return (
+                "ไฟล์ตาม path ที่กำหนด",
+                "บน Render ต้องตรวจสอบว่า path อยู่บน Persistent Disk "
+                "(แผน Free ใช้ดิสก์ถาวรไม่ได้)",
+            )
+        return ("ไฟล์ตาม path ที่กำหนด", str(PORTFOLIO_FILE))
+    if ON_RENDER:
+        return (
+            "พื้นที่ชั่วคราวของ Render",
+            "ข้อมูลอาจหายเมื่อ Deploy, รีสตาร์ต หรือบริการพักตัว; "
+            "ต้องตั้ง DATABASE_URL เพื่อเก็บพอร์ตถาวร",
+        )
+    return ("ไฟล์ local", str(PORTFOLIO_FILE))
+
+
 _portfolio_lock = threading.RLock()
 _portfolio_database_lock = threading.Lock()
 _portfolio_database_ready = False
@@ -291,6 +316,118 @@ def _save_all_portfolios_unlocked(data):
 def save_all_portfolios(data):
     with _portfolio_lock:
         _save_all_portfolios_unlocked(data)
+
+
+def export_portfolio_backup(user_id):
+    """Return this user's portable, versioned JSON backup."""
+    portfolio = get_portfolio(user_id)
+    backup = json.dumps(
+        {
+            "format": "line-trading-bot-portfolio",
+            "version": 1,
+            "exported_at": utc_text(),
+            "portfolio": {
+                "cash": portfolio.get("cash", 0),
+                "stocks": portfolio.get("stocks", {}),
+                "watchlist": portfolio.get("watchlist", []),
+            },
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(backup.encode("utf-8")) > 3000:
+        raise ValueError(
+            "ข้อมูลพอร์ตใหญ่เกินกว่าจะสำรองในข้อความ LINE "
+            "โปรดลดจำนวนหุ้น/รายการติดตามก่อน"
+        )
+    return backup
+
+
+def validate_portfolio_backup(raw_text):
+    """Parse and validate backup data before any current data is changed."""
+    if len(raw_text.encode("utf-8")) > 3000:
+        raise ValueError("ไฟล์สำรองใหญ่เกินกำหนด (สูงสุด 3 KB)")
+    try:
+        payload = json.loads(raw_text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("อ่าน JSON ไม่ได้ ตรวจข้อความแล้วลองใหม่") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("รูปแบบไฟล์สำรองไม่ถูกต้อง")
+    if (
+        payload.get("format") != "line-trading-bot-portfolio"
+        or payload.get("version") != 1
+    ):
+        raise ValueError("ไม่รู้จักรูปแบบไฟล์สำรองนี้")
+
+    portfolio = payload.get("portfolio")
+    required = {"cash", "stocks", "watchlist"}
+    if not isinstance(portfolio, dict) or not required.issubset(portfolio):
+        raise ValueError("ข้อมูลพอร์ตในไฟล์สำรองไม่ครบ")
+
+    cash = portfolio.get("cash")
+    if (
+        isinstance(cash, bool)
+        or not isinstance(cash, (int, float))
+        or not np.isfinite(cash)
+        or cash < 0
+    ):
+        raise ValueError("ยอดเงินสดในไฟล์สำรองไม่ถูกต้อง")
+
+    stocks = portfolio.get("stocks")
+    if not isinstance(stocks, dict) or len(stocks) > 100:
+        raise ValueError("รายการหุ้นในไฟล์สำรองไม่ถูกต้อง")
+    normalized_stocks = {}
+    for raw_symbol, info in stocks.items():
+        symbol = normalize_stock_symbol(raw_symbol)
+        if symbol is None or not isinstance(info, dict):
+            raise ValueError("ข้อมูลหุ้นในไฟล์สำรองไม่ถูกต้อง")
+        shares = info.get("shares")
+        avg_price = info.get("avg_price")
+        if (
+            isinstance(shares, bool)
+            or not isinstance(shares, int)
+            or shares < 0
+            or shares > 1_000_000_000
+            or isinstance(avg_price, bool)
+            or not isinstance(avg_price, (int, float))
+            or not np.isfinite(avg_price)
+            or avg_price < 0
+            or (shares > 0 and avg_price <= 0)
+        ):
+            raise ValueError(f"ข้อมูลจำนวนหุ้น/ต้นทุน {symbol} ไม่ถูกต้อง")
+        normalized_stocks[symbol] = {
+            "shares": shares,
+            "avg_price": float(avg_price),
+        }
+
+    history = portfolio.get("history", [])
+    watchlist = portfolio.get("watchlist")
+    if not isinstance(history, list) or len(history) > 5000:
+        raise ValueError("ประวัติในไฟล์สำรองไม่ถูกต้อง")
+    if not isinstance(watchlist, list) or len(watchlist) > MAX_WATCHLIST:
+        raise ValueError("รายการติดตามในไฟล์สำรองไม่ถูกต้อง")
+    normalized_watchlist = []
+    for raw_symbol in watchlist:
+        symbol = normalize_stock_symbol(raw_symbol)
+        if symbol is None:
+            raise ValueError("ชื่อหุ้นในรายการติดตามไม่ถูกต้อง")
+        if symbol not in normalized_watchlist:
+            normalized_watchlist.append(symbol)
+
+    restored = {
+        "cash": float(cash),
+        "stocks": normalized_stocks,
+        "history": history,
+        "watchlist": normalized_watchlist,
+        "overnight_plan": None,
+    }
+    try:
+        json.dumps(restored, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("มีข้อมูลบางส่วนในไฟล์สำรองที่ใช้ไม่ได้") from exc
+    return restored
 
 
 def get_portfolio(user_id):
@@ -1517,6 +1654,65 @@ def handle_message(event):
         )
 
 
+@handler.add(MessageEvent, message=FileMessage)
+def handle_backup_file(event):
+    user_id = event.source.user_id
+    message = event.message
+    filename = (message.file_name or "").lower()
+    if not filename.endswith(".json"):
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="รับคืนได้เฉพาะไฟล์สำรอง .json จากบอต"),
+        )
+        return
+    if message.file_size and message.file_size > 900_000:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="⚠️ ไฟล์สำรองใหญ่เกินกำหนด (สูงสุด 900 KB)"
+            ),
+        )
+        return
+    try:
+        content = line_bot_api.get_message_content(message.id)
+        raw_backup = b"".join(content.iter_content())
+        if len(raw_backup) > 900_000:
+            raise ValueError("ไฟล์สำรองใหญ่เกินกำหนด (สูงสุด 900 KB)")
+        restored = validate_portfolio_backup(
+            raw_backup.decode("utf-8-sig")
+        )
+
+        def restore_portfolio(current):
+            restore_history = list(restored["history"])
+            restore_history.append({
+                "type": "PORTFOLIO_RESTORED",
+                "restored_at": utc_text(),
+                "previous_cash": current.get("cash"),
+                "previous_stock_count": len(current.get("stocks", {})),
+            })
+            restored["history"] = restore_history
+            current.clear()
+            current.update(restored)
+            return (
+                "✅ กู้คืนพอร์ตแล้ว\n"
+                f"เงินสด: {restored['cash']:,.2f} บาท\n"
+                f"หุ้น: {len(restored['stocks'])} รายการ\n"
+                f"รายการติดตาม: {len(restored['watchlist'])} รายการ\n"
+                "ระบบจะเตรียมแผนใหม่จากข้อมูลตลาดล่าสุด"
+            )
+
+        result = mutate_portfolio(user_id, restore_portfolio)
+    except ValueError as exc:
+        result = f"⚠️ กู้คืนไม่ได้: {exc}"
+    except Exception:
+        logger.exception("กู้คืนพอร์ตจากไฟล์ LINE ไม่สำเร็จ")
+        result = "⚠️ อ่านหรือบันทึกไฟล์สำรองไม่สำเร็จ พอร์ตเดิมไม่ได้รับการยืนยันว่าเปลี่ยนแปลง"
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=result),
+    )
+
+
 def help_text():
     return (
         "📊 PORTFOLIO BOT\n"
@@ -1530,6 +1726,9 @@ def help_text():
         "และส่งผลให้เมื่อวิเคราะห์เสร็จ\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
+        "สถานะข้อมูล — ดูว่าวิธีเก็บพอร์ตถาวรหรือไม่\n"
+        "สำรองพอร์ต — รับ JSON สำหรับบันทึกเป็นไฟล์ .json\n"
+        "กู้คืน — ส่งไฟล์สำรอง .json กลับเข้าแชต\n"
         "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
         "ตั้งหุ้น AOT 100 35.50 — บันทึกจำนวนและต้นทุนเฉลี่ย\n"
         "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดออกจากพอร์ต\n"
@@ -1653,6 +1852,28 @@ def command_reply(user_id, text):
         return "\n".join(lines)
 
     portfolio = get_portfolio(user_id)
+
+    if text == "สถานะข้อมูล":
+        storage_name, storage_detail = portfolio_storage_status()
+        return (
+            "🗄️ สถานะการเก็บข้อมูลพอร์ต\n"
+            f"วิธีเก็บ: {storage_name}\n"
+            f"รายละเอียด: {storage_detail}"
+        )
+
+    if text == "สำรองพอร์ต":
+        try:
+            backup = export_portfolio_backup(user_id)
+        except Exception:
+            logger.exception("สร้างไฟล์สำรองพอร์ตไม่สำเร็จ")
+            return "⚠️ สร้างข้อมูลสำรองไม่สำเร็จ กรุณาลองใหม่ภายหลัง"
+        return (
+        "🔐 JSON สำรองพอร์ตของคุณ — คัดลอกทั้งหมดนี้บันทึกเป็นไฟล์ "
+            "`portfolio-backup.json` เก็บไว้เป็นความลับ\n"
+            "กู้คืนโดยส่งไฟล์ .json นี้เข้าแชตกับบอต "
+            "(ไม่รวมประวัติรายการและแผนเก่า)\n\n"
+            f"{backup}"
+        )
 
     if text in {
         "แผนเทรดวันนี้",
