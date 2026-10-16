@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import json
+import hashlib
 import logging
 import os
 import re
@@ -116,6 +117,18 @@ def next_set_session(day):
         while candidate.weekday() >= 5:
             candidate += timedelta(days=1)
         return candidate
+
+
+def latest_completed_set_session(current):
+    """Use a completed SET session, never a live intraday bar."""
+    candidate = current.date()
+    if current.hour < 19:
+        candidate -= timedelta(days=1)
+    for _ in range(14):
+        if is_set_session(candidate):
+            return candidate
+        candidate -= timedelta(days=1)
+    raise RuntimeError("Cannot find a recently completed SET session")
 
 
 # =========================================================
@@ -818,24 +831,89 @@ def build_daily_plan(portfolio, frames=None):
 # =========================================================
 # OVERNIGHT PLAN SYSTEM
 # =========================================================
+_on_demand_lock = threading.Lock()
+_on_demand_users = set()
+
+
+def _prepare_on_demand(user_id, data_day):
+    try:
+        prepare_overnight_plans(
+            target_data_day=data_day,
+            only_user_ids=[user_id],
+        )
+    finally:
+        with _on_demand_lock:
+            _on_demand_users.discard(user_id)
+
+
+def queue_on_demand_plan(user_id):
+    """Start one background preparation without holding the LINE webhook."""
+    data_day = latest_completed_set_session(now_bkk())
+    with _on_demand_lock:
+        if user_id in _on_demand_users:
+            return data_day, False
+        _on_demand_users.add(user_id)
+    try:
+        job_id = "on-demand-" + hashlib.sha256(
+            user_id.encode("utf-8")
+        ).hexdigest()[:20]
+        scheduler.add_job(
+            _prepare_on_demand,
+            "date",
+            run_date=now_bkk() + timedelta(seconds=1),
+            args=[user_id, data_day],
+            id=job_id,
+            replace_existing=True,
+            max_instances=1,
+        )
+    except Exception:
+        with _on_demand_lock:
+            _on_demand_users.discard(user_id)
+        raise
+    return data_day, True
+
+
 def read_overnight_plan(user_id):
     portfolio = get_portfolio(user_id)
     plan = portfolio.get("overnight_plan")
 
     if not isinstance(plan, dict):
-        # ไม่ดึงหุ้นทั้งตลาดระหว่างตอบ LINE
-        logger.warning(
-            "ไม่พบแผนล่วงหน้า: "
-            "ข้ามการคำนวณในคำขอ LINE"
-        )
+        try:
+            data_day, _ = queue_on_demand_plan(user_id)
+        except Exception:
+            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
+            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
         return (
-            "⚠️ ยังไม่มีแผนที่เตรียมไว้สำหรับวันนี้\n"
-            "ระบบไม่ได้คำนวณหุ้นในระหว่างตอบ LINE "
-            "เพื่อป้องกันคำขอหมดเวลา "
-            "และจะไม่แนะนำซื้อโดยไม่มีข้อมูล"
-            "ที่ตรวจสอบได้\n"
-            "โปรดตรวจ Logs ของบริการว่ารอบเตรียมแผน"
-            "หลังตลาดปิดทำงานสำเร็จหรือไม่"
+            f"กำลังวิเคราะห์หุ้นจากราคาปิด {data_day.isoformat()}\n"
+            "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ "
+            "ระหว่างนี้ยังไม่มีคำแนะนำซื้อที่ตรวจสอบได้"
+        )
+
+    today = now_bkk().date().isoformat()
+    delivery_day = plan.get("delivery_day")
+    status = plan.get("status")
+
+    if delivery_day != today:
+        if (
+            status == "READY"
+            and isinstance(delivery_day, str)
+            and delivery_day > today
+        ):
+            return (
+                "เตรียมแผนจากราคาปิด "
+                f"{plan.get('data_date', 'ไม่ทราบ')} แล้ว\n"
+                "รอวันซื้อขาย "
+                f"{delivery_day}"
+            )
+        try:
+            data_day, _ = queue_on_demand_plan(user_id)
+        except Exception:
+            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
+            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
+        return (
+            f"แผนเดิมไม่ใช่ของวันนี้ กำลังวิเคราะห์จากราคาปิด "
+            f"{data_day.isoformat()}\n"
+            "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ"
         )
 
     if plan.get("status") == "NO_DATA":
@@ -868,31 +946,11 @@ def read_overnight_plan(user_id):
             + "\nระบบจะลองใหม่ในรอบเตรียมแผนถัดไป"
         )
 
-    today = now_bkk().date().isoformat()
-    delivery_day = plan.get("delivery_day")
-    status = plan.get("status")
-
-    if delivery_day != today:
-        if (
-            status == "READY"
-            and isinstance(delivery_day, str)
-            and delivery_day > today
-        ):
-            return (
-                "เตรียมแผนจากราคาปิด "
-                f"{plan.get('data_date', 'ไม่ทราบ')} แล้ว\n"
-                "รอส่งเช้าวันซื้อขาย "
-                f"{delivery_day}"
-            )
-        return (
-            "ยังไม่มีแผนที่ตรวจสอบได้สำหรับวันนี้ "
-            "จึงไม่ใช้แผนเก่ามาแนะนำซื้อ"
-        )
-
     if status == "READY":
         return (
-            "แผนสำหรับวันนี้เตรียมแล้ว "
-            "แต่ยังไม่ถึงรอบส่งอัตโนมัติ"
+            f"แผนสำหรับวันซื้อขาย {delivery_day}\n"
+            f"ใช้ราคาปิด {plan.get('data_date', 'ไม่ทราบ')}\n\n"
+            + plan.get("text", "ไม่พบข้อความแผน")
         )
 
     if status in ("SENT", "DELIVERY_UNKNOWN"):
@@ -913,8 +971,8 @@ def read_overnight_plan(user_id):
     return "ยังไม่มีแผนที่ใช้ได้สำหรับวันนี้"
 
 
-def prepare_overnight_plans():
-    current_day = now_bkk().date()
+def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
+    current_day = target_data_day or now_bkk().date()
     logger.info(
         "เริ่มรอบเตรียมแผน: data_date=%s",
         current_day,
@@ -927,7 +985,7 @@ def prepare_overnight_plans():
         return
 
     try:
-        users = registered_users()
+        users = only_user_ids if only_user_ids is not None else registered_users()
         logger.info(
             "รอบเตรียมแผน: registered=%d",
             len(users),
@@ -986,6 +1044,14 @@ def prepare_overnight_plans():
             len(pending),
         )
         frames = get_market_frames(symbols)
+        if target_data_day is not None:
+            cutoff = current_day.isoformat()
+            frames = {
+                symbol: frame.loc[
+                    frame.index.strftime("%Y-%m-%d") <= cutoff
+                ]
+                for symbol, frame in frames.items()
+            }
         ctx = market_context(frames)
 
         if (
@@ -1042,11 +1108,19 @@ def prepare_overnight_plans():
             }
             for user_id in pending:
                 try:
+                    def save_failure(portfolio):
+                        previous = portfolio.get("overnight_plan")
+                        if (
+                            isinstance(previous, dict)
+                            and str(previous.get("data_date", ""))
+                            > current_day.isoformat()
+                        ):
+                            return
+                        portfolio["overnight_plan"] = failure_plan
+
                     mutate_portfolio(
                         user_id,
-                        lambda portfolio: portfolio.update(
-                            {"overnight_plan": failure_plan}
-                        ),
+                        save_failure,
                     )
                 except Exception:
                     save_failed += 1
@@ -1086,6 +1160,13 @@ def prepare_overnight_plans():
                 }
 
                 def save_plan(p):
+                    previous = p.get("overnight_plan")
+                    if (
+                        isinstance(previous, dict)
+                        and str(previous.get("data_date", ""))
+                        > current_day.isoformat()
+                    ):
+                        return "ข้ามแผนเก่ากว่า"
                     p["overnight_plan"] = new_plan
                     return "เตรียมแผนแล้ว"
 
@@ -1297,7 +1378,9 @@ def help_text():
         "แผนวันนี้ — ดูแผนหุ้นสำหรับวันซื้อขายนี้\n"
         "สถานะแผน — ดูวันที่ข้อมูลและสถานะเตรียมแผน\n"
         "หรือพิมพ์: แผนเทรดวันนี้ / "
-        "ควรซื้อวันนี้ / ซื้อวันนี้\n\n"
+        "ควรซื้อวันนี้ / ซื้อวันนี้\n"
+        "หากยังไม่มีแผน คำสั่งจะเริ่มวิเคราะห์ในเบื้องหลัง "
+        "แล้วให้พิมพ์ซ้ำเพื่ออ่านผล\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
         "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
