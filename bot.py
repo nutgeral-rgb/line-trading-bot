@@ -1747,17 +1747,35 @@ def handle_backup_file(event):
 def build_long_term_accumulation_plan(portfolio):
     """Screen SET100 candidates for a cautious, user-triggered accumulation review."""
     strategy = portfolio.get("investment_strategy", {})
-    expected_day = latest_completed_set_session(now_bkk()).isoformat()
+    expected_session = latest_completed_set_session(now_bkk())
+    # Free quote sources can publish the latest SET close one session late.
+    # For a long-term screen, accept the latest session or the immediately
+    # preceding SET session, while preserving the universe coverage threshold.
+    previous_session = latest_completed_set_session(
+        datetime.combine(expected_session, datetime.min.time())
+    )
+    allowed_data_dates = {
+        expected_session.isoformat(),
+        previous_session.isoformat(),
+    }
     symbols = sorted(set(UNIVERSE) | set(portfolio.get("stocks", {}).keys()))
     frames = get_market_frames(symbols)
     ctx = market_context(frames)
-    if not ctx["sufficient"] or ctx["date"] != expected_day:
+    if not ctx["sufficient"]:
         return (
             "⚠️ ยังจัดแผนสะสมหุ้นไม่ได้ เพราะข้อมูล SET100 "
-            f"ไม่ครบหรือไม่ใช่วันล่าสุด ({ctx.get('date') or 'ไม่มีข้อมูล'})\n"
+            "ไม่ครบเกณฑ์\n"
+            f"วันที่ข้อมูล: {ctx.get('date') or 'ไม่มีข้อมูล'} | "
             f"ข้อมูลครบ {ctx.get('coverage', 0):.0%} "
             f"({ctx.get('valid_count', 0)}/{ctx.get('total_count', len(UNIVERSE))}) "
-            "ระบบงดแนะนำจนกว่าจะได้ข้อมูลวันเดียวกันครบเกณฑ์"
+            "ต้องครบอย่างน้อย 80% ในวันเดียวกัน"
+        )
+    if ctx["date"] not in allowed_data_dates:
+        return (
+            "⚠️ ยังจัดแผนสะสมหุ้นไม่ได้ เพราะข้อมูลราคาล่าช้าเกินหนึ่งวันซื้อขาย\n"
+            f"วันที่ข้อมูลล่าสุด: {ctx.get('date') or 'ไม่มีข้อมูล'} | "
+            f"วันซื้อขายล่าสุดที่ควรมีข้อมูล: {expected_session.isoformat()}\n"
+            "ระบบงดแนะนำจนกว่าจะได้ข้อมูลที่ใหม่กว่านี้"
         )
 
     cash = max(0.0, float(portfolio.get("cash", 0) or 0))
@@ -1790,6 +1808,11 @@ def build_long_term_accumulation_plan(portfolio):
     header = [
         "🧭 แผนสะสมหุ้นไทยระยะยาว (ข้อมูลประกอบ ไม่ใช่คำสั่งซื้อ)",
         f"📅 ราคาปิดข้อมูลล่าสุด: {ctx['date']}",
+        *(
+            ["⚠️ ราคาปิดช้ากว่าวันซื้อขายล่าสุดหนึ่งรอบ ใช้เป็นข้อมูลคัดกรองแผนถือยาว"]
+            if ctx["date"] != expected_session.isoformat()
+            else []
+        ),
         f"ภาพตลาด SET100: Breadth {ctx['breadth']:.1f}% "
         f"({ctx['valid_count']}/{ctx['total_count']} ตัว)",
         f"พอร์ตที่ประเมินจากข้อมูลในบอต: {total_value:,.2f} บาท",
