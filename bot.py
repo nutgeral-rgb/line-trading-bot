@@ -848,6 +848,7 @@ def _prepare_on_demand(user_id, data_day):
 
 def queue_on_demand_plan(user_id):
     """Start one background preparation without holding the LINE webhook."""
+    ensure_scheduler()
     data_day = latest_completed_set_session(now_bkk())
     with _on_demand_lock:
         if user_id in _on_demand_users:
@@ -1781,47 +1782,66 @@ def command_reply(user_id, text):
 # =========================================================
 # SCHEDULER STARTUP
 # =========================================================
-scheduler = BackgroundScheduler(
-    timezone="Asia/Bangkok"
-)
-scheduler.add_job(
-    prepare_overnight_plans,
-    "cron",
-    day_of_week="mon-fri",
-    hour="19,20,21",
-    minute=15,
-    id="prepare-overnight-plan",
-    replace_existing=True,
-    max_instances=1,
-    coalesce=True,
-)
-scheduler.add_job(
-    send_overnight_plans,
-    "cron",
-    day_of_week="mon-fri",
-    hour=8,
-    minute="30,35,40,45,50,55",
-    id="send-overnight-plan-8",
-    replace_existing=True,
-    max_instances=1,
-    coalesce=True,
-)
-scheduler.add_job(
-    send_overnight_plans,
-    "cron",
-    day_of_week="mon-fri",
-    hour=9,
-    minute="0,5",
-    id="send-overnight-plan-9",
-    replace_existing=True,
-    max_instances=1,
-    coalesce=True,
-)
-scheduler.start()
-logger.info(
-    "เริ่ม scheduler สำหรับรอบเตรียม"
-    "และส่งแผนแล้ว"
-)
+scheduler = None
+_scheduler_pid = None
+_scheduler_lock = threading.Lock()
+
+
+def ensure_scheduler():
+    """Start jobs inside the serving worker, after Gunicorn forks."""
+    global scheduler, _scheduler_pid
+    pid = os.getpid()
+    if scheduler is not None and _scheduler_pid == pid and scheduler.running:
+        return
+    with _scheduler_lock:
+        if scheduler is not None and _scheduler_pid == pid and scheduler.running:
+            return
+        worker_scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
+        worker_scheduler.add_job(
+            prepare_overnight_plans,
+            "cron",
+            day_of_week="mon-fri",
+            hour="19,20,21",
+            minute=15,
+            id="prepare-overnight-plan",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_overnight_plans,
+            "cron",
+            day_of_week="mon-fri",
+            hour=8,
+            minute="30,35,40,45,50,55",
+            id="send-overnight-plan-8",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_overnight_plans,
+            "cron",
+            day_of_week="mon-fri",
+            hour=9,
+            minute="0,5",
+            id="send-overnight-plan-9",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.start()
+        scheduler = worker_scheduler
+        _scheduler_pid = pid
+        logger.info("เริ่ม scheduler ใน worker pid=%d", pid)
+
+
+@app.before_request
+def start_scheduler_in_worker():
+    try:
+        ensure_scheduler()
+    except Exception:
+        logger.exception("เริ่ม scheduler ใน worker ไม่สำเร็จ")
 
 if __name__ == "__main__":
     app.run(
