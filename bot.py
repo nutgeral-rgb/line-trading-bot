@@ -32,7 +32,11 @@ import requests
 
 from fundamental_analysis import analyze_fundamentals
 from position_risk import estimate_position
-from set100_constituents import SET100_SYMBOLS
+from set100_constituents import (
+    SET100_EFFECTIVE_FROM,
+    SET100_EFFECTIVE_TO,
+    SET100_SYMBOLS,
+)
 
 
 # =========================================================
@@ -609,6 +613,13 @@ def normalize_stock_symbol(value):
     return base + ".BK"
 
 
+def display_stock_symbol(value):
+    """Show the SET ticker without Yahoo Finance's provider suffix."""
+    if isinstance(value, str) and value.upper().endswith(".BK"):
+        return value[:-3]
+    return value
+
+
 def combined_universe(portfolio):
     custom = [
         symbol for value in portfolio.get("watchlist", [])[:MAX_WATCHLIST]
@@ -956,7 +967,7 @@ def build_daily_plan(portfolio, frames=None):
                     )
                 )
                 detail = (
-                    f"{index}. 📈 {sym}\n"
+                    f"{index}. 📈 {display_stock_symbol(sym)}\n"
                     f"   ผลตอบแทน 63 วัน: "
                     f"{momentum * 100:+.1f}%\n"
                     f"   ความผันผวนต่อปี: "
@@ -1126,7 +1137,7 @@ def _format_plan_failure(plan, title="⚠️ รอบล่าสุดยั�
     if missing_sample:
         response += (
             "\nตัวอย่างหุ้นที่ข้อมูลขาด: "
-            + ", ".join(missing_sample[:5])
+            + ", ".join(display_stock_symbol(sym) for sym in missing_sample[:5])
         )
     return response
 
@@ -1808,6 +1819,8 @@ def build_long_term_accumulation_plan(portfolio):
     header = [
         "🧭 แผนสะสมหุ้นไทยระยะยาว (ข้อมูลประกอบ ไม่ใช่คำสั่งซื้อ)",
         f"📅 ราคาปิดข้อมูลล่าสุด: {ctx['date']}",
+        f"📚 รายชื่อ SET100: {SET100_EFFECTIVE_FROM} ถึง {SET100_EFFECTIVE_TO} | "
+        "ราคาจาก Yahoo Finance ไม่ใช่ feed โดยตรงจาก SET",
         *(
             ["⚠️ ราคาปิดช้ากว่าวันซื้อขายล่าสุดหนึ่งรอบ ใช้เป็นข้อมูลคัดกรองแผนถือยาว"]
             if ctx["date"] != expected_session.isoformat()
@@ -1931,6 +1944,37 @@ def build_long_term_accumulation_plan(portfolio):
             break
 
     if not chosen:
+        odd_lot_budget = budget / 2
+        odd_lot_candidates = [
+            item for item in candidates
+            if item["close"] <= odd_lot_budget
+        ][:2]
+        if len(odd_lot_candidates) == 2:
+            lines = header + [
+                f"งบสูงสุดรอบนี้ {budget:,.2f} บาท "
+                f"แบ่งสองบริษัทประมาณ {odd_lot_budget:,.2f} บาทต่อบริษัท",
+                "ตัวเลือกซื้อหน่วยย่อย (Odd Lot) หากโบรกเกอร์รองรับ:",
+            ]
+            for index, item in enumerate(odd_lot_candidates, 1):
+                shares = int(odd_lot_budget // item["close"])
+                estimated_cost = shares * item["close"]
+                lines.append(
+                    f"{index}. {display_stock_symbol(item['symbol'])} — "
+                    f"ราคาปิด {item['close']:.2f} บาท; ประมาณ {shares:,} หุ้น "
+                    f"({estimated_cost:,.2f} บาท ก่อนค่าธรรมเนียม)"
+                )
+                lines.append(
+                    f"   พื้นฐานผ่าน {item['fundamental']['score']}/"
+                    f"{item['fundamental']['available']}: "
+                    f"{item['fundamental']['summary']}"
+                )
+            lines.extend([
+                "Odd Lot อาจมีสภาพคล่อง/ส่วนต่างราคาและโอกาสจับคู่ต่างจากกระดานหลัก "
+                "ตรวจสอบกับโบรกเกอร์ก่อนส่งคำสั่ง",
+                "เป็นเพียงตัวเลือกเพื่อพิจารณาสะสม ไม่รับประกันผลตอบแทน "
+                "หรือจำกัดขาดทุนไว้ที่ 10%",
+            ])
+            return "\n".join(lines)
         return "\n".join(
             header
             + [
@@ -1940,7 +1984,7 @@ def build_long_term_accumulation_plan(portfolio):
                 "หากใช้กระดาน Odd Lot ให้ตรวจราคาและค่าธรรมเนียมกับโบรกเกอร์",
                 "หุ้นที่ผ่านเกณฑ์เพื่อเฝ้าดู: "
                 + ", ".join(
-                    f"{item['symbol']} {item['close']:.2f} บาท"
+                    f"{display_stock_symbol(item['symbol'])} {item['close']:.2f} บาท"
                     for item in candidates[:3]
                 ),
             ]
@@ -1956,7 +2000,7 @@ def build_long_term_accumulation_plan(portfolio):
         estimated_cost = shares * item["close"]
         fundamental = item["fundamental"]
         lines.append(
-            f"{index}. {item['symbol']} — ราคาปิด {item['close']:.2f} บาท; "
+            f"{index}. {display_stock_symbol(item['symbol'])} — ราคาปิด {item['close']:.2f} บาท; "
             f"ประมาณ {shares:,} หุ้น / {estimated_cost:,.2f} บาท "
             "(ก่อนค่าธรรมเนียม)"
         )
@@ -2093,7 +2137,7 @@ def command_reply(user_id, text):
             symbol, period="6mo"
         )
         lines = [
-            f"📊 วิเคราะห์ {symbol}",
+            f"📊 วิเคราะห์ {display_stock_symbol(symbol)}",
             "━━━━━━━━━━━━━━━━━━",
         ]
         if (
@@ -2290,7 +2334,7 @@ def command_reply(user_id, text):
                 market_value = shares * avg_price
                 total_market += market_value
                 holding_lines.append(
-                    f"• {symbol}: ไม่มีราคาล่าสุด; แสดงตามต้นทุน "
+                    f"• {display_stock_symbol(symbol)}: ไม่มีราคาล่าสุด; แสดงตามต้นทุน "
                     f"{market_value:,.2f} บาท (ไม่ใช่มูลค่าตลาด)"
                 )
                 continue
@@ -2299,7 +2343,7 @@ def command_reply(user_id, text):
             pnl = market_value - (shares * avg_price)
             total_market += market_value
             holding_lines.append(
-                f"• {symbol}: {shares:,} หุ้น | ปิด {day} "
+                f"• {display_stock_symbol(symbol)}: {shares:,} หุ้น | ปิด {day} "
                 f"{price:.2f} บาท | กำไร/ขาดทุนค้าง "
                 f"{pnl:+,.2f} บาท ({pnl / (shares * avg_price) * 100:+.1f}%)"
             )
@@ -2435,7 +2479,7 @@ def command_reply(user_id, text):
                 stocks.items()
             ):
                 lines.append(
-                    f"• {sym}  |  "
+                    f"• {display_stock_symbol(sym)}  |  "
                     f"{info['shares']} หุ้น  |  "
                     "ต้นทุนเฉลี่ย "
                     f"{info['avg_price']:.2f} บาท"
@@ -2518,7 +2562,7 @@ def command_reply(user_id, text):
                 "recorded_at": utc_text(),
             })
             return (
-                f"บันทึก {symbol} {shares:,} หุ้นแล้ว "
+                f"บันทึก {display_stock_symbol(symbol)} {shares:,} หุ้นแล้ว "
                 "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่คำสั่งซื้อขายจริง) "
                 "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
             )
@@ -2538,7 +2582,7 @@ def command_reply(user_id, text):
         return (
             "🔎 หุ้นที่ติดตาม\n"
             + "\n".join(
-                f"• {symbol}"
+                f"• {display_stock_symbol(symbol)}"
                 for symbol in watchlist
             )
         )
@@ -2562,12 +2606,12 @@ def command_reply(user_id, text):
                 )
                 p["overnight_plan"] = None
                 return (
-                    f"เพิ่ม {sym} "
+                    f"เพิ่ม {display_stock_symbol(sym)} "
                     "ลงในรายการติดตามแล้ว "
                     "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
-                f"{sym} อยู่ในรายการ"
+                f"{display_stock_symbol(sym)} อยู่ในรายการ"
                 "ติดตามอยู่แล้ว"
             )
 
@@ -2591,12 +2635,12 @@ def command_reply(user_id, text):
                 )
                 p["overnight_plan"] = None
                 return (
-                    f"นำ {sym} ออกจาก"
+                    f"นำ {display_stock_symbol(sym)} ออกจาก"
                     "รายการติดตามแล้ว "
                     "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
-                f"ไม่พบ {sym} "
+                f"ไม่พบ {display_stock_symbol(sym)} "
                 "ในรายการติดตาม"
             )
 
