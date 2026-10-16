@@ -1141,6 +1141,16 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
 
         for user_id, portfolio in pending.items():
             try:
+                # A balance or watchlist may change while market data loads.
+                portfolio = get_portfolio(user_id)
+                portfolio_state = json.dumps(
+                    {
+                        key: portfolio.get(key)
+                        for key in ("cash", "stocks", "watchlist")
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
                 report, selected = build_daily_plan(
                     portfolio, frames=frames
                 )
@@ -1160,6 +1170,16 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
                 }
 
                 def save_plan(p):
+                    current_state = json.dumps(
+                        {
+                            key: p.get(key)
+                            for key in ("cash", "stocks", "watchlist")
+                        },
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                    if current_state != portfolio_state:
+                        return "พอร์ตเปลี่ยนระหว่างเตรียมแผน"
                     previous = p.get("overnight_plan")
                     if (
                         isinstance(previous, dict)
@@ -1170,10 +1190,11 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
                     p["overnight_plan"] = new_plan
                     return "เตรียมแผนแล้ว"
 
-                mutate_portfolio(
-                    user_id, save_plan
-                )
-                prepared += 1
+                result = mutate_portfolio(user_id, save_plan)
+                if result == "เตรียมแผนแล้ว":
+                    prepared += 1
+                else:
+                    logger.info("ข้ามแผนหนึ่งรายการ: %s", result)
             except Exception:
                 failed += 1
                 logger.exception(
