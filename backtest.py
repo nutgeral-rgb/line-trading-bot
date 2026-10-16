@@ -183,7 +183,7 @@ def backtest(
         # A missing next-session quote cannot be treated as a free sale of an
         # existing holding, or as a buy at an unknown price. Postpone trading.
         can_rebalance = all(s in open_prices for s in set(weights) | set(targets))
-        if can_rebalance:
+        if can_rebalance and tuple(targets) != previous_targets:
             actual_targets = targets
             target_weights = {
                 symbol: 1.0 / len(targets) for symbol in targets
@@ -193,9 +193,8 @@ def backtest(
                 for symbol in set(target_weights) | set(current_open_weights)
             )
             total_turnover += turnover
-            if tuple(actual_targets) != previous_targets:
-                rebalance_count += 1
-                previous_targets = tuple(actual_targets)
+            rebalance_count += 1
+            previous_targets = tuple(actual_targets)
         else:
             actual_targets = list(weights)
             target_weights = current_open_weights
@@ -366,7 +365,9 @@ def _self_test() -> None:
     gap_curve, _ = backtest(gap_frames, **gap_kwargs)
     expected = 15_000 * ((2 / 3) * 1.5 + (1 / 3) * (106.5 / 106.4))
     assert math.isclose(gap_curve.iloc[-1]["Equity"], expected, abs_tol=1e-6)
+    assert gap_curve.iloc[-1]["Turnover"] == 0
     missing = {symbol: frame.copy() for symbol, frame in gap_frames.items()}
+    missing["B.BK"].loc[gap_days[64], "Close"] = 50.0
     missing["A.BK"].loc[gap_days[65], ["Open", "Close"]] = np.nan
     missing_curve, _ = backtest(missing, **gap_kwargs)
     assert missing_curve.iloc[-1]["Turnover"] == 0
