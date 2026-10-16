@@ -1838,19 +1838,14 @@ def build_long_term_accumulation_plan(portfolio):
     ctx = market_context(frames)
     if not ctx["sufficient"]:
         return (
-            "⚠️ ยังจัดแผนสะสมหุ้นไม่ได้ เพราะข้อมูล SET100 "
-            "ไม่ครบเกณฑ์\n"
-            f"วันที่ข้อมูล: {ctx.get('date') or 'ไม่มีข้อมูล'} | "
-            f"ข้อมูลครบ {ctx.get('coverage', 0):.0%} "
+            "⚠️ ข้อมูล SET100 ยังไม่ครบ 80% ในวันเดียวกัน "
             f"({ctx.get('valid_count', 0)}/{ctx.get('total_count', len(UNIVERSE))}) "
-            "ต้องครบอย่างน้อย 80% ในวันเดียวกัน"
+            "รอข้อมูลรอบถัดไปแล้วลองใหม่"
         )
     if ctx["date"] not in allowed_data_dates:
         return (
-            "⚠️ ยังจัดแผนสะสมหุ้นไม่ได้ เพราะข้อมูลราคาล่าช้าเกินหนึ่งวันซื้อขาย\n"
-            f"วันที่ข้อมูลล่าสุด: {ctx.get('date') or 'ไม่มีข้อมูล'} | "
-            f"วันซื้อขายล่าสุดที่ควรมีข้อมูล: {expected_session.isoformat()}\n"
-            "ระบบงดแนะนำจนกว่าจะได้ข้อมูลที่ใหม่กว่านี้"
+            "⚠️ ข้อมูลราคาล่าสุดเก่าเกิน 1 วันซื้อขาย "
+            f"(ข้อมูล {ctx.get('date') or 'ไม่มีข้อมูล'}); รอบนี้งดแนะนำ"
         )
 
     cash = max(0.0, float(portfolio.get("cash", 0) or 0))
@@ -1881,57 +1876,77 @@ def build_long_term_accumulation_plan(portfolio):
     planned_contribution = float(
         strategy.get("monthly_contribution_baht", 500.0) or 500.0
     )
-    planned_equity_contribution = planned_contribution * target_equity_pct / 100.0
     remaining_target = max(0.0, target_equity - current_equity_value)
     budget = min(cash, remaining_target)
 
     header = [
-        "🧭 แผนสะสมหุ้นไทยระยะยาว | เป้าหมายหุ้น 100% (ข้อมูลประกอบ)",
-        f"📅 ราคาปิดข้อมูลล่าสุด: {ctx['date']}",
-        f"📚 รายชื่อ SET100: {SET100_EFFECTIVE_FROM} ถึง {SET100_EFFECTIVE_TO} | "
-        "ราคาจาก Yahoo Finance ไม่ใช่ feed โดยตรงจาก SET",
-        f"💰 เติมเงินตามแผน {planned_contribution:,.0f} บาท/เดือน | "
-        f"เป้าหมายจัดสรรหุ้น {planned_equity_contribution:,.0f} บาท "
-        f"เงินสดสำรองตามเป้าหมาย {planned_contribution - planned_equity_contribution:,.0f} บาท",
-        "ถ้าไม่มีหุ้นผ่านเกณฑ์ ระบบงดซื้อและเงินสดจะคงอยู่ชั่วคราว",
-        "(ยังไม่นับเป็นเงินสดจนกว่าจะบันทึกยอดเงินจริง)",
+        "🧭 แผนสะสมหุ้นระยะยาว | หุ้นเป้าหมาย 100%",
+        f"📅 ราคาปิด {ctx['date']} (Yahoo Finance)",
+        f"📊 หุ้น SET100 เหนือ SMA20 {ctx['breadth']:.1f}% "
+        f"({ctx['valid_count']}/{ctx['total_count']})",
+        f"💰 พอร์ตตามข้อมูลบอต {total_value:,.0f} | "
+        f"เงินสดบันทึก {cash:,.0f} | งบรอบนี้ {budget:,.0f} บาท",
+        f"📥 แผนเติมเงิน {planned_contribution:,.0f} บาท/เดือน",
         *(
-            ["⚠️ ราคาปิดช้ากว่าวันซื้อขายล่าสุดหนึ่งรอบ ใช้เป็นข้อมูลคัดกรองแผนถือยาว"]
+            ["⚠️ ราคาปิดช้ากว่าวันซื้อขายล่าสุด 1 วัน"]
             if ctx["date"] != expected_session.isoformat()
             else []
         ),
-        f"ภาพตลาด SET100: Breadth {ctx['breadth']:.1f}% "
-        f"({ctx['valid_count']}/{ctx['total_count']} ตัว)",
-        f"พอร์ตที่ประเมินจากข้อมูลในบอต: {total_value:,.2f} บาท",
-        f"หุ้นตามเป้าหมาย {target_equity_pct:.0f}%: {target_equity:,.2f} บาท | "
-        f"มูลค่าหุ้นปัจจุบัน: {current_equity_value:,.2f} บาท",
         *(
             [
-                "📍 หุ้นที่ถืออยู่กระจุกตัวสูงสุด "
-                f"{max(holding_values.values()) / current_equity_value * 100:.1f}% ของมูลค่าหุ้น"
+                "⚠️ หุ้นตัวใหญ่สุดคิดเป็น "
+                f"{max(holding_values.values()) / current_equity_value * 100:.0f}% ของหุ้นในพอร์ต"
             ]
-            if holding_values and current_equity_value > 0
+            if holding_values
+            and current_equity_value > 0
+            and max(holding_values.values()) / current_equity_value >= 0.4
             else []
         ),
-        f"🧾 กันค่าใช้จ่ายซื้อโดยประมาณ {ESTIMATED_BUY_COST_RATE * 100:.2f}% ต่อรายการ "
-        "(ค่าจริงขึ้นกับโบรกเกอร์)",
     ]
+
+    def concise_fundamental(fundamental):
+        score = fundamental.get("score")
+        required = int(fundamental.get("required", 5) or 5)
+        available = int(fundamental.get("available", 0) or 0)
+        if score is None:
+            summary = f"งบยังไม่ครบ ({available}/{required})"
+        else:
+            summary = f"งบผ่าน {int(score)}/{required}"
+        details_text = str(fundamental.get("summary") or "")
+        details_text = details_text.partition("|")[2]
+        details = [part.strip() for part in details_text.split(";")]
+        for prefix, label in (
+            ("รายได้ YoY", "รายได้"),
+            ("กำไรบวก", "กำไร"),
+            ("กระแสเงินสดดำเนินงาน", "CFO"),
+            ("FCF 4 ไตรมาส", "FCF"),
+        ):
+            match = next((part for part in details if part.startswith(prefix)), None)
+            if match:
+                value = match[len(prefix):].strip()
+                summary += f" · {label} {value}"
+        warnings = fundamental.get("quality_warnings") or []
+        if warnings:
+            summary += " · ⚠️ " + str(warnings[0])
+        elif int(fundamental.get("valuation_concern", 0) or 0) > 0:
+            summary += " · ⚠️ ควรทบทวนมูลค่า"
+        return summary
+
     if unpriced_holdings:
         return "\n".join(
             header
             + [
-                "⚠️ ยังประเมินหุ้นที่ถืออยู่ไม่ได้ครบ: "
+                "⚠️ ประเมินหุ้นในพอร์ตได้ไม่ครบ: "
                 + ", ".join(unpriced_holdings[:5]),
-                "จึงยังไม่เสนอซื้อเพิ่ม เพื่อไม่คำนวณสัดส่วนผิด",
+                "รอบนี้งดแนะนำซื้อเพื่อป้องกันคำนวณสัดส่วนคลาดเคลื่อน",
             ]
         )
     if budget <= 0:
         return "\n".join(
             header
             + [
-                "ยังไม่แนะนำสะสมเพิ่ม เพราะเงินสดที่บันทึกหรือวงเงินหุ้นเป้าหมายไม่เหลือ",
-                "เรียกแนะนำหุ้นสะสมใหม่ได้ทุกเมื่อหลังอัปเดตเงินสด/พอร์ต "
-                "ไม่ต้องรอเดือนหน้า",
+                "เงินสดหรือวงเงินสะสมไม่พอในรอบนี้ จึงงดแนะนำซื้อ",
+                "อัปเดตยอดพอร์ตแล้วเรียกคำสั่งนี้ใหม่ได้",
             ]
         )
 
@@ -2072,9 +2087,7 @@ def build_long_term_accumulation_plan(portfolio):
         return "\n".join(
             header
             + [
-                "⚠️ รอบนี้ไม่มีหุ้นที่ผ่านเกณฑ์แนวโน้มราคาและสภาพคล่อง",
-                "ระบบไม่ฝืนเลือกหุ้นในตลาดที่ยังไม่ผ่านเกณฑ์ "
-                "พิมพ์ แนะนำหุ้นสะสม ซ้ำได้ทุกเมื่อหลังมีข้อมูลตลาดใหม่",
+                "⚠️ รอบนี้ไม่มีหุ้นผ่านเกณฑ์แนวโน้มและสภาพคล่อง จึงงดแนะนำซื้อ",
             ]
         )
 
@@ -2152,36 +2165,32 @@ def build_long_term_accumulation_plan(portfolio):
         -item["avg_value"],
     ))
     if not candidates:
+        watch_lines = []
+        if watch_candidates:
+            watch_lines = ["หุ้นเฝ้าดูที่แนวโน้มผ่าน แต่ข้อมูลงบยังไม่ครบเกณฑ์:"]
+            watch_lines.extend(
+                f"• {display_stock_symbol(item['symbol'])} — "
+                f"งบ {item['fundamental'].get('score') or 0}/"
+                f"{item['fundamental'].get('required', 5)}"
+                for item in sorted(
+                    watch_candidates,
+                    key=lambda candidate: (
+                        -int(candidate["fundamental"].get("available", 0) or 0),
+                        -(int(candidate["fundamental"].get("score", 0) or 0)),
+                    ),
+                )[:3]
+            )
         return "\n".join(
             header
             + [
-                "⚠️ รอบนี้ยังไม่มีหุ้นที่ผ่านครบทุกเกณฑ์พื้นฐาน "
-                "จึงงดแนะนำซื้อ",
-                "ข้อมูลที่ขาดหรือสัญญาณที่ไม่ผ่านจะไม่ถูกนับเป็นผ่าน "
-                "เรียกวิเคราะห์ซ้ำได้ทุกเมื่อ ไม่ต้องรอเดือนหน้า",
+                "⚠️ รอบนี้ไม่มีหุ้นผ่านเกณฑ์พื้นฐานครบ จึงงดแนะนำซื้อ",
+                "เงินสดคงไว้ก่อน; เรียกคำสั่งนี้ใหม่ได้เมื่อมีข้อมูลตลาดรอบถัดไป",
             ]
-            + (
-                [
-                    "หุ้นเฝ้าดูที่ผ่านแนวโน้ม/สภาพคล่อง แต่พื้นฐานยังไม่ครบหรือมีข้อที่ต้องทบทวน:",
-                ]
-                + [
-                    f"• {display_stock_symbol(item['symbol'])} {item['close']:.2f} บาท — "
-                    f"{item['fundamental']['summary']}"
-                    for item in sorted(
-                        watch_candidates,
-                        key=lambda candidate: (
-                            -int(candidate["fundamental"].get("available", 0) or 0),
-                            -(int(candidate["fundamental"].get("score", 0) or 0)),
-                        ),
-                    )[:3]
-                ]
-                if watch_candidates else []
-            )
+            + watch_lines
         )
 
-    # Keep at least two names to avoid turning the small equity allocation
-    # into a single-stock bet. Use the standard 100-share lot as a conservative
-    # affordability check; verify the actual board lot and fees with the broker.
+    # Use the standard 100-share lot as an affordability check and spread
+    # purchases across distinct sectors where possible.
     def pick_distinct_sectors(items, count):
         selected = []
         sectors = set()
@@ -2219,9 +2228,7 @@ def build_long_term_accumulation_plan(portfolio):
         )
         if len(odd_lot_candidates) == 2:
             lines = header + [
-                f"งบสูงสุดรอบนี้ {budget:,.2f} บาท "
-                f"แบ่งสองบริษัทประมาณ {odd_lot_budget:,.2f} บาทต่อบริษัท",
-                "ตัวเลือกซื้อหน่วยย่อย (Odd Lot) หากโบรกเกอร์รองรับ:",
+                f"🪙 หน่วยย่อย (Odd Lot) หากโบรกเกอร์รองรับ | งบ {budget:,.0f} บาท",
             ]
             for index, item in enumerate(odd_lot_candidates, 1):
                 shares = int(
@@ -2229,71 +2236,45 @@ def build_long_term_accumulation_plan(portfolio):
                 )
                 estimated_cost = shares * item["close"]
                 estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
+                relative_strength = item.get("relative_strength")
                 lines.append(
                     f"{index}. {display_stock_symbol(item['symbol'])} — "
-                    f"ราคาปิด {item['close']:.2f} บาท; ประมาณ {shares:,} หุ้น "
-                    f"(มูลค่าซื้อ {estimated_cost:,.2f} + กันค่าใช้จ่าย ~{estimated_fee:,.2f} บาท)"
+                    f"{item['close']:.2f} บ. | {shares:,} หุ้น | "
+                    f"ซื้อ ~{estimated_cost:,.0f} + ค่าใช้จ่าย ~{estimated_fee:,.0f} บ."
                 )
                 lines.append(
-                    f"   กลุ่มธุรกิจ: {item['fundamental'].get('sector') or 'ไม่ทราบ'} | "
-                    f"ผลตอบแทน 6 เดือน {item['six_month_return'] * 100:+.1f}% | "
-                    f"มูลค่าซื้อขายมัธยฐาน {item['avg_value']:,.0f} บาท/วัน "
-                    f"({item['liquidity_days']}/20 วัน)"
+                    "   " + concise_fundamental(item["fundamental"])
                 )
                 lines.append(
-                    f"   ความเสี่ยงราคา: ลดจากจุดสูงสุด 6 เดือน "
-                    f"{item['max_drawdown'] * 100:.1f}% | "
+                    f"   แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}%"
                     + (
-                        f"ATR14 {item['atr_pct'] * 100:.1f}%"
-                        if item.get("atr_pct") is not None
-                        else "ATR14 ไม่มีข้อมูล"
+                        f" | เทียบ SET100 {relative_strength * 100:+.1f}%"
+                        if relative_strength is not None else ""
                     )
+                    + f" | ซื้อขาย {item['liquidity_days']}/20 วัน"
                 )
-                if item.get("portfolio_correlation") is not None:
-                    lines.append(
-                        f"   ความสัมพันธ์กับหุ้นเดิมในพอร์ต "
-                        f"{item['portfolio_correlation']:.2f}"
-                    )
-                if item.get("peer_valuation"):
-                    for metric, label in (("trailing_pe", "P/E"), ("price_to_book", "P/B")):
-                        peer = item["peer_valuation"].get(metric)
-                        if peer:
-                            current = item["fundamental"]["valuation"].get(metric)
-                            lines.append(
-                                f"   เทียบกลุ่ม {label}: {current:.1f}x / "
-                                f"ค่ากลาง {peer['median']:.1f}x "
-                                f"({peer['peer_count']} บริษัท)"
-                            )
-                lines.append(
-                    f"   พื้นฐาน {item['fundamental']['summary']}"
-                )
-            lines.extend([
-                "Odd Lot อาจมีสภาพคล่อง/ส่วนต่างราคาและโอกาสจับคู่ต่างจากกระดานหลัก "
-                "ตรวจสอบกับโบรกเกอร์ก่อนส่งคำสั่ง",
-                "เป็นเพียงตัวเลือกเพื่อพิจารณาสะสม ไม่รับประกันผลตอบแทน; "
-                "พอร์ตหุ้น 100% อาจขาดทุนเกิน 10%",
-            ])
+            lines.append(
+                "Odd Lot อาจมีส่วนต่างราคา/สภาพคล่องต่างจากกระดานหลัก; "
+                "ตรวจสอบกับโบรกเกอร์ก่อนซื้อ"
+            )
+            lines.append(
+                "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
+                "หุ้น 100% อาจขาดทุนเกิน 10%"
+            )
             return "\n".join(lines)
         return "\n".join(
             header
             + [
-                f"เงินสดที่จัดสรรรอบนี้ได้ {budget:,.2f} บาท "
-                "ยังไม่พอซื้ออย่างน้อย 1 board lot ต่อหุ้นให้กระจายอย่างน้อย 2 บริษัท",
-                "ถือเงินสดสะสมต่อก่อน ไม่จำเป็นต้องรีบซื้อ; "
-                "หากใช้กระดาน Odd Lot ให้ตรวจราคาและค่าธรรมเนียมกับโบรกเกอร์",
-                "หุ้นที่ผ่านเกณฑ์เพื่อเฝ้าดู: "
+                f"งบ {budget:,.0f} บาทยังไม่พอซื้อ 100 หุ้นอย่างน้อย 2 บริษัท",
+                "แนะนำเก็บเงินสดไว้ก่อน; หุ้นที่ผ่านเกณฑ์: "
                 + ", ".join(
-                    f"{display_stock_symbol(item['symbol'])} {item['close']:.2f} บาท"
+                    f"{display_stock_symbol(item['symbol'])} {item['close']:.2f} บ."
                     for item in candidates[:3]
                 ),
             ]
         )
 
-    lines = header + [
-        f"งบสะสมรอบนี้ไม่เกิน {budget:,.2f} บาท "
-        f"(แบ่งประมาณ {per_name_budget:,.2f} บาทต่อบริษัท)",
-        "หุ้นที่ผ่านหน้าจอข้อมูลรอบนี้:",
-    ]
+    lines = header + ["✅ หุ้นผ่านเกณฑ์ (ใช้พิจารณาสะสม):"]
     for index, item in enumerate(chosen, 1):
         shares = int(
             per_name_budget // (item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE))
@@ -2301,71 +2282,42 @@ def build_long_term_accumulation_plan(portfolio):
         estimated_cost = shares * item["close"]
         estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
         fundamental = item["fundamental"]
-        lines.append(
-            f"{index}. {display_stock_symbol(item['symbol'])} — ราคาปิด {item['close']:.2f} บาท; "
-            f"ประมาณ {shares:,} หุ้น | ซื้อ {estimated_cost:,.2f} + "
-            f"กันค่าใช้จ่าย ~{estimated_fee:,.2f} บาท"
-        )
-        lines.append(
-            f"   กลุ่มธุรกิจ: {fundamental.get('sector') or 'ไม่ทราบ'} | "
-            f"พื้นฐาน: {fundamental['summary']}"
-        )
         relative_strength = item.get("relative_strength")
-        market_text = (
-            f" | เทียบค่ากลางผลตอบแทนหุ้น SET100 {relative_strength * 100:+.1f}%"
-            if relative_strength is not None
-            else " | เทียบ SET100 ไม่ได้"
-        )
         lines.append(
-            f"   แนวโน้ม: เหนือ SMA50/SMA20 ({item['sma50']:.2f}/"
-            f"{item['sma20']:.2f}); 6 เดือน {item['six_month_return'] * 100:+.1f}%"
-            f"{market_text}"
+            f"{index}. {display_stock_symbol(item['symbol'])} — "
+            f"{item['close']:.2f} บ. | {shares:,} หุ้น | "
+            f"ซื้อ ~{estimated_cost:,.0f} + ค่าใช้จ่าย ~{estimated_fee:,.0f} บ."
         )
+        lines.append("   " + concise_fundamental(fundamental))
         lines.append(
-            f"   ความเสี่ยง: ลดจากจุดสูงสุด 6 เดือน "
-            f"{item['max_drawdown'] * 100:.1f}% | "
+            f"   แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}%"
             + (
-                f"ATR14 {item['atr_pct'] * 100:.1f}%"
-                if item.get("atr_pct") is not None
-                else "ATR14 ไม่มีข้อมูล"
+                f" | เทียบ SET100 {relative_strength * 100:+.1f}%"
+                if relative_strength is not None else ""
             )
-            + (
-                f" | สัมพันธ์กับหุ้นเดิม {item['portfolio_correlation']:.2f}"
-                if item.get("portfolio_correlation") is not None
-                else " | ความสัมพันธ์กับหุ้นเดิม: ยังประเมินไม่ได้"
-            )
+            + f" | สภาพคล่อง {item['liquidity_days']}/20 วัน, "
+            f"~{item['avg_value']:,.0f} บ./วัน"
         )
-        lines.append(
-            f"   สภาพคล่อง: มูลค่าซื้อขายมัธยฐาน 20 วัน "
-            f"{item['avg_value']:,.0f} บาท/วัน; "
-            f"มีซื้อขาย {item['liquidity_days']}/20 วัน; "
-            f"ความผันผวนย้อนหลัง 20 วันต่อปี {item['volatility'] * 100:.1f}%"
+        risk_text = (
+            f"   ความเสี่ยง: ลดจากจุดสูงสุด {abs(item['max_drawdown']) * 100:.1f}%"
         )
-        if item.get("peer_valuation"):
-            for metric, label in (("trailing_pe", "P/E"), ("price_to_book", "P/B")):
-                peer = item["peer_valuation"].get(metric)
-                if peer:
-                    current = fundamental["valuation"].get(metric)
-                    lines.append(
-                        f"   เทียบกลุ่ม {label}: {current:.1f}x | "
-                        f"ค่ากลาง {peer['median']:.1f}x จาก {peer['peer_count']} บริษัท"
-                    )
-        else:
-            lines.append("   เทียบมูลค่ากลุ่ม: ยังไม่มีหุ้นกลุ่มเดียวกันพอสำหรับเทียบ")
+        if item.get("portfolio_correlation") is not None:
+            risk_text += f" | สัมพันธ์กับหุ้นเดิม {item['portfolio_correlation']:.2f}"
+        peer = item.get("peer_valuation", {}).get("trailing_pe")
+        if peer:
+            current_pe = fundamental.get("valuation", {}).get("trailing_pe")
+            if isinstance(current_pe, (int, float)):
+                risk_text += (
+                    f" | P/E {current_pe:.1f}x (ค่ากลางกลุ่ม {peer['median']:.1f}x)"
+                )
+        lines.append(risk_text)
 
-    lines.extend([
-        "แนวทาง: ใช้เป็นรายการพิจารณาสะสมรอบนี้ ไม่ใช่ให้ซื้อทุกตัวทันที "
-        "ตรวจงบล่าสุด ราคา ณ เวลาส่งคำสั่ง และ board lot/ค่าธรรมเนียมกับโบรกเกอร์",
-        "เทียบ P/E/P/B กับกลุ่มเมื่อมีอย่างน้อย 3 หุ้น; "
-        "ไม่มีข้อมูลมูลค่าย้อนหลัง และความเห็นผู้สอบบัญชีต้องตรวจจาก SET/ก.ล.ต.",
-        "ผลตอบแทนเทียบ SET100 ใช้ค่ากลางหุ้นที่มีข้อมูล ไม่ใช่ผลตอบแทนดัชนี SET100 "
-        "และแผนสะสมนี้ยังไม่มีผลทดสอบย้อนหลังที่รวมงบอดีต",
-        f"ค่าใช้จ่ายซื้อที่กันไว้เป็นเพียงประมาณการ {ESTIMATED_BUY_COST_RATE * 100:.2f}% "
-        "ไม่ใช่อัตราค่าธรรมเนียมจริงของโบรกเกอร์",
-        "หุ้น 100% อาจขาดทุนเกิน 10%; ข้อมูลนี้ไม่รับประกันผลตอบแทน",
-    ])
+    lines.append(
+        "ตรวจราคาและค่าธรรมเนียมกับโบรกเกอร์ก่อนซื้อ; "
+        "ข้อมูลนี้ไม่ใช่คำสั่งซื้ออัตโนมัติหรือการรับประกันผลตอบแทน"
+    )
+    lines.append("หุ้น 100% อาจขาดทุนเกิน 10%")
     return "\n".join(lines)
-
 
 _long_term_users = set()
 
