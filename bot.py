@@ -794,7 +794,8 @@ def build_daily_plan(portfolio, frames=None):
             )
             report_lines.append(
                 "Stop อาจขายได้ต่ำกว่าราคาที่วางไว้เมื่อราคาเปิดกระโดด "
-                "และบอตยังไม่บันทึกวันซื้อขายจริง"
+                "บอตยังไม่บันทึกวันซื้อขายจริง; "
+                "โปรดอัปเดตเงินสดและหุ้นหลังซื้อขาย"
             )
         else:
             report_lines.append(
@@ -1298,6 +1299,9 @@ def help_text():
         "ควรซื้อวันนี้ / ซื้อวันนี้\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
+        "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
+        "ตั้งหุ้น AOT 100 35.50 — บันทึกจำนวนและต้นทุนเฉลี่ย\n"
+        "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดออกจากพอร์ต\n"
         "รายการติดตาม — ดูหุ้นที่ติดตาม\n"
         "วิเคราะห์ COM7 — ดูแนวโน้มราคา"
         "และข้อมูลงบรายตัว\n"
@@ -1307,7 +1311,8 @@ def help_text():
         "❔ เมนูคำสั่ง\n"
         "พิมพ์: เมนู หรือ ช่วยเหลือ\n\n"
         "หมายเหตุ: บอตให้ข้อมูลประกอบ"
-        "การตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง"
+        "การตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง "
+        "และต้องบันทึกเงินสด/หุ้นใหม่หลังซื้อขายที่โบรกเกอร์"
     )
 
 
@@ -1512,6 +1517,76 @@ def command_reply(user_id, text):
         )
         return "\n".join(lines)
 
+    if text.startswith("ตั้งเงินสด "):
+        parts = text.split()
+        if len(parts) != 2:
+            return "รูปแบบ: ตั้งเงินสด 10000"
+        try:
+            amount = float(parts[1].replace(",", ""))
+        except ValueError:
+            return "ยอดเงินสดต้องเป็นตัวเลขตั้งแต่ 0 บาท"
+        if not np.isfinite(amount) or amount < 0:
+            return "ยอดเงินสดต้องเป็นตัวเลขตั้งแต่ 0 บาท"
+
+        def set_cash(p):
+            p["cash"] = amount
+            p["overnight_plan"] = None
+            p.setdefault("history", []).append({
+                "type": "MANUAL_CASH_BALANCE",
+                "cash": amount,
+                "recorded_at": utc_text(),
+            })
+            return (
+                f"บันทึกเงินสด {amount:,.2f} บาทแล้ว "
+                "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่การฝากเงินจริง) "
+                "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
+            )
+
+        return mutate_portfolio(user_id, set_cash)
+
+    if text.startswith("ตั้งหุ้น "):
+        parts = text.split()
+        if len(parts) != 4:
+            return "รูปแบบ: ตั้งหุ้น AOT 100 35.50 (จำนวนและต้นทุนเฉลี่ย)"
+        symbol = normalize_stock_symbol(parts[1])
+        try:
+            shares = int(parts[2])
+            avg_price = float(parts[3].replace(",", ""))
+        except ValueError:
+            return "จำนวนหุ้นต้องเป็นจำนวนเต็ม และต้นทุนเฉลี่ยต้องเป็นตัวเลข"
+        if (
+            symbol is None or shares < 0 or shares > 1_000_000_000
+            or not np.isfinite(avg_price)
+            or (shares > 0 and avg_price <= 0)
+            or (shares == 0 and avg_price != 0)
+        ):
+            return "ข้อมูลหุ้นไม่ถูกต้อง ลองพิมพ์: ตั้งหุ้น AOT 100 35.50"
+
+        def set_holding(p):
+            holdings = p.setdefault("stocks", {})
+            if shares:
+                holdings[symbol] = {
+                    "shares": shares,
+                    "avg_price": avg_price,
+                }
+            else:
+                holdings.pop(symbol, None)
+            p["overnight_plan"] = None
+            p.setdefault("history", []).append({
+                "type": "MANUAL_HOLDING_BALANCE",
+                "symbol": symbol,
+                "shares": shares,
+                "avg_price": avg_price,
+                "recorded_at": utc_text(),
+            })
+            return (
+                f"บันทึก {symbol} {shares:,} หุ้นแล้ว "
+                "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่คำสั่งซื้อขายจริง) "
+                "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
+            )
+
+        return mutate_portfolio(user_id, set_holding)
+
     if text == "รายการติดตาม":
         watchlist = portfolio.get(
             "watchlist", []
@@ -1547,9 +1622,11 @@ def command_reply(user_id, text):
                 p["watchlist"].append(
                     sym
                 )
+                p["overnight_plan"] = None
                 return (
                     f"เพิ่ม {sym} "
-                    "ลงในรายการติดตามแล้ว"
+                    "ลงในรายการติดตามแล้ว "
+                    "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
                 f"{sym} อยู่ในรายการ"
@@ -1574,9 +1651,11 @@ def command_reply(user_id, text):
                 p["watchlist"].remove(
                     sym
                 )
+                p["overnight_plan"] = None
                 return (
                     f"นำ {sym} ออกจาก"
-                    "รายการติดตามแล้ว"
+                    "รายการติดตามแล้ว "
+                    "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
                 f"ไม่พบ {sym} "
