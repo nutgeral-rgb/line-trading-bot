@@ -1744,6 +1744,274 @@ def handle_backup_file(event):
     )
 
 
+def build_long_term_accumulation_plan(portfolio):
+    """Screen SET100 candidates for a cautious, user-triggered accumulation review."""
+    strategy = portfolio.get("investment_strategy", {})
+    expected_day = latest_completed_set_session(now_bkk()).isoformat()
+    symbols = sorted(set(UNIVERSE) | set(portfolio.get("stocks", {}).keys()))
+    frames = get_market_frames(symbols)
+    ctx = market_context(frames)
+    if not ctx["sufficient"] or ctx["date"] != expected_day:
+        return (
+            "⚠️ ยังจัดแผนสะสมหุ้นไม่ได้ เพราะข้อมูล SET100 "
+            f"ไม่ครบหรือไม่ใช่วันล่าสุด ({ctx.get('date') or 'ไม่มีข้อมูล'})\n"
+            f"ข้อมูลครบ {ctx.get('coverage', 0):.0%} "
+            f"({ctx.get('valid_count', 0)}/{ctx.get('total_count', len(UNIVERSE))}) "
+            "ระบบงดแนะนำจนกว่าจะได้ข้อมูลวันเดียวกันครบเกณฑ์"
+        )
+
+    cash = max(0.0, float(portfolio.get("cash", 0) or 0))
+    holdings = portfolio.get("stocks", {})
+    current_equity_value = 0.0
+    unpriced_holdings = []
+    for symbol, info in holdings.items():
+        shares = int(info.get("shares", 0))
+        if shares <= 0:
+            continue
+        frame = frames.get(symbol)
+        if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
+            unpriced_holdings.append(symbol)
+            continue
+        close_col = "Close" if "Close" in frame.columns else "Adj Close"
+        close = pd.to_numeric(frame[close_col], errors="coerce").dropna()
+        if close.empty or close.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
+            unpriced_holdings.append(symbol)
+            continue
+        current_equity_value += shares * float(close.iloc[-1])
+
+    total_value = cash + current_equity_value
+    starting_capital = float(strategy.get("starting_capital", 10000.0))
+    target_equity = starting_capital * float(
+        strategy.get("target_equity_pct", 30.0)
+    ) / 100.0
+    remaining_target = max(0.0, target_equity - current_equity_value)
+    budget = min(cash, remaining_target)
+
+    header = [
+        "🧭 แผนสะสมหุ้นไทยระยะยาว (ข้อมูลประกอบ ไม่ใช่คำสั่งซื้อ)",
+        f"📅 ราคาปิดข้อมูลล่าสุด: {ctx['date']}",
+        f"ภาพตลาด SET100: Breadth {ctx['breadth']:.1f}% "
+        f"({ctx['valid_count']}/{ctx['total_count']} ตัว)",
+        f"พอร์ตที่ประเมินจากข้อมูลในบอต: {total_value:,.2f} บาท",
+        f"หุ้นตามเป้าหมาย: {target_equity:,.2f} บาท | "
+        f"มูลค่าหุ้นปัจจุบัน: {current_equity_value:,.2f} บาท",
+    ]
+    if unpriced_holdings:
+        return "\n".join(
+            header
+            + [
+                "⚠️ ยังประเมินหุ้นที่ถืออยู่ไม่ได้ครบ: "
+                + ", ".join(unpriced_holdings[:5]),
+                "จึงยังไม่เสนอซื้อเพิ่ม เพื่อไม่คำนวณสัดส่วนผิด",
+            ]
+        )
+    if budget <= 0:
+        return "\n".join(
+            header
+            + [
+                "ยังไม่แนะนำสะสมเพิ่ม เพราะเงินสดที่บันทึกหรือวงเงินหุ้นเป้าหมายไม่เหลือ",
+                "ทบทวนพอร์ตอีกครั้งเดือนหน้า หรืออัปเดตยอดเงินจริงก่อน",
+            ]
+        )
+
+    eligible = []
+    for symbol in UNIVERSE:
+        if symbol in holdings:
+            continue
+        frame = frames.get(symbol)
+        if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
+            continue
+        close_col = "Close" if "Close" in frame.columns else "Adj Close"
+        closes = pd.to_numeric(frame[close_col], errors="coerce").dropna()
+        if len(closes) < 100 or closes.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
+            continue
+        recent = closes.tail(60)
+        close = float(recent.iloc[-1])
+        sma50 = float(recent.tail(50).mean())
+        if not np.isfinite(close) or not np.isfinite(sma50) or close <= sma50:
+            continue
+        volume = pd.to_numeric(frame.loc[recent.index, "Volume"], errors="coerce")
+        traded = (
+            pd.to_numeric(frame.loc[recent.index, "Close"], errors="coerce")
+            * volume
+        ).tail(20).dropna()
+        if len(traded) < 15 or float(traded.median()) < MIN_AVG_DAILY_VALUE_BAHT:
+            continue
+        returns = recent.pct_change().dropna()
+        volatility = float(returns.tail(20).std(ddof=1) * np.sqrt(252))
+        if not np.isfinite(volatility) or volatility <= 0:
+            continue
+        eligible.append({
+            "symbol": symbol,
+            "close": close,
+            "sma50": sma50,
+            "volatility": volatility,
+            "avg_value": float(traded.median()),
+        })
+
+    # Limit fundamental-data calls to a liquid, lower-volatility shortlist.
+    eligible.sort(key=lambda item: (-item["avg_value"], item["volatility"]))
+    shortlist = eligible[:15]
+    if not shortlist:
+        return "\n".join(
+            header
+            + [
+                "⚠️ รอบนี้ไม่มีหุ้นที่ผ่านเกณฑ์แนวโน้มราคาและสภาพคล่อง",
+                "ระบบไม่ฝืนเลือกหุ้น และจะให้ตรวจใหม่ในรอบเดือนถัดไป",
+            ]
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fundamentals = list(executor.map(
+            analyze_fundamentals,
+            [item["symbol"] for item in shortlist],
+        ))
+    candidates = []
+    for item, fundamental in zip(shortlist, fundamentals):
+        available = int(fundamental.get("available", 0) or 0)
+        score = fundamental.get("score")
+        # Require at least three observed positive checks; missing data is not
+        # treated as a pass. This does not include a valuation check.
+        if available < 3 or score is None or int(score) != available:
+            continue
+        item = dict(item)
+        item["fundamental"] = fundamental
+        candidates.append(item)
+
+    candidates.sort(key=lambda item: (
+        -int(item["fundamental"].get("available", 0)),
+        item["volatility"],
+        -item["avg_value"],
+    ))
+    if not candidates:
+        return "\n".join(
+            header
+            + [
+                "⚠️ รอบนี้ไม่มีหุ้นที่ผ่านเกณฑ์พื้นฐานพร้อมข้อมูลอย่างน้อย 3 รายการ",
+                "ข้อมูลพื้นฐานที่ขาดจะไม่นับเป็นคะแนนผ่าน จึงงดแนะนำซื้อ",
+            ]
+        )
+
+    # Keep at least two names to avoid turning the small equity allocation
+    # into a single-stock bet. Use the standard 100-share lot as a conservative
+    # affordability check; verify the actual board lot and fees with the broker.
+    chosen = []
+    per_name_budget = 0.0
+    for count in (3, 2):
+        per_name_budget = budget / count
+        affordable = [
+            item for item in candidates
+            if item["close"] * 100 <= per_name_budget
+        ]
+        if len(affordable) >= count:
+            chosen = affordable[:count]
+            break
+
+    if not chosen:
+        return "\n".join(
+            header
+            + [
+                f"เงินสดที่จัดสรรรอบนี้ได้ {budget:,.2f} บาท "
+                "ยังไม่พอซื้ออย่างน้อย 1 board lot ต่อหุ้นให้กระจายอย่างน้อย 2 บริษัท",
+                "ถือเงินสดสะสมต่อก่อน ไม่จำเป็นต้องรีบซื้อ; "
+                "หากใช้กระดาน Odd Lot ให้ตรวจราคาและค่าธรรมเนียมกับโบรกเกอร์",
+                "หุ้นที่ผ่านเกณฑ์เพื่อเฝ้าดู: "
+                + ", ".join(
+                    f"{item['symbol']} {item['close']:.2f} บาท"
+                    for item in candidates[:3]
+                ),
+            ]
+        )
+
+    lines = header + [
+        f"งบสะสมรอบนี้ไม่เกิน {budget:,.2f} บาท "
+        f"(แบ่งประมาณ {per_name_budget:,.2f} บาทต่อบริษัท)",
+        "หุ้นที่ผ่านหน้าจอข้อมูลรอบนี้:",
+    ]
+    for index, item in enumerate(chosen, 1):
+        shares = int(per_name_budget // (item["close"] * 100)) * 100
+        estimated_cost = shares * item["close"]
+        fundamental = item["fundamental"]
+        lines.append(
+            f"{index}. {item['symbol']} — ราคาปิด {item['close']:.2f} บาท; "
+            f"ประมาณ {shares:,} หุ้น / {estimated_cost:,.2f} บาท "
+            "(ก่อนค่าธรรมเนียม)"
+        )
+        lines.append(
+            f"   พื้นฐานผ่าน {fundamental['score']}/{fundamental['available']}: "
+            f"{fundamental['summary']}"
+        )
+        lines.append(
+            f"   ราคาอยู่เหนือ SMA50; "
+            f"ความผันผวนย้อนหลัง 20 วันต่อปี {item['volatility'] * 100:.1f}%"
+        )
+
+    lines.extend([
+        "แนวทาง: ใช้เป็นรายการพิจารณาสะสมเดือนนี้ ไม่ใช่ให้ซื้อทุกตัวทันที "
+        "ตรวจงบล่าสุด ราคา ณ เวลาส่งคำสั่ง และ board lot/ค่าธรรมเนียมกับโบรกเกอร์",
+        "หน้าจอนี้ไม่ประเมินมูลค่าเหมาะสมหรือรับประกันผลตอบแทน "
+        "และไม่รับประกันว่าพอร์ตจะขาดทุนไม่เกิน 10%",
+    ])
+    return "\n".join(lines)
+
+
+_long_term_users = set()
+
+
+def _prepare_long_term_recommendation(user_id):
+    try:
+        portfolio = get_portfolio(user_id)
+        if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+            result = "ยังไม่ได้เปิดแผนลงทุนระยะยาว จึงไม่ได้จัดแผนสะสมหุ้น"
+        else:
+            result = build_long_term_accumulation_plan(portfolio)
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=result),
+        )
+    except Exception:
+        logger.exception("จัดทำหรือส่งแผนสะสมระยะยาวไม่สำเร็จ")
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(
+                    text="⚠️ รอบนี้จัดทำแผนสะสมหุ้นไม่สำเร็จ "
+                    "ระบบไม่ได้ส่งคำแนะนำซื้อ โปรดลองใหม่ภายหลัง"
+                ),
+            )
+        except Exception:
+            logger.exception("แจ้งผลการจัดทำแผนสะสมระยะยาวไม่สำเร็จ")
+    finally:
+        with _on_demand_lock:
+            _long_term_users.discard(user_id)
+
+
+def queue_long_term_recommendation(user_id):
+    ensure_scheduler()
+    with _on_demand_lock:
+        if user_id in _long_term_users or user_id in _on_demand_users:
+            return False
+        _long_term_users.add(user_id)
+    try:
+        job_id = "long-term-" + hashlib.sha256(
+            user_id.encode("utf-8")
+        ).hexdigest()[:20]
+        scheduler.add_job(
+            _prepare_long_term_recommendation,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
+            args=[user_id],
+            id=job_id,
+            replace_existing=True,
+            max_instances=1,
+        )
+    except Exception:
+        with _on_demand_lock:
+            _long_term_users.discard(user_id)
+        raise
+    return True
+
+
 def help_text():
     return (
         "📊 PORTFOLIO BOT\n"
@@ -1751,6 +2019,7 @@ def help_text():
         "📈 แผนหุ้นและการลงทุน\n"
         "ตั้งแผนลงทุนระยะยาว — ตั้งเป้าหมายหุ้นไทย 30% "
         "และเงินสด/ความเสี่ยงต่ำ 70%\n"
+        "แนะนำหุ้นสะสม — คัดหุ้นเข้าพอร์ต (เรียกทบทวนเดือนละครั้ง)\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและกำไร/ขาดทุนที่ยังไม่รับรู้\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่บันทึกไว้\n"
         "แผนวันนี้ / ควรซื้อวันนี้ — แผนซื้อขายรายวัน "
@@ -1923,6 +2192,30 @@ def command_reply(user_id, text):
             )
 
         return mutate_portfolio(user_id, disable_long_term)
+
+    if text == "แนะนำหุ้นสะสม":
+        strategy = portfolio.get("investment_strategy")
+        if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+            return (
+                "ยังไม่ได้เปิดแผนลงทุนระยะยาว "
+                "พิมพ์ ตั้งแผนลงทุนระยะยาว ก่อน"
+            )
+        try:
+            started = queue_long_term_recommendation(user_id)
+        except Exception:
+            logger.exception("เริ่มจัดแผนสะสมหุ้นไม่สำเร็จ")
+            return "ยังเริ่มจัดแผนสะสมหุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
+        if not started:
+            return (
+                "กำลังวิเคราะห์คำขอล่าสุดอยู่ "
+                "เมื่อเสร็จระบบจะส่งผลให้ใน LINE"
+            )
+        return (
+            "รับคำขอจัดแผนสะสมหุ้นไทยแล้ว "
+            "กำลังตรวจข้อมูลราคาและงบพื้นฐานของ SET100 "
+            "เมื่อเสร็จระบบจะส่งผลในแชตนี้ "
+            "(อาจใช้เวลาสักครู่)"
+        )
 
     if text == "ดูแนวทางลงทุน":
         strategy = portfolio.get("investment_strategy")
