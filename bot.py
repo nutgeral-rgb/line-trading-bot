@@ -1251,6 +1251,11 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
         for user_id in users:
             try:
                 portfolio = get_portfolio(user_id)
+                if portfolio.get("investment_strategy", {}).get("style") == "LONG_TERM":
+                    logger.info(
+                        "ข้ามแผนรายวันสำหรับผู้ใช้โหมดลงทุนระยะยาว"
+                    )
+                    continue
                 previous = portfolio.get(
                     "overnight_plan"
                 )
@@ -1509,6 +1514,9 @@ def send_overnight_plans():
     for user_id in users:
         try:
             portfolio = get_portfolio(user_id)
+            if portfolio.get("investment_strategy", {}).get("style") == "LONG_TERM":
+                skipped += 1
+                continue
             plan = portfolio.get(
                 "overnight_plan"
             )
@@ -1740,13 +1748,14 @@ def help_text():
     return (
         "📊 PORTFOLIO BOT\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📈 แผนหุ้น\n"
-        "แผนวันนี้ — ดูแผนหุ้นสำหรับวันซื้อขายนี้\n"
-        "สถานะแผน — ดูวันที่ข้อมูลและสถานะเตรียมแผน\n"
-        "หรือพิมพ์: แผนเทรดวันนี้ / "
-        "ควรซื้อวันนี้ / ซื้อวันนี้\n"
-        "หากยังไม่มีแผน คำสั่งจะเริ่มวิเคราะห์ในเบื้องหลัง "
-        "และส่งผลให้เมื่อวิเคราะห์เสร็จ\n\n"
+        "📈 แผนหุ้นและการลงทุน\n"
+        "ตั้งแผนลงทุนระยะยาว — ตั้งเป้าหมายหุ้นไทย 30% "
+        "และเงินสด/ความเสี่ยงต่ำ 70%\n"
+        "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและกำไร/ขาดทุนที่ยังไม่รับรู้\n"
+        "ดูแนวทางลงทุน — ดูเป้าหมายที่บันทึกไว้\n"
+        "แผนวันนี้ / ควรซื้อวันนี้ — แผนซื้อขายรายวัน "
+        "(หยุดส่งเมื่อเปิดโหมดระยะยาว)\n"
+        "สถานะแผน — ดูวันที่ข้อมูลและสถานะเตรียมแผน\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
         "สถานะข้อมูล — ดูว่าวิธีเก็บพอร์ตถาวรหรือไม่\n"
@@ -1763,8 +1772,9 @@ def help_text():
         "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n\n"
         "❔ เมนูคำสั่ง\n"
         "พิมพ์: เมนู หรือ ช่วยเหลือ\n\n"
-        "หมายเหตุ: บอตให้ข้อมูลประกอบ"
-        "การตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง "
+        "โหมดระยะยาวเป็นเป้าหมายเริ่มต้น ไม่รับประกันขาดทุนไม่เกิน 10% "
+        "และไม่ส่งคำสั่งซื้อขายจริง "
+        "ข้อมูลราคาพอร์ตอิงข้อมูลจากผู้ให้บริการภายนอก "
         "และต้องบันทึกเงินสด/หุ้นใหม่หลังซื้อขายที่โบรกเกอร์"
     )
 
@@ -1876,6 +1886,136 @@ def command_reply(user_id, text):
 
     portfolio = get_portfolio(user_id)
 
+    if text == "ตั้งแผนลงทุนระยะยาว":
+        def enable_long_term(p):
+            p["investment_strategy"] = {
+                "style": "LONG_TERM",
+                "starting_capital": 10000.0,
+                "max_temporary_loss_pct": 10.0,
+                "target_equity_pct": 30.0,
+                "target_cash_pct": 70.0,
+                "market_scope": "TH",
+                "review_frequency": "monthly",
+                "updated_at": utc_text(),
+            }
+            p["overnight_plan"] = None
+            return (
+                "✅ บันทึกแนวทางลงทุนระยะยาวแล้ว\n"
+                "เงินตั้งต้นอ้างอิง 10,000 บาท\n"
+                "เป้าหมายเบื้องต้น: หุ้นไทย 30% (3,000 บาท) "
+                "และเงินสด/สินทรัพย์ความเสี่ยงต่ำ 70% (7,000 บาท)\n"
+                "ปิดแผนซื้อขายรายวันและการแจ้งหุ้นรายเช้า "
+                "ทบทวนด้วยคำสั่ง ตรวจพอร์ตระยะยาว เดือนละครั้ง\n"
+                "⚠️ สัดส่วนนี้เป็นกรอบตั้งต้น ไม่รับประกันขาดทุนไม่เกิน 10% "
+                "บอตไม่ซื้อขายแทนและไม่ทราบสินทรัพย์นอกพอร์ตที่บันทึก"
+            )
+
+        return mutate_portfolio(user_id, enable_long_term)
+
+    if text == "ยกเลิกแผนลงทุนระยะยาว":
+        def disable_long_term(p):
+            p.pop("investment_strategy", None)
+            p["overnight_plan"] = None
+            return (
+                "ปิดโหมดลงทุนระยะยาวแล้ว "
+                "แผนรายวันจะกลับมาทำงานตามรอบปกติ "
+                "เมื่อมีข้อมูลตลาดเพียงพอ"
+            )
+
+        return mutate_portfolio(user_id, disable_long_term)
+
+    if text == "ดูแนวทางลงทุน":
+        strategy = portfolio.get("investment_strategy")
+        if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+            return (
+                "ยังไม่ได้ตั้งแนวทางระยะยาว "
+                "พิมพ์ ตั้งแผนลงทุนระยะยาว เพื่อเริ่มต้น"
+            )
+        return (
+            "📌 แนวทางลงทุนที่บันทึกไว้\n"
+            "ตลาด: หุ้นไทย\n"
+            f"เงินตั้งต้นอ้างอิง: {strategy.get('starting_capital', 10000):,.0f} บาท\n"
+            f"หุ้นเป้าหมาย: {strategy.get('target_equity_pct', 30):.0f}% | "
+            f"เงินสด/เสี่ยงต่ำ: {strategy.get('target_cash_pct', 70):.0f}%\n"
+            f"ระดับขาดทุนชั่วคราวที่ตั้งใจรับ: "
+            f"{strategy.get('max_temporary_loss_pct', 10):.0f}%\n"
+            "รอบทบทวน: รายเดือน"
+        )
+
+    if text == "ตรวจพอร์ตระยะยาว":
+        strategy = portfolio.get("investment_strategy")
+        if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+            return (
+                "ยังไม่ได้เปิดแนวทางระยะยาว "
+                "พิมพ์ ตั้งแผนลงทุนระยะยาว เพื่อเริ่มต้น"
+            )
+
+        cash = float(portfolio.get("cash", 0) or 0)
+        holdings = portfolio.get("stocks", {})
+        total_cost = sum(
+            float(info.get("shares", 0)) * float(info.get("avg_price", 0))
+            for info in holdings.values()
+        )
+        total_market = 0.0
+        holding_lines = []
+        for symbol, info in holdings.items():
+            shares = int(info.get("shares", 0))
+            avg_price = float(info.get("avg_price", 0))
+            if shares <= 0 or avg_price <= 0:
+                continue
+            frame = get_stock_history(symbol, period="6mo")
+            latest = None
+            if frame is not None and not frame.empty:
+                day = frame.index[-1].strftime("%Y-%m-%d")
+                values = _close_and_sma20(frame, day)
+                if values:
+                    latest = (day, values[0])
+            if latest is None:
+                market_value = shares * avg_price
+                total_market += market_value
+                holding_lines.append(
+                    f"• {symbol}: ไม่มีราคาล่าสุด; แสดงตามต้นทุน "
+                    f"{market_value:,.2f} บาท (ไม่ใช่มูลค่าตลาด)"
+                )
+                continue
+            day, price = latest
+            market_value = shares * price
+            pnl = market_value - (shares * avg_price)
+            total_market += market_value
+            holding_lines.append(
+                f"• {symbol}: {shares:,} หุ้น | ปิด {day} "
+                f"{price:.2f} บาท | กำไร/ขาดทุนค้าง "
+                f"{pnl:+,.2f} บาท ({pnl / (shares * avg_price) * 100:+.1f}%)"
+            )
+
+        total_value = cash + total_market
+        target_equity_pct = float(strategy.get("target_equity_pct", 30))
+        target_equity = total_value * target_equity_pct / 100
+        actual_equity_pct = total_market / total_value * 100 if total_value > 0 else 0
+        lines = [
+            "🧭 ทบทวนพอร์ตระยะยาว",
+            "━━━━━━━━━━━━━━━━━━",
+            f"เงินสดตามบันทึก: {cash:,.2f} บาท",
+            f"มูลค่าหุ้นตามราคาล่าสุดที่หาได้: {total_market:,.2f} บาท",
+            f"รวมที่ประเมินได้: {total_value:,.2f} บาท",
+            f"สัดส่วนหุ้นปัจจุบันโดยประมาณ: {actual_equity_pct:.1f}%",
+            f"กรอบหุ้น {target_equity_pct:.0f}%: ประมาณ {target_equity:,.2f} บาท",
+            "",
+        ]
+        if holding_lines:
+            lines.extend(holding_lines)
+        else:
+            lines.append("ยังไม่มีหุ้นในพอร์ตที่บอตบันทึก")
+        lines.extend([
+            "",
+            "ทบทวนเดือนละครั้งก็เพียงพอสำหรับแนวทางนี้",
+            "ข้อมูลนี้ใช้เฉพาะเงินสด/หุ้นที่บันทึกในบอต "
+            "และไม่ใช่การคำนวณ drawdown ของทั้งบัญชี",
+            "การจำกัดขาดทุน 10% ทำไม่ได้ด้วยการเตือนอย่างเดียว "
+            "ราคาหุ้นอาจลดเกินระดับดังกล่าวได้",
+        ])
+        return "\n".join(lines)
+
     if text == "สถานะข้อมูล":
         storage_name, storage_detail = portfolio_storage_status()
         return (
@@ -1904,6 +2044,13 @@ def command_reply(user_id, text):
         "ควรซื้อวันนี้",
         "ซื้อวันนี้",
     }:
+        if portfolio.get("investment_strategy", {}).get("style") == "LONG_TERM":
+            return (
+                "ℹ️ เปิดแผนลงทุนระยะยาวอยู่ "
+                "จึงปิดคำแนะนำซื้อขายรายวันไว้\n"
+                "พิมพ์ ตรวจพอร์ตระยะยาว เพื่อทบทวนพอร์ต "
+                "หรือ ยกเลิกแผนลงทุนระยะยาว เพื่อกลับไปใช้แผนรายวัน"
+            )
         return read_overnight_plan(
             user_id, retry_no_data=True
         )
