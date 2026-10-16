@@ -457,6 +457,14 @@ def registered_users():
 # =========================================================
 # MARKET DATA & SELECTION
 # =========================================================
+# Keep successful Yahoo responses briefly so scheduled retries and LINE requests
+# do not re-download the same daily bars repeatedly. This cache is intentionally
+# process-local and short-lived; freshness validation still happens downstream.
+_MARKET_DATA_CACHE_TTL_SECONDS = 15 * 60
+_market_data_cache = {}
+_market_data_cache_lock = threading.Lock()
+
+
 def get_stock_history(symbol, period="3mo"):
     try:
         url = (
@@ -472,7 +480,8 @@ def get_stock_history(symbol, period="3mo"):
                 )
             except requests.RequestException as exc:
                 if attempt < 2:
-                    time.sleep(min(1.5 * (2 ** attempt), 5))
+                    delay = min(2 ** attempt, 4) + (attempt * 0.25)
+                    time.sleep(delay)
                     continue
                 logger.warning(
                     "ดึงราคาหุ้นไม่สำเร็จจากเครือข่าย: "
@@ -490,14 +499,11 @@ def get_stock_history(symbol, period="3mo"):
             )
             if retryable and attempt < 2:
                 try:
-                    delay = float(
-                        response.headers.get(
-                            "Retry-After", ""
-                        )
-                    )
+                    delay = float(response.headers.get("Retry-After", ""))
                 except (TypeError, ValueError):
-                    delay = 1.5 * (attempt + 1)
-                time.sleep(min(max(delay, 1), 5))
+                    delay = 2 ** (attempt + 1)
+                # Honor provider backoff while bounding a single wait.
+                time.sleep(min(max(delay, 1), 8))
                 continue
 
             logger.warning(
@@ -547,35 +553,52 @@ def get_market_frames(symbols):
     if not unique_symbols:
         return {}
 
+    now = time.monotonic()
+    frames = {}
+    symbols_to_fetch = []
+    with _market_data_cache_lock:
+        for sym in unique_symbols:
+            cached = _market_data_cache.get(sym)
+            if cached and now - cached[0] < _MARKET_DATA_CACHE_TTL_SECONDS:
+                frames[sym] = cached[1].copy(deep=True)
+            else:
+                symbols_to_fetch.append(sym)
+
     def fetch_one(sym):
         return sym, get_stock_history(sym, period="6mo")
 
-    frames = {}
     short_history = []
-    # ลดคำขอพร้อมกันเพื่อลดโอกาสถูก Yahoo Finance จำกัด
-    worker_count = min(4, len(unique_symbols))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        for sym, df in executor.map(fetch_one, unique_symbols):
-            if df is not None and len(df) >= 20:
-                frames[sym] = df
-            elif df is not None:
-                short_history.append(sym)
+    # Keep provider load modest; failed symbols are retried on the next request.
+    worker_count = min(2, len(symbols_to_fetch))
+    if symbols_to_fetch:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for sym, df in executor.map(fetch_one, symbols_to_fetch):
+                if df is not None and len(df) >= 20:
+                    frames[sym] = df
+                    with _market_data_cache_lock:
+                        _market_data_cache[sym] = (
+                            time.monotonic(),
+                            df.copy(deep=True),
+                        )
+                elif df is not None:
+                    short_history.append(sym)
 
     missing = [
         sym for sym in unique_symbols
         if sym not in frames and sym not in short_history
     ]
     logger.info(
-        "ผลดึงข้อมูลราคา: received=%d requested=%d no_data=%d "
-        "short_history=%d sample=%s",
+        "ผลดึงข้อมูลราคา: received=%d requested=%d fetched=%d cached=%d "
+        "no_data=%d short_history=%d sample=%s",
         len(frames),
         len(unique_symbols),
+        len(symbols_to_fetch),
+        len(unique_symbols) - len(symbols_to_fetch),
         len(missing),
         len(short_history),
         ",".join((missing + short_history)[:5]),
     )
     return frames
-
 
 def normalize_stock_symbol(value):
     if not isinstance(value, str):
