@@ -1859,18 +1859,25 @@ def build_long_term_accumulation_plan(portfolio):
             continue
         close_col = "Close" if "Close" in frame.columns else "Adj Close"
         closes = pd.to_numeric(frame[close_col], errors="coerce").dropna()
-        if len(closes) < 100 or closes.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
+        if len(closes) < 127 or closes.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
             continue
-        recent = closes.tail(60)
-        close = float(recent.iloc[-1])
-        sma50 = float(recent.tail(50).mean())
-        if not np.isfinite(close) or not np.isfinite(sma50) or close <= sma50:
+        close = float(closes.iloc[-1])
+        sma20 = float(closes.tail(20).mean())
+        sma50 = float(closes.tail(50).mean())
+        six_month_return = float(close / closes.iloc[-127] - 1)
+        if (
+            not np.isfinite(close) or not np.isfinite(sma20)
+            or not np.isfinite(sma50) or not np.isfinite(six_month_return)
+            or close <= sma50 or sma20 <= sma50 or six_month_return <= 0
+        ):
             continue
+        recent = closes.tail(20)
         volume = pd.to_numeric(frame.loc[recent.index, "Volume"], errors="coerce")
         traded = (
             pd.to_numeric(frame.loc[recent.index, "Close"], errors="coerce")
             * volume
-        ).tail(20).dropna()
+        ).dropna()
+        traded = traded[traded > 0]
         if len(traded) < 15 or float(traded.median()) < MIN_AVG_DAILY_VALUE_BAHT:
             continue
         returns = recent.pct_change().dropna()
@@ -1880,13 +1887,15 @@ def build_long_term_accumulation_plan(portfolio):
         eligible.append({
             "symbol": symbol,
             "close": close,
+            "sma20": sma20,
             "sma50": sma50,
+            "six_month_return": six_month_return,
             "volatility": volatility,
             "avg_value": float(traded.median()),
         })
 
     # Limit fundamental-data calls to a liquid, lower-volatility shortlist.
-    eligible.sort(key=lambda item: (-item["avg_value"], item["volatility"]))
+    eligible.sort(key=lambda item: (-item["six_month_return"], -item["avg_value"], item["volatility"]))
     shortlist = eligible[:15]
     if not shortlist:
         return "\n".join(
@@ -1906,17 +1915,19 @@ def build_long_term_accumulation_plan(portfolio):
     for item, fundamental in zip(shortlist, fundamentals):
         available = int(fundamental.get("available", 0) or 0)
         score = fundamental.get("score")
-        # Require at least three observed positive checks; missing data is not
-        # treated as a pass. This does not include a valuation check.
-        if available < 3 or score is None or int(score) != available:
+        required = int(fundamental.get("required", 4) or 4)
+        # Require every applicable fundamental check. Missing evidence is not a pass.
+        if available != required or score is None or int(score) != required:
             continue
         item = dict(item)
         item["fundamental"] = fundamental
         candidates.append(item)
 
     candidates.sort(key=lambda item: (
-        -int(item["fundamental"].get("available", 0)),
+        item["fundamental"].get("valuation_concern")
+        if item["fundamental"].get("valuation_concern") is not None else 99,
         item["volatility"],
+        -item["six_month_return"],
         -item["avg_value"],
     ))
     if not candidates:
@@ -1931,6 +1942,20 @@ def build_long_term_accumulation_plan(portfolio):
     # Keep at least two names to avoid turning the small equity allocation
     # into a single-stock bet. Use the standard 100-share lot as a conservative
     # affordability check; verify the actual board lot and fees with the broker.
+    def pick_distinct_sectors(items, count):
+        selected = []
+        sectors = set()
+        for item in items:
+            sector = str(item["fundamental"].get("sector") or "").strip().lower()
+            sector_key = sector or "__unknown__"
+            if sector_key in sectors:
+                continue
+            selected.append(item)
+            sectors.add(sector_key)
+            if len(selected) == count:
+                return selected
+        return []
+
     chosen = []
     per_name_budget = 0.0
     for count in (3, 2):
@@ -1939,16 +1964,19 @@ def build_long_term_accumulation_plan(portfolio):
             item for item in candidates
             if item["close"] * 100 <= per_name_budget
         ]
-        if len(affordable) >= count:
-            chosen = affordable[:count]
+        chosen = pick_distinct_sectors(affordable, count)
+        if chosen:
             break
 
     if not chosen:
         odd_lot_budget = budget / 2
-        odd_lot_candidates = [
-            item for item in candidates
-            if item["close"] <= odd_lot_budget
-        ][:2]
+        odd_lot_candidates = pick_distinct_sectors(
+            [
+                item for item in candidates
+                if item["close"] <= odd_lot_budget
+            ],
+            2,
+        )
         if len(odd_lot_candidates) == 2:
             lines = header + [
                 f"งบสูงสุดรอบนี้ {budget:,.2f} บาท "
@@ -1964,9 +1992,12 @@ def build_long_term_accumulation_plan(portfolio):
                     f"({estimated_cost:,.2f} บาท ก่อนค่าธรรมเนียม)"
                 )
                 lines.append(
-                    f"   พื้นฐานผ่าน {item['fundamental']['score']}/"
-                    f"{item['fundamental']['available']}: "
-                    f"{item['fundamental']['summary']}"
+                    f"   กลุ่มธุรกิจ: {item['fundamental'].get('sector') or 'ไม่ทราบ'} | "
+                    f"แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}% | "
+                    f"สภาพคล่องมัธยฐาน {item['avg_value']:,.0f} บาท/วัน"
+                )
+                lines.append(
+                    f"   พื้นฐาน {item['fundamental']['summary']}"
                 )
             lines.extend([
                 "Odd Lot อาจมีสภาพคล่อง/ส่วนต่างราคาและโอกาสจับคู่ต่างจากกระดานหลัก "
@@ -2005,19 +2036,26 @@ def build_long_term_accumulation_plan(portfolio):
             "(ก่อนค่าธรรมเนียม)"
         )
         lines.append(
-            f"   พื้นฐานผ่าน {fundamental['score']}/{fundamental['available']}: "
-            f"{fundamental['summary']}"
+            f"   กลุ่มธุรกิจ: {fundamental.get('sector') or 'ไม่ทราบ'} | "
+            f"พื้นฐาน: {fundamental['summary']}"
         )
         lines.append(
-            f"   ราคาอยู่เหนือ SMA50; "
+            f"   แนวโน้ม: ปิดเหนือ SMA50 และ SMA20 ({item['sma50']:.2f}/"
+            f"{item['sma20']:.2f}); ผลตอบแทน 6 เดือน "
+            f"{item['six_month_return'] * 100:+.1f}%"
+        )
+        lines.append(
+            f"   สภาพคล่อง: มูลค่าซื้อขายมัธยฐาน 20 วัน "
+            f"{item['avg_value']:,.0f} บาท/วัน; "
             f"ความผันผวนย้อนหลัง 20 วันต่อปี {item['volatility'] * 100:.1f}%"
         )
 
     lines.extend([
         "แนวทาง: ใช้เป็นรายการพิจารณาสะสมเดือนนี้ ไม่ใช่ให้ซื้อทุกตัวทันที "
         "ตรวจงบล่าสุด ราคา ณ เวลาส่งคำสั่ง และ board lot/ค่าธรรมเนียมกับโบรกเกอร์",
-        "หน้าจอนี้ไม่ประเมินมูลค่าเหมาะสมหรือรับประกันผลตอบแทน "
-        "และไม่รับประกันว่าพอร์ตจะขาดทุนไม่เกิน 10%",
+        "P/E และ P/B เป็นเพียงธงเตือนเบื้องต้น ไม่ใช่มูลค่าเหมาะสม; "
+        "ควรตรวจงบ/หมายเหตุและเปรียบเทียบกลุ่มธุรกิจ",
+        "หน้าจอนี้ไม่รับประกันผลตอบแทน หรือจำกัดขาดทุนไว้ที่ 10%",
     ])
     return "\n".join(lines)
 
