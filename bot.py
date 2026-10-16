@@ -70,7 +70,6 @@ _portfolio_lock = threading.RLock()
 _portfolio_database_lock = threading.Lock()
 _portfolio_database_ready = False
 
-INDEX_SYMBOL = "^SET.BK"
 UNIVERSE = SET100_SYMBOLS
 
 MAX_POSITIONS = 5
@@ -330,9 +329,21 @@ def get_stock_history(symbol, period="3mo"):
         headers = {"User-Agent": "Mozilla/5.0"}
         response = None
         for attempt in range(3):
-            response = requests.get(
-                url, headers=headers, timeout=10
-            )
+            try:
+                response = requests.get(
+                    url, headers=headers, timeout=10
+                )
+            except requests.RequestException as exc:
+                if attempt < 2:
+                    time.sleep(min(1.5 * (2 ** attempt), 5))
+                    continue
+                logger.warning(
+                    "ดึงราคาหุ้นไม่สำเร็จจากเครือข่าย: "
+                    "symbol=%s error=%s",
+                    symbol,
+                    type(exc).__name__,
+                )
+                return None
             if response.status_code == 200:
                 break
 
@@ -387,7 +398,10 @@ def get_stock_history(symbol, period="3mo"):
         df.dropna(subset=["Close", "Adj Close"], inplace=True)
         return df if not df.empty else None
     except Exception:
-        logger.exception("ดึงหรือแปลงข้อมูลราคาหุ้นหนึ่งรายการไม่สำเร็จ")
+        logger.exception(
+            "ดึงหรือแปลงข้อมูลราคาหนึ่งรายการไม่สำเร็จ: symbol=%s",
+            symbol,
+        )
         return None
 
 
@@ -400,12 +414,26 @@ def get_market_frames(symbols):
         return sym, get_stock_history(sym, period="6mo")
 
     frames = {}
+    short_history = []
     # ลดคำขอพร้อมกันเพื่อลดโอกาสถูก Yahoo Finance จำกัด
     worker_count = min(4, len(unique_symbols))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for sym, df in executor.map(fetch_one, unique_symbols):
             if df is not None and len(df) >= 20:
                 frames[sym] = df
+            elif df is not None:
+                short_history.append(sym)
+
+    missing = [sym for sym in unique_symbols if sym not in frames]
+    logger.info(
+        "ผลดึงข้อมูลราคา: received=%d requested=%d missing=%d "
+        "short_history=%d sample=%s",
+        len(frames),
+        len(unique_symbols),
+        len(missing),
+        len(short_history),
+        ",".join((missing + short_history)[:5]),
+    )
     return frames
 
 
@@ -573,8 +601,20 @@ def _portfolio_market_value(portfolio, frames, as_of):
 
 
 def market_context(frames):
-    idx_df = frames.get(INDEX_SYMBOL)
-    if idx_df is None or len(idx_df) < 20:
+    """Measure SET100 breadth using constituents on a common trading date.
+
+    The SET index feed is optional; missing index data must not block a
+    breadth calculation that is already based on the SET100 constituents.
+    """
+    candidate_dates = set()
+    for sym in UNIVERSE:
+        frame = frames.get(sym)
+        if frame is not None and not frame.empty:
+            candidate_dates.add(
+                frame.index[-1].strftime("%Y-%m-%d")
+            )
+
+    if not candidate_dates:
         return {
             "sufficient": False,
             "date": "",
@@ -586,47 +626,60 @@ def market_context(frames):
             "missing_symbols": list(UNIVERSE),
         }
 
-    as_of = idx_df.index[-1].strftime("%Y-%m-%d")
-    valid = {}
-    for sym in UNIVERSE:
-        values = _close_and_sma20(frames.get(sym), as_of)
-        if values is not None:
-            valid[sym] = values
+    sorted_dates = sorted(candidate_dates, reverse=True)
+    as_of = sorted_dates[0]
+    valid = {
+        sym: values
+        for sym in UNIVERSE
+        if (values := _close_and_sma20(frames.get(sym), as_of))
+        is not None
+    }
+
+    for candidate in sorted_dates:
+        candidate_valid = {
+            sym: values
+            for sym in UNIVERSE
+            if (values := _close_and_sma20(
+                frames.get(sym), candidate
+            )) is not None
+        }
+        candidate_coverage = (
+            len(candidate_valid) / len(UNIVERSE)
+            if UNIVERSE
+            else 0
+        )
+        if candidate_coverage >= MIN_UNIVERSE_COVERAGE:
+            as_of = candidate
+            valid = candidate_valid
+            break
+        if candidate == sorted_dates[0]:
+            as_of = candidate
+            valid = candidate_valid
 
     coverage = (
         len(valid) / len(UNIVERSE) if UNIVERSE else 0
     )
-    if coverage < MIN_UNIVERSE_COVERAGE:
-        return {
-            "sufficient": False,
-            "date": as_of,
-            "breadth": 0,
-            "coverage": coverage,
-            "pass": False,
-            "valid_count": len(valid),
-            "total_count": len(UNIVERSE),
-            "missing_symbols": [
-                sym for sym in UNIVERSE if sym not in valid
-            ],
-        }
-
+    sufficient = coverage >= MIN_UNIVERSE_COVERAGE
     above_count = sum(
         close > sma20 for close, sma20 in valid.values()
     )
-    breadth = above_count / len(valid) * 100
+    breadth = (
+        above_count / len(valid) * 100
+        if sufficient and valid
+        else 0
+    )
     return {
-        "sufficient": True,
+        "sufficient": sufficient,
         "date": as_of,
         "breadth": breadth,
         "coverage": coverage,
-        "pass": breadth >= 50.0,
+        "pass": sufficient and breadth >= 50.0,
         "valid_count": len(valid),
         "total_count": len(UNIVERSE),
         "missing_symbols": [
             sym for sym in UNIVERSE if sym not in valid
         ],
     }
-
 
 def build_daily_plan(portfolio, frames=None):
     symbols = combined_universe(portfolio)
@@ -636,7 +689,6 @@ def build_daily_plan(portfolio, frames=None):
                 UNIVERSE
                 + symbols
                 + list(portfolio["stocks"])
-                + [INDEX_SYMBOL]
             )
         )
         frames = get_market_frames(symbols_to_load)
@@ -842,6 +894,34 @@ def _prepare_on_demand(user_id, data_day):
             target_data_day=data_day,
             only_user_ids=[user_id],
         )
+        portfolio = get_portfolio(user_id)
+        plan = portfolio.get("overnight_plan")
+        if (
+            isinstance(plan, dict)
+            and plan.get("data_date") == data_day.isoformat()
+            and plan.get("status") in {"READY", "NO_DATA"}
+        ):
+            result_text = read_overnight_plan(user_id)
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text=result_text),
+            )
+            if plan.get("status") == "NO_DATA":
+                def mark_failure_notified(p):
+                    current_plan = p.get("overnight_plan")
+                    if (
+                        isinstance(current_plan, dict)
+                        and current_plan.get("status") == "NO_DATA"
+                        and current_plan.get("data_date")
+                        == data_day.isoformat()
+                    ):
+                        current_plan["failure_notified_for"] = (
+                            current_plan.get("delivery_day")
+                        )
+
+                mutate_portfolio(user_id, mark_failure_notified)
+    except Exception:
+        logger.exception("ส่งผลการเตรียมแผนตามคำขอไม่สำเร็จ")
     finally:
         with _on_demand_lock:
             _on_demand_users.discard(user_id)
@@ -873,6 +953,27 @@ def queue_on_demand_plan(user_id):
             _on_demand_users.discard(user_id)
         raise
     return data_day, True
+
+
+def _format_plan_failure(plan, title="⚠️ รอบล่าสุดยังสร้างแผนไม่ได้"):
+    diagnostic = plan.get("diagnostic", {})
+    coverage = float(diagnostic.get("coverage", 0) or 0)
+    actual_date = diagnostic.get("actual_date") or "ไม่พบข้อมูลราคาหุ้น"
+    missing_sample = diagnostic.get("missing_sample", [])
+    response = (
+        f"{title}\n"
+        f"วันที่ราคาที่พบ: {actual_date}\n"
+        f"ข้อมูลหุ้นครบ {coverage:.0%} "
+        f"({diagnostic.get('valid_count', 0)}/"
+        f"{diagnostic.get('total_count', len(UNIVERSE))} ตัว)\n"
+        f"สาเหตุ: {diagnostic.get('reason', 'ข้อมูลไม่ครบ')}"
+    )
+    if missing_sample:
+        response += (
+            "\nตัวอย่างหุ้นที่ข้อมูลขาด: "
+            + ", ".join(missing_sample[:5])
+        )
+    return response
 
 
 def read_overnight_plan(user_id):
@@ -918,34 +1019,27 @@ def read_overnight_plan(user_id):
             "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ"
         )
 
-    if plan.get("status") == "NO_DATA":
-        diagnostic = plan.get("diagnostic", {})
-        coverage = float(
-            diagnostic.get("coverage", 0) or 0
-        )
-        actual_date = (
-            diagnostic.get("actual_date")
-            or "ไม่พบข้อมูลดัชนี"
-        )
-        missing_sample = diagnostic.get(
-            "missing_sample", []
-        )
-        response = (
-            "⚠️ รอบล่าสุดยังสร้างแผนไม่ได้\n"
-            f"วันที่ราคาที่พบ: {actual_date}\n"
-            f"ข้อมูลหุ้นครบ {coverage:.0%} "
-            f"({diagnostic.get('valid_count', 0)}/"
-            f"{diagnostic.get('total_count', len(UNIVERSE))} ตัว)\n"
-            f"สาเหตุ: {diagnostic.get('reason', 'ข้อมูลไม่ครบ')}"
-        )
-        if missing_sample:
-            response += (
-                "\nตัวอย่างหุ้นที่ข้อมูลขาด: "
-                + ", ".join(missing_sample[:5])
+    if status == "NO_DATA":
+        try:
+            expected_data_day = latest_completed_set_session(
+                now_bkk()
+            ).isoformat()
+        except Exception:
+            expected_data_day = None
+        if plan.get("data_date") == expected_data_day:
+            return (
+                _format_plan_failure(plan)
+                + "\nระบบจะลองใหม่ตามรอบเตรียมแผนถัดไป"
             )
+        try:
+            data_day, _ = queue_on_demand_plan(user_id)
+        except Exception:
+            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
+            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
         return (
-            response
-            + "\nระบบจะลองใหม่ในรอบเตรียมแผนถัดไป"
+            f"ข้อมูลแผนเดิมเก่าแล้ว กำลังวิเคราะห์จากราคาปิด "
+            f"{data_day.isoformat()}\n"
+            "ระหว่างนี้ยังไม่มีคำแนะนำซื้อที่ตรวจสอบได้"
         )
 
     if status == "READY":
@@ -1030,7 +1124,7 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
             )
             return
 
-        symbols = set(UNIVERSE + [INDEX_SYMBOL])
+        symbols = set(UNIVERSE)
         for portfolio in pending.values():
             symbols.update(
                 combined_universe(portfolio)
@@ -1062,15 +1156,12 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
             != current_day.isoformat()
         ):
             missing = ctx.get("missing_symbols", [])
-            reason = (
-                "ไม่มีข้อมูลดัชนี SET"
-                if not ctx["date"]
-                else (
-                    "ข้อมูลหุ้นหลักไม่ครบ"
-                    if not ctx["sufficient"]
-                    else "วันที่ราคายังไม่ตรงกับวันที่ต้องใช้"
-                )
-            )
+            if not ctx["date"]:
+                reason = "ไม่มีข้อมูลราคาหุ้น SET100"
+            elif not ctx["sufficient"]:
+                reason = "ข้อมูลหุ้น SET100 ไม่ครบเกณฑ์"
+            else:
+                reason = "ข้อมูลราคาล่าสุดยังไม่ถึงวันที่ต้องใช้"
             diagnostic = {
                 "reason": reason,
                 "coverage": ctx["coverage"],
@@ -1253,6 +1344,7 @@ def send_overnight_plans():
 
     sent = 0
     failed = 0
+    notified_no_data = 0
     skipped = 0
 
     for user_id in users:
@@ -1264,12 +1356,44 @@ def send_overnight_plans():
             if not isinstance(plan, dict):
                 skipped += 1
                 continue
-            if (
-                plan.get("delivery_day")
-                != today.isoformat()
-                or plan.get("status")
-                != "READY"
-            ):
+            if plan.get("delivery_day") != today.isoformat():
+                skipped += 1
+                continue
+
+            if plan.get("status") == "NO_DATA":
+                if plan.get("failure_notified_for") == today.isoformat():
+                    skipped += 1
+                    continue
+                message = (
+                    _format_plan_failure(
+                        plan,
+                        title="⚠️ วันนี้ระบบยังจัดทำแผนหุ้นไม่ได้",
+                    )
+                    + "\nระบบงดแนะนำจนกว่าจะได้ข้อมูลครบ "
+                    "ลองพิมพ์ ควรซื้อวันนี้ เพื่อตรวจใหม่"
+                )
+                line_bot_api.push_message(
+                    user_id,
+                    TextSendMessage(text=message),
+                )
+
+                def mark_failure_notified(p):
+                    current_plan = p.get("overnight_plan")
+                    if (
+                        isinstance(current_plan, dict)
+                        and current_plan.get("status") == "NO_DATA"
+                        and current_plan.get("delivery_day")
+                        == today.isoformat()
+                    ):
+                        current_plan["failure_notified_for"] = (
+                            today.isoformat()
+                        )
+
+                mutate_portfolio(user_id, mark_failure_notified)
+                notified_no_data += 1
+                continue
+
+            if plan.get("status") != "READY":
                 skipped += 1
                 continue
 
@@ -1346,9 +1470,10 @@ def send_overnight_plans():
 
     logger.info(
         "จบรอบส่งแผน: sent=%d "
-        "failed=%d skipped=%d "
+        "notified_no_data=%d failed=%d skipped=%d "
         "registered=%d",
         sent,
+        notified_no_data,
         failed,
         skipped,
         len(users),
@@ -1805,6 +1930,17 @@ def ensure_scheduler():
             hour="19,20,21",
             minute=15,
             id="prepare-overnight-plan",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.add_job(
+            prepare_overnight_plans,
+            "cron",
+            day_of_week="mon-fri",
+            hour=8,
+            minute="15,20,25",
+            id="prepare-overnight-plan-morning-retry",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
