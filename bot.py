@@ -971,7 +971,7 @@ def _format_plan_failure(plan, title="⚠️ รอบล่าสุดยั�
     return response
 
 
-def read_overnight_plan(user_id):
+def read_overnight_plan(user_id, retry_no_data=False):
     portfolio = get_portfolio(user_id)
     plan = portfolio.get("overnight_plan")
 
@@ -998,43 +998,47 @@ def read_overnight_plan(user_id):
             ).isoformat()
         except Exception:
             expected_data_day = None
+
         if plan.get("data_date") == expected_data_day:
+            if retry_no_data:
+                try:
+                    data_day, started = queue_on_demand_plan(user_id)
+                except Exception:
+                    logger.exception(
+                        "เริ่มเตรียมแผนตามคำขอไม่สำเร็จ"
+                    )
+                    return (
+                        "ยังเริ่มวิเคราะห์หุ้นไม่ได้ "
+                        "โปรดลองอีกครั้งภายหลัง"
+                    )
+                action = "เริ่มตรวจข้อมูลใหม่" if started else "กำลังตรวจข้อมูลอยู่"
+                return (
+                    f"รอบก่อนข้อมูลไม่พอ {action} "
+                    f"จากราคาปิด {data_day.isoformat()} "
+                    "เมื่อเสร็จระบบจะแจ้งผลใน LINE"
+                )
             return (
                 _format_plan_failure(plan)
                 + "\nระบบจะลองใหม่ตามรอบเตรียมแผนถัดไป"
             )
-        try:
-            data_day, _ = queue_on_demand_plan(user_id)
-        except Exception:
-            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
-            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
-        return (
-            f"ข้อมูลแผนเดิมเก่าแล้ว กำลังวิเคราะห์จากราคาปิด "
-            f"{data_day.isoformat()}\n"
-            "ระหว่างนี้ยังไม่มีคำแนะนำซื้อที่ตรวจสอบได้"
-        )
 
-    if delivery_day != today:
-        if (
-            status == "READY"
-            and isinstance(delivery_day, str)
-            and delivery_day > today
-        ):
+        if not retry_no_data:
             return (
-                "เตรียมแผนจากราคาปิด "
-                f"{plan.get('data_date', 'ไม่ทราบ')} แล้ว\n"
-                "รอวันซื้อขาย "
-                f"{delivery_day}"
+                _format_plan_failure(plan)
+                + "\nข้อมูลชุดนี้ไม่ใช่รอบล่าสุด "
+                "พิมพ์ ควรซื้อวันนี้ เพื่อเริ่มวิเคราะห์ใหม่"
             )
+
         try:
-            data_day, _ = queue_on_demand_plan(user_id)
+            data_day, started = queue_on_demand_plan(user_id)
         except Exception:
             logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
             return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
+        action = "เริ่มตรวจข้อมูลใหม่" if started else "กำลังตรวจข้อมูลอยู่"
         return (
-            f"แผนเดิมไม่ใช่ของวันนี้ กำลังวิเคราะห์จากราคาปิด "
-            f"{data_day.isoformat()}\n"
-            "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ"
+            f"ข้อมูลแผนเดิมเก่าแล้ว {action} "
+            f"จากราคาปิด {data_day.isoformat()} "
+            "เมื่อเสร็จระบบจะแจ้งผลใน LINE"
         )
 
     if status == "READY":
@@ -1523,7 +1527,7 @@ def help_text():
         "หรือพิมพ์: แผนเทรดวันนี้ / "
         "ควรซื้อวันนี้ / ซื้อวันนี้\n"
         "หากยังไม่มีแผน คำสั่งจะเริ่มวิเคราะห์ในเบื้องหลัง "
-        "แล้วให้พิมพ์ซ้ำเพื่ออ่านผล\n\n"
+        "และส่งผลให้เมื่อวิเคราะห์เสร็จ\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
         "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
@@ -1657,7 +1661,7 @@ def command_reply(user_id, text):
         "ซื้อวันนี้",
     }:
         return read_overnight_plan(
-            user_id
+            user_id, retry_no_data=True
         )
 
     if text == "สถานะแผน":
