@@ -424,9 +424,12 @@ def get_market_frames(symbols):
             elif df is not None:
                 short_history.append(sym)
 
-    missing = [sym for sym in unique_symbols if sym not in frames]
+    missing = [
+        sym for sym in unique_symbols
+        if sym not in frames and sym not in short_history
+    ]
     logger.info(
-        "ผลดึงข้อมูลราคา: received=%d requested=%d missing=%d "
+        "ผลดึงข้อมูลราคา: received=%d requested=%d no_data=%d "
         "short_history=%d sample=%s",
         len(frames),
         len(unique_symbols),
@@ -601,18 +604,18 @@ def _portfolio_market_value(portfolio, frames, as_of):
 
 
 def market_context(frames):
-    """Measure SET100 breadth using constituents on a common trading date.
-
-    The SET index feed is optional; missing index data must not block a
-    breadth calculation that is already based on the SET100 constituents.
-    """
+    """Measure SET100 breadth from constituents sharing a qualified date."""
     candidate_dates = set()
+    valid_by_date = {}
     for sym in UNIVERSE:
         frame = frames.get(sym)
-        if frame is not None and not frame.empty:
-            candidate_dates.add(
-                frame.index[-1].strftime("%Y-%m-%d")
-            )
+        if frame is None or frame.empty:
+            continue
+        as_of = frame.index[-1].strftime("%Y-%m-%d")
+        candidate_dates.add(as_of)
+        values = _close_and_sma20(frame, as_of)
+        if values is not None:
+            valid_by_date.setdefault(as_of, {})[sym] = values
 
     if not candidate_dates:
         return {
@@ -626,36 +629,22 @@ def market_context(frames):
             "missing_symbols": list(UNIVERSE),
         }
 
-    sorted_dates = sorted(candidate_dates, reverse=True)
-    as_of = sorted_dates[0]
-    valid = {
-        sym: values
-        for sym in UNIVERSE
-        if (values := _close_and_sma20(frames.get(sym), as_of))
-        is not None
-    }
-
-    for candidate in sorted_dates:
-        candidate_valid = {
-            sym: values
-            for sym in UNIVERSE
-            if (values := _close_and_sma20(
-                frames.get(sym), candidate
-            )) is not None
-        }
-        candidate_coverage = (
-            len(candidate_valid) / len(UNIVERSE)
-            if UNIVERSE
-            else 0
+    qualified_dates = [
+        day
+        for day, valid in valid_by_date.items()
+        if UNIVERSE
+        and len(valid) / len(UNIVERSE) >= MIN_UNIVERSE_COVERAGE
+    ]
+    if qualified_dates:
+        as_of = max(qualified_dates)
+    else:
+        # Report the date with the most usable rows; break ties toward newer data.
+        as_of = max(
+            candidate_dates,
+            key=lambda day: (len(valid_by_date.get(day, {})), day),
         )
-        if candidate_coverage >= MIN_UNIVERSE_COVERAGE:
-            as_of = candidate
-            valid = candidate_valid
-            break
-        if candidate == sorted_dates[0]:
-            as_of = candidate
-            valid = candidate_valid
 
+    valid = valid_by_date.get(as_of, {})
     coverage = (
         len(valid) / len(UNIVERSE) if UNIVERSE else 0
     )
@@ -901,7 +890,13 @@ def _prepare_on_demand(user_id, data_day):
             and plan.get("data_date") == data_day.isoformat()
             and plan.get("status") in {"READY", "NO_DATA"}
         ):
-            result_text = read_overnight_plan(user_id)
+            if plan.get("status") == "NO_DATA":
+                result_text = (
+                    _format_plan_failure(plan)
+                    + "\nระบบจะลองใหม่ตามรอบเตรียมแผนถัดไป"
+                )
+            else:
+                result_text = read_overnight_plan(user_id)
             line_bot_api.push_message(
                 user_id,
                 TextSendMessage(text=result_text),
@@ -996,29 +991,6 @@ def read_overnight_plan(user_id):
     delivery_day = plan.get("delivery_day")
     status = plan.get("status")
 
-    if delivery_day != today:
-        if (
-            status == "READY"
-            and isinstance(delivery_day, str)
-            and delivery_day > today
-        ):
-            return (
-                "เตรียมแผนจากราคาปิด "
-                f"{plan.get('data_date', 'ไม่ทราบ')} แล้ว\n"
-                "รอวันซื้อขาย "
-                f"{delivery_day}"
-            )
-        try:
-            data_day, _ = queue_on_demand_plan(user_id)
-        except Exception:
-            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
-            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
-        return (
-            f"แผนเดิมไม่ใช่ของวันนี้ กำลังวิเคราะห์จากราคาปิด "
-            f"{data_day.isoformat()}\n"
-            "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ"
-        )
-
     if status == "NO_DATA":
         try:
             expected_data_day = latest_completed_set_session(
@@ -1040,6 +1012,29 @@ def read_overnight_plan(user_id):
             f"ข้อมูลแผนเดิมเก่าแล้ว กำลังวิเคราะห์จากราคาปิด "
             f"{data_day.isoformat()}\n"
             "ระหว่างนี้ยังไม่มีคำแนะนำซื้อที่ตรวจสอบได้"
+        )
+
+    if delivery_day != today:
+        if (
+            status == "READY"
+            and isinstance(delivery_day, str)
+            and delivery_day > today
+        ):
+            return (
+                "เตรียมแผนจากราคาปิด "
+                f"{plan.get('data_date', 'ไม่ทราบ')} แล้ว\n"
+                "รอวันซื้อขาย "
+                f"{delivery_day}"
+            )
+        try:
+            data_day, _ = queue_on_demand_plan(user_id)
+        except Exception:
+            logger.exception("เริ่มเตรียมแผนตามคำขอไม่สำเร็จ")
+            return "ยังเริ่มวิเคราะห์หุ้นไม่ได้ โปรดลองอีกครั้งภายหลัง"
+        return (
+            f"แผนเดิมไม่ใช่ของวันนี้ กำลังวิเคราะห์จากราคาปิด "
+            f"{data_day.isoformat()}\n"
+            "พิมพ์ ควรซื้อวันนี้ อีกครั้งหลังระบบเตรียมแผนเสร็จ"
         )
 
     if status == "READY":
