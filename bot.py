@@ -1068,7 +1068,7 @@ def read_overnight_plan(user_id):
 
 
 def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
-    current_day = target_data_day or now_bkk().date()
+    current_day = target_data_day or latest_completed_set_session(now_bkk())
     logger.info(
         "เริ่มรอบเตรียมแผน: data_date=%s",
         current_day,
