@@ -112,6 +112,13 @@ def backtest(
     evaluation_start: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Run daily close-signal / next-open rotation with cash and trading costs."""
+    if (
+        top_n < 1 or sma_days < 2 or not 0 <= breadth_threshold <= 100
+        or not 0 <= min_coverage <= 1 or min_avg_daily_value < 0
+        or commission_rate < 0 or vat_rate < 0 or slippage_bps < 0
+        or initial_cash <= 0
+    ):
+        raise ValueError("Invalid strategy, cost, or initial cash parameter")
     if INDEX_SYMBOL not in frames:
         raise ValueError(f"Missing benchmark/index data: {INDEX_SYMBOL}")
     dates = frames[INDEX_SYMBOL].index.sort_values().unique()
@@ -173,29 +180,40 @@ def backtest(
             symbol: value / overnight_factor
             for symbol, value in opened_weights.items()
         } if overnight_factor > 0 else {}
-        actual_targets = [s for s in targets if s in open_prices]
-        target_weights = {
-            symbol: 1.0 / len(actual_targets) for symbol in actual_targets
-        } if actual_targets else {}
-
-        turnover = sum(
-            abs(target_weights.get(symbol, 0.0) - current_open_weights.get(symbol, 0.0))
-            for symbol in set(target_weights) | set(current_open_weights)
-        )
-        total_turnover += turnover
-        if tuple(actual_targets) != previous_targets:
+        # A missing next-session quote cannot be treated as a free sale of an
+        # existing holding, or as a buy at an unknown price. Postpone trading.
+        can_rebalance = all(s in open_prices for s in set(weights) | set(targets))
+        if can_rebalance and tuple(targets) != previous_targets:
+            actual_targets = targets
+            target_weights = {
+                symbol: 1.0 / len(targets) for symbol in targets
+            } if targets else {}
+            turnover = sum(
+                abs(target_weights.get(symbol, 0.0) - current_open_weights.get(symbol, 0.0))
+                for symbol in set(target_weights) | set(current_open_weights)
+            )
+            total_turnover += turnover
             rebalance_count += 1
             previous_targets = tuple(actual_targets)
+        else:
+            actual_targets = list(weights)
+            target_weights = current_open_weights
+            turnover = 0.0
 
         equity_after_cost = equity_open * max(0.0, 1.0 - turnover * cost_rate)
-        close_factor = 1.0
-        if target_weights:
-            close_factor = sum(
-                weight * (close_prices[symbol] / open_prices[symbol])
-                for symbol, weight in target_weights.items()
+        closing_values = {
+            symbol: equity_after_cost * weight * (
+                close_prices[symbol] / open_prices[symbol]
+                if symbol in open_prices else 1.0
             )
-        equity = equity_after_cost * close_factor
-        weights = target_weights
+            for symbol, weight in target_weights.items()
+        }
+        cash_after_cost = equity_after_cost * max(0.0, 1.0 - sum(target_weights.values()))
+        equity = cash_after_cost + sum(closing_values.values())
+        # Carry actual end-of-day weights into the next session.
+        weights = {
+            symbol: value / equity for symbol, value in closing_values.items()
+        } if equity > 0 else {}
         curve.append({
             "Date": day.strftime("%Y-%m-%d"),
             "Equity": equity,
@@ -321,6 +339,38 @@ def _self_test() -> None:
     )
     assert metrics["final_equity"] > 10_000, metrics
     assert metrics["average_daily_turnover"] > 0, metrics
+
+    # A price jump changes position weights before the next overnight gap.
+    # A missing opening quote must not create a fictional sale.
+    gap_days = pd.bdate_range("2024-01-01", periods=66)
+    gap_frames = {}
+    for symbol, slope in (("A.BK", 0.2), ("B.BK", 0.1)):
+        closes = [100 + i * slope for i in range(66)]
+        opens = closes.copy()
+        if symbol == "A.BK":
+            closes[64] = opens[64] * 2
+            opens[65] = closes[64] * 1.5
+            closes[65] = opens[65]
+        gap_frames[symbol] = pd.DataFrame({
+            "Open": opens, "Close": closes, "Volume": [100_000] * 66,
+        }, index=gap_days)
+    gap_frames[INDEX_SYMBOL] = pd.DataFrame({
+        "Open": [100] * 66, "Close": [100] * 66,
+    }, index=gap_days)
+    gap_kwargs = dict(
+        universe=["A.BK", "B.BK"], top_n=2, min_avg_daily_value=0,
+        commission_rate=0, slippage_bps=0, initial_cash=10_000,
+        evaluation_start=gap_days[64].date().isoformat(),
+    )
+    gap_curve, _ = backtest(gap_frames, **gap_kwargs)
+    expected = 15_000 * ((2 / 3) * 1.5 + (1 / 3) * (106.5 / 106.4))
+    assert math.isclose(gap_curve.iloc[-1]["Equity"], expected, abs_tol=1e-6)
+    assert gap_curve.iloc[-1]["Turnover"] == 0
+    missing = {symbol: frame.copy() for symbol, frame in gap_frames.items()}
+    missing["B.BK"].loc[gap_days[64], "Close"] = 50.0
+    missing["A.BK"].loc[gap_days[65], ["Open", "Close"]] = np.nan
+    missing_curve, _ = backtest(missing, **gap_kwargs)
+    assert missing_curve.iloc[-1]["Turnover"] == 0
     print("Self-test passed: risk-adjusted ranking, coverage, liquidity, and accounting.")
 
 def main() -> None:
@@ -343,8 +393,13 @@ def main() -> None:
     if args.self_test:
         _self_test()
         return
-    if args.top < 1 or args.sma < 2 or not 0 <= args.min_coverage <= 1:
-        parser.error("--top must be positive, --sma at least 2, and --min-coverage between 0 and 1")
+    if (
+        args.top < 1 or args.sma < 2 or not 0 <= args.breadth <= 100
+        or not 0 <= args.min_coverage <= 1 or args.min_avg_daily_value < 0
+        or args.commission < 0 or args.vat < 0 or args.slippage_bps < 0
+        or args.cash <= 0
+    ):
+        parser.error("Strategy and cash must be positive; costs cannot be negative")
 
     symbols = sorted(set(UNIVERSE + [INDEX_SYMBOL]))
     warmup_days = max(90, args.sma * 3)
@@ -380,3 +435,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -28,6 +29,7 @@ from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
+from position_risk import estimate_position
 from set100_constituents import SET100_SYMBOLS
 
 
@@ -70,6 +72,9 @@ INDEX_SYMBOL = "SET.BK"
 UNIVERSE = SET100_SYMBOLS
 
 MAX_POSITIONS = 5
+MAX_WATCHLIST = 20
+RISK_PER_TRADE = 0.01
+MAX_HOLDING_SESSIONS = 20
 MIN_UNIVERSE_COVERAGE = 0.80
 MOMENTUM_LOOKBACK = 63
 VOLATILITY_LOOKBACK = 20
@@ -390,8 +395,20 @@ def get_market_frames(symbols):
     return frames
 
 
+def normalize_stock_symbol(value):
+    if not isinstance(value, str):
+        return None
+    base = value.strip().upper().removesuffix(".BK")
+    if not re.fullmatch(r"[A-Z0-9]{1,10}", base):
+        return None
+    return base + ".BK"
+
+
 def combined_universe(portfolio):
-    custom = portfolio.get("watchlist", [])
+    custom = [
+        symbol for value in portfolio.get("watchlist", [])[:MAX_WATCHLIST]
+        if (symbol := normalize_stock_symbol(value)) is not None
+    ]
     return sorted(set(UNIVERSE + custom))
 
 
@@ -483,6 +500,62 @@ def _selection_metrics(df, as_of):
         volatility,
         avg_value,
     )
+
+
+def _risk_reference(df, as_of):
+    """Use completed raw-price bars for an indicative two-ATR stop."""
+    if df is None or not {"High", "Low", "Close"}.issubset(df.columns):
+        return None
+    history = df.loc[df.index.strftime("%Y-%m-%d") <= as_of]
+    if len(history) < 15 or history.index[-1].strftime("%Y-%m-%d") != as_of:
+        return None
+    prices = history[["High", "Low", "Close"]].tail(15).apply(
+        pd.to_numeric, errors="coerce"
+    )
+    if prices.isna().any().any():
+        return None
+    prior_close = prices["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            prices["High"] - prices["Low"],
+            (prices["High"] - prior_close).abs(),
+            (prices["Low"] - prior_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1).iloc[1:]
+    close = float(prices["Close"].iloc[-1])
+    atr = float(true_range.mean())
+    stop = close - 2 * atr
+    if not all(np.isfinite(value) for value in (close, atr, stop)):
+        return None
+    return (close, stop) if close > 0 and atr > 0 and stop > 0 else None
+
+
+def _portfolio_market_value(portfolio, frames, as_of):
+    """Return cash and marked equity only when every holding has current data."""
+    try:
+        cash = float(portfolio["cash"])
+        if not np.isfinite(cash) or cash < 0:
+            return None
+        equity = cash
+        for symbol, holding in portfolio.get("stocks", {}).items():
+            shares = float(holding["shares"])
+            if not np.isfinite(shares) or shares < 0:
+                return None
+            if shares == 0:
+                continue
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                return None
+            if frame.index[-1].strftime("%Y-%m-%d") != as_of:
+                return None
+            price = float(frame["Close"].iloc[-1])
+            if not np.isfinite(price) or price <= 0:
+                return None
+            equity += shares * price
+        return cash, equity
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def market_context(frames):
@@ -643,9 +716,16 @@ def build_daily_plan(portfolio, frames=None):
 
         report_lines.append("")
         if selected:
-            weight = 100 / len(selected)
+            portfolio_value = _portfolio_market_value(
+                portfolio, frames, data_date
+            )
             report_lines.append(
                 f"✅ หุ้นที่ผ่านเกณฑ์ ({len(selected)} ตัว)"
+            )
+            report_lines.append(
+                "กรอบทดลอง: ถือประมาณ 1–4 สัปดาห์ "
+                f"และตั้งงบขาดทุนตาม Stop ประมาณ {RISK_PER_TRADE:.0%} "
+                "ของพอร์ตต่อรายการ"
             )
             for index, (
                 _,
@@ -660,7 +740,7 @@ def build_daily_plan(portfolio, frames=None):
                         "ข้อมูลพื้นฐานไม่พร้อม",
                     )
                 )
-                report_lines.append(
+                detail = (
                     f"{index}. 📈 {sym}\n"
                     f"   ผลตอบแทน 63 วัน: "
                     f"{momentum * 100:+.1f}%\n"
@@ -670,9 +750,39 @@ def build_daily_plan(portfolio, frames=None):
                     f"{avg_value:,.0f} บาท/วัน\n"
                     f"   พื้นฐาน: {fundamental_text}"
                 )
+                if sym in portfolio.get("stocks", {}):
+                    detail += "\n   มีหุ้นอยู่ในพอร์ตแล้ว: ไม่คำนวณซื้อเพิ่ม"
+                elif portfolio_value is None:
+                    detail += "\n   ยังประเมินขนาดซื้อไม่ได้: มูลค่าพอร์ตหรือราคาหุ้นที่ถือไม่ครบ"
+                else:
+                    reference = _risk_reference(frames.get(sym), data_date)
+                    if reference is None:
+                        detail += "\n   ยังประเมิน Stop และขนาดซื้อไม่ได้: ข้อมูลราคาไม่ครบ"
+                    else:
+                        close, stop = reference
+                        cash, equity = portfolio_value
+                        estimate = estimate_position(
+                            equity, cash, close, stop, 1,
+                            risk_fraction=RISK_PER_TRADE,
+                        )
+                        if estimate["shares"]:
+                            detail += (
+                                f"\n   Stop อ้างอิงประมาณ {stop:.2f} บาท"
+                                f" | ขนาดสูงสุดประมาณ {estimate['shares']} หุ้น"
+                                f" | ขาดทุนตามแผนประมาณ "
+                                f"{estimate['estimated_loss']:,.0f} บาท"
+                            )
+                        else:
+                            detail += (
+                                "\n   งบเสี่ยง/เงินสดไม่พอสำหรับซื้อหนึ่งล็อต "
+                                "จึงไม่เสนอจำนวนซื้อ"
+                            )
+                report_lines.append(detail)
             report_lines.append("")
             report_lines.append(
-                f"⚖️ น้ำหนักเป้าหมาย: หุ้นละ {weight:.1f}%"
+                "ขนาดซื้อเป็นเพียงประมาณการจากราคาปิด "
+                "ของหุ้นแต่ละตัวแยกกัน ห้ามนำจำนวนซื้อทุกตัวมารวมกัน "
+                "ต้องคำนวณใหม่ที่ราคาเปิดจริงและหลังซื้อแต่ละครั้ง"
             )
             report_lines.append(
                 "🔁 ใช้สัญญาณราคาปิดเพื่อวางแผน"
@@ -680,7 +790,13 @@ def build_daily_plan(portfolio, frames=None):
             )
             report_lines.append(
                 "ทบทวนขายเมื่อหลุด 5 อันดับแรก"
-                "หรือปิดต่ำกว่า SMA20"
+                "หรือปิดต่ำกว่า SMA20 และทบทวนเมื่อถือครบ "
+                f"{MAX_HOLDING_SESSIONS} วันซื้อขาย"
+            )
+            report_lines.append(
+                "Stop อาจขายได้ต่ำกว่าราคาที่วางไว้เมื่อราคาเปิดกระโดด "
+                "บอตยังไม่บันทึกวันซื้อขายจริง; "
+                "โปรดอัปเดตเงินสดและหุ้นหลังซื้อขาย"
             )
         else:
             report_lines.append(
@@ -1184,16 +1300,20 @@ def help_text():
         "ควรซื้อวันนี้ / ซื้อวันนี้\n\n"
         "💼 พอร์ตและรายการติดตาม\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บอตบันทึก\n"
+        "ตั้งเงินสด 10000 — บันทึกยอดเงินสดตามบัญชีจริง\n"
+        "ตั้งหุ้น AOT 100 35.50 — บันทึกจำนวนและต้นทุนเฉลี่ย\n"
+        "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดออกจากพอร์ต\n"
         "รายการติดตาม — ดูหุ้นที่ติดตาม\n"
         "วิเคราะห์ COM7 — ดูแนวโน้มราคา"
         "และข้อมูลงบรายตัว\n"
         "ติดตาม AOT — เพิ่มหุ้นในรายการ"
-        "และใช้พิจารณาแผน\n"
+        f"และใช้พิจารณาแผน (สูงสุด {MAX_WATCHLIST} หุ้น)\n"
         "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n\n"
         "❔ เมนูคำสั่ง\n"
         "พิมพ์: เมนู หรือ ช่วยเหลือ\n\n"
         "หมายเหตุ: บอตให้ข้อมูลประกอบ"
-        "การตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง"
+        "การตัดสินใจ ไม่ส่งคำสั่งซื้อขายจริง "
+        "และต้องบันทึกเงินสด/หุ้นใหม่หลังซื้อขายที่โบรกเกอร์"
     )
 
 
@@ -1208,19 +1328,8 @@ def command_reply(user_id, text):
         return help_text()
 
     if text.startswith("วิเคราะห์ "):
-        raw_symbol = text[
-            len("วิเคราะห์ "):
-        ].strip().upper()
-        symbol = (
-            raw_symbol
-            if raw_symbol.endswith(".BK")
-            else raw_symbol + ".BK"
-        )
-        base_symbol = symbol[:-3]
-        if (
-            not base_symbol.isalnum()
-            or len(base_symbol) > 10
-        ):
+        symbol = normalize_stock_symbol(text[len("วิเคราะห์ "):])
+        if symbol is None:
             return (
                 "รูปแบบชื่อหุ้นไม่ถูกต้อง "
                 "ลองพิมพ์: วิเคราะห์ COM7"
@@ -1409,6 +1518,76 @@ def command_reply(user_id, text):
         )
         return "\n".join(lines)
 
+    if text.startswith("ตั้งเงินสด "):
+        parts = text.split()
+        if len(parts) != 2:
+            return "รูปแบบ: ตั้งเงินสด 10000"
+        try:
+            amount = float(parts[1].replace(",", ""))
+        except ValueError:
+            return "ยอดเงินสดต้องเป็นตัวเลขตั้งแต่ 0 บาท"
+        if not np.isfinite(amount) or amount < 0:
+            return "ยอดเงินสดต้องเป็นตัวเลขตั้งแต่ 0 บาท"
+
+        def set_cash(p):
+            p["cash"] = amount
+            p["overnight_plan"] = None
+            p.setdefault("history", []).append({
+                "type": "MANUAL_CASH_BALANCE",
+                "cash": amount,
+                "recorded_at": utc_text(),
+            })
+            return (
+                f"บันทึกเงินสด {amount:,.2f} บาทแล้ว "
+                "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่การฝากเงินจริง) "
+                "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
+            )
+
+        return mutate_portfolio(user_id, set_cash)
+
+    if text.startswith("ตั้งหุ้น "):
+        parts = text.split()
+        if len(parts) != 4:
+            return "รูปแบบ: ตั้งหุ้น AOT 100 35.50 (จำนวนและต้นทุนเฉลี่ย)"
+        symbol = normalize_stock_symbol(parts[1])
+        try:
+            shares = int(parts[2])
+            avg_price = float(parts[3].replace(",", ""))
+        except ValueError:
+            return "จำนวนหุ้นต้องเป็นจำนวนเต็ม และต้นทุนเฉลี่ยต้องเป็นตัวเลข"
+        if (
+            symbol is None or shares < 0 or shares > 1_000_000_000
+            or not np.isfinite(avg_price)
+            or (shares > 0 and avg_price <= 0)
+            or (shares == 0 and avg_price != 0)
+        ):
+            return "ข้อมูลหุ้นไม่ถูกต้อง ลองพิมพ์: ตั้งหุ้น AOT 100 35.50"
+
+        def set_holding(p):
+            holdings = p.setdefault("stocks", {})
+            if shares:
+                holdings[symbol] = {
+                    "shares": shares,
+                    "avg_price": avg_price,
+                }
+            else:
+                holdings.pop(symbol, None)
+            p["overnight_plan"] = None
+            p.setdefault("history", []).append({
+                "type": "MANUAL_HOLDING_BALANCE",
+                "symbol": symbol,
+                "shares": shares,
+                "avg_price": avg_price,
+                "recorded_at": utc_text(),
+            })
+            return (
+                f"บันทึก {symbol} {shares:,} หุ้นแล้ว "
+                "(เป็นข้อมูลพอร์ตในบอต ไม่ใช่คำสั่งซื้อขายจริง) "
+                "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
+            )
+
+        return mutate_portfolio(user_id, set_holding)
+
     if text == "รายการติดตาม":
         watchlist = portfolio.get(
             "watchlist", []
@@ -1428,15 +1607,15 @@ def command_reply(user_id, text):
         )
 
     if text.startswith("ติดตาม "):
-        sym = text.replace(
-            "ติดตาม", ""
-        ).strip().upper()
-        if not sym.endswith(".BK"):
-            sym += ".BK"
+        sym = normalize_stock_symbol(text[len("ติดตาม "):])
+        if sym is None:
+            return "รูปแบบชื่อหุ้นไม่ถูกต้อง ลองพิมพ์: ติดตาม AOT"
 
         def add_w(p):
             if "watchlist" not in p:
                 p["watchlist"] = []
+            if sym not in p["watchlist"] and len(p["watchlist"]) >= MAX_WATCHLIST:
+                return f"รายการติดตามเต็มแล้ว (สูงสุด {MAX_WATCHLIST} หุ้น)"
             if (
                 sym
                 not in p["watchlist"]
@@ -1444,9 +1623,11 @@ def command_reply(user_id, text):
                 p["watchlist"].append(
                     sym
                 )
+                p["overnight_plan"] = None
                 return (
                     f"เพิ่ม {sym} "
-                    "ลงในรายการติดตามแล้ว"
+                    "ลงในรายการติดตามแล้ว "
+                    "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
                 f"{sym} อยู่ในรายการ"
@@ -1460,11 +1641,9 @@ def command_reply(user_id, text):
     if text.startswith(
         "เลิกติดตาม "
     ):
-        sym = text.replace(
-            "เลิกติดตาม", ""
-        ).strip().upper()
-        if not sym.endswith(".BK"):
-            sym += ".BK"
+        sym = normalize_stock_symbol(text[len("เลิกติดตาม "):])
+        if sym is None:
+            return "รูปแบบชื่อหุ้นไม่ถูกต้อง ลองพิมพ์: เลิกติดตาม AOT"
 
         def remove_w(p):
             if sym in p.get(
@@ -1473,9 +1652,11 @@ def command_reply(user_id, text):
                 p["watchlist"].remove(
                     sym
                 )
+                p["overnight_plan"] = None
                 return (
                     f"นำ {sym} ออกจาก"
-                    "รายการติดตามแล้ว"
+                    "รายการติดตามแล้ว "
+                    "แผนเดิมถูกยกเลิกและจะเตรียมใหม่หลังตลาดปิด"
                 )
             return (
                 f"ไม่พบ {sym} "
@@ -1543,3 +1724,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
     )
+
