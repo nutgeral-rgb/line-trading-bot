@@ -102,6 +102,18 @@ _portfolio_database_ready = False
 
 UNIVERSE = SET100_SYMBOLS
 
+
+def set100_universe_warning(as_of=None):
+    """Fail closed when the bundled index membership is outside its term."""
+    day = (as_of or now_bkk().date()).isoformat()
+    if SET100_EFFECTIVE_FROM <= day <= SET100_EFFECTIVE_TO:
+        return None
+    return (
+        f"⚠️ รายชื่อ SET100 ในบอตใช้ได้เฉพาะ {SET100_EFFECTIVE_FROM} "
+        f"ถึง {SET100_EFFECTIVE_TO}; วันนี้ {day} จึงงดคัดหุ้นใหม่ "
+        "จนกว่าจะอัปเดตรายชื่อจากตลาดหลักทรัพย์"
+    )
+
 MAX_POSITIONS = 5
 MAX_WATCHLIST = 20
 RISK_PER_TRADE = 0.01
@@ -1008,6 +1020,9 @@ def market_context(frames):
     }
 
 def build_daily_plan(portfolio, frames=None):
+    universe_warning = set100_universe_warning()
+    if universe_warning:
+        return universe_warning, []
     symbols = combined_universe(portfolio)
     if frames is None:
         symbols_to_load = sorted(
@@ -1414,6 +1429,11 @@ def prepare_overnight_plans(target_data_day=None, only_user_ids=None):
         logger.info(
             "ข้ามรอบเตรียมแผน: ไม่ใช่วันซื้อขาย SET"
         )
+        return
+
+    universe_warning = set100_universe_warning()
+    if universe_warning:
+        logger.warning("ข้ามแผนรายวัน: รายชื่อ SET100 หมดอายุ")
         return
 
     try:
@@ -1923,6 +1943,9 @@ def handle_backup_file(event):
 
 def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     """Screen SET100 candidates for a cautious, user-triggered accumulation review."""
+    universe_warning = set100_universe_warning()
+    if universe_warning:
+        return universe_warning
     strategy = portfolio.get("investment_strategy", {})
     expected_session = latest_completed_set_session(now_bkk())
     # Free quote sources can publish the latest SET close one session late.
@@ -2197,9 +2220,25 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             "portfolio_correlation": portfolio_correlation(symbol),
         })
 
-    # Limit fundamental-data calls to the strongest trend/liquidity shortlist.
+    # Include affordable board-lot names so an expensive momentum leader does
+    # not crowd out every candidate this small portfolio can actually buy.
     eligible.sort(key=lambda item: (-item["six_month_return"], -item["avg_value"], item["volatility"]))
-    shortlist = eligible[:15]
+    shortlist = eligible[:12]
+    seen_symbols = {item["symbol"] for item in shortlist}
+    affordable_board_lots = [
+        item for item in eligible
+        if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE) <= budget / 2
+    ]
+    for item in affordable_board_lots + eligible:
+        if len(shortlist) >= 24:
+            break
+        if item["symbol"] not in seen_symbols:
+            shortlist.append(item)
+            seen_symbols.add(item["symbol"])
+    header.append(
+        f"🔎 ผ่านแนวโน้ม/สภาพคล่อง {len(eligible)}/{len(UNIVERSE)} ตัว "
+        f"| ตรวจงบ {len(shortlist)} ตัว"
+    )
     if not shortlist:
         return "\n".join(
             header
@@ -2300,7 +2339,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         return "\n".join(
             header
             + [
-                "⚠️ รอบนี้ไม่มีหุ้นผ่านเกณฑ์พื้นฐานครบ จึงงดแนะนำซื้อ",
+                f"⚠️ ตรวจงบ {len(shortlist)} ตัวแล้ว ยังไม่มีหุ้นผ่านพื้นฐานครบ จึงงดแนะนำซื้อ",
                 "เงินสดคงไว้ก่อน; เรียกคำสั่งนี้ใหม่ได้เมื่อมีข้อมูลตลาดรอบถัดไป",
             ]
             + watch_lines
@@ -2490,6 +2529,7 @@ def _prepare_long_term_recommendation(user_id):
                 # advice was sent would be false; keep the unconfirmed record
                 # out of measured results until it can be reconciled.
                 logger.exception("ส่งคำแนะนำแล้ว แต่ยืนยันสถานะบันทึกไม่สำเร็จ")
+        return True
     except Exception:
         logger.exception("จัดทำหรือส่งแผนสะสมระยะยาวไม่สำเร็จ")
         try:
@@ -2502,6 +2542,7 @@ def _prepare_long_term_recommendation(user_id):
             )
         except Exception:
             logger.exception("แจ้งผลการจัดทำแผนสะสมระยะยาวไม่สำเร็จ")
+        return False
     finally:
         with _on_demand_lock:
             _long_term_users.discard(user_id)
@@ -2531,6 +2572,78 @@ def queue_long_term_recommendation(user_id):
             _long_term_users.discard(user_id)
         raise
     return True
+
+
+def send_weekly_long_term_recommendations():
+    """Send one long-term screen per user each trading week after the close."""
+    current = now_bkk()
+    today = current.date()
+    if current.hour < 19 or not is_set_session(today):
+        return
+    universe_warning = set100_universe_warning(today)
+    year, week, _ = today.isocalendar()
+    week_key = f"{year}-W{week:02d}"
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อส่งหุ้นสะสมรายสัปดาห์ไม่สำเร็จ")
+        return
+
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+                continue
+            if float(portfolio.get("cash", 0) or 0) <= 0:
+                continue
+
+            def claim(current_portfolio):
+                previous = current_portfolio.get("weekly_long_term_recommendation") or {}
+                if previous.get("week") == week_key and (
+                    previous.get("status") == "SENT"
+                    or previous.get("date") == today.isoformat()
+                ):
+                    return False
+                current_portfolio["weekly_long_term_recommendation"] = {
+                    "week": week_key,
+                    "date": today.isoformat(),
+                    "status": "PENDING",
+                }
+                return True
+
+            if not mutate_portfolio(user_id, claim):
+                continue
+
+            with _on_demand_lock:
+                busy = user_id in _long_term_users or user_id in _on_demand_users
+                if not busy:
+                    _long_term_users.add(user_id)
+            if busy:
+                def mark_busy(current_portfolio):
+                    current_portfolio["weekly_long_term_recommendation"]["status"] = "FAILED"
+                mutate_portfolio(user_id, mark_busy)
+                continue
+
+            if universe_warning:
+                try:
+                    line_bot_api.push_message(user_id, TextSendMessage(text=universe_warning))
+                    sent = True
+                except Exception:
+                    sent = False
+                    logger.exception("แจ้งรายชื่อ SET100 หมดอายุไม่สำเร็จ")
+                finally:
+                    with _on_demand_lock:
+                        _long_term_users.discard(user_id)
+            else:
+                sent = _prepare_long_term_recommendation(user_id)
+
+            def record_result(current_portfolio):
+                previous = current_portfolio.get("weekly_long_term_recommendation") or {}
+                if previous.get("week") == week_key and previous.get("date") == today.isoformat():
+                    previous["status"] = "SENT" if sent else "FAILED"
+            mutate_portfolio(user_id, record_result)
+        except Exception:
+            logger.exception("ส่งหุ้นสะสมรายสัปดาห์หนึ่งรายการไม่สำเร็จ")
 
 
 _long_term_review_users = set()
@@ -2763,6 +2876,7 @@ def help_text():
         "📈 แผนลงทุน\n"
         "ตั้งแผนลงทุนระยะยาว — ทุนอ้างอิง 6,000 บาท\n"
         "แนะนำหุ้นสะสม — คัดหุ้นใหม่ได้ทุกเมื่อ\n"
+        "สถานะหุ้นสะสม — ดูรอบส่งอัตโนมัติและข้อมูลที่บันทึก\n"
         "ทบทวนหุ้นระยะยาว — ผลคำแนะนำเดิมและหุ้นที่ควรทบทวนขาย\n"
         "ตั้งเงินเติมรายเดือน 500 — กำหนด 500–1,000 บาท/เดือน\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
@@ -2807,10 +2921,12 @@ def command_reply(user_id, text):
 
     if text == "สถานะข้อมูล":
         storage_name, storage_detail = portfolio_storage_status()
+        universe_warning = set100_universe_warning()
         return (
             "🗄️ สถานะการเก็บข้อมูลพอร์ต\n"
             f"วิธีเก็บ: {storage_name}\n"
-            f"รายละเอียด: {storage_detail}"
+            f"รายละเอียด: {storage_detail}\n"
+            + (universe_warning or f"รายชื่อ SET100 ใช้ถึง {SET100_EFFECTIVE_TO}")
         )
 
     if text.startswith("วิเคราะห์ "):
@@ -2916,6 +3032,27 @@ def command_reply(user_id, text):
             "⚠️ ยังเข้าถึงที่เก็บพอร์ตถาวรไม่ได้ "
             "ระบบงดบันทึกและแนะนำจากยอดเงินที่อาจหาย "
             "พิมพ์ สถานะข้อมูล เพื่อตรวจสอบ"
+        )
+
+    if text == "สถานะหุ้นสะสม":
+        strategy = portfolio.get("investment_strategy") or {}
+        weekly = portfolio.get("weekly_long_term_recommendation") or {}
+        sent_records = [
+            row for row in portfolio.get("long_term_recommendations", [])
+            if isinstance(row, dict) and row.get("delivery_status") == "SENT"
+        ]
+        status_text = {
+            "SENT": "ส่งข้อความแล้ว",
+            "PENDING": "กำลังจัดทำหรือรอบก่อนถูกขัดจังหวะ",
+            "FAILED": "รอบล่าสุดไม่สำเร็จ จะลองใหม่ในวันซื้อขายถัดไป",
+        }.get(weekly.get("status"), "ยังไม่มีรอบส่ง")
+        return (
+            "🧭 สถานะหุ้นสะสม\n"
+            f"แผนระยะยาว: {'เปิด' if strategy.get('style') == 'LONG_TERM' else 'ยังไม่เปิด'}\n"
+            f"รอบอัตโนมัติ: {weekly.get('week', 'ยังไม่มี')} — {status_text}\n"
+            f"คำแนะนำที่ส่งและบันทึกแล้ว: {len(sent_records)} รายการ\n"
+            "ระบบพยายามส่งสัปดาห์ละหนึ่งครั้งหลังตลาดปิด; "
+            "สั่ง แนะนำหุ้นสะสม เองได้ทุกเมื่อ"
         )
 
     if text == "ตั้งแผนลงทุนระยะยาว":
@@ -3615,6 +3752,17 @@ def ensure_scheduler():
             max_instances=1,
             coalesce=True,
         )
+        worker_scheduler.add_job(
+            send_weekly_long_term_recommendations,
+            "cron",
+            day_of_week="mon-fri",
+            hour=19,
+            minute="20,50",
+            id="weekly-long-term-recommendations",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
         # Render Free can sleep through a cron time. A later wake-up on a
         # closed day should still attempt the idempotent weekly review.
         current = now_bkk()
@@ -3624,6 +3772,15 @@ def ensure_scheduler():
                 "date",
                 run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
                 id="closed-day-long-term-review-catchup",
+                replace_existing=True,
+                max_instances=1,
+            )
+        if current.hour >= 19 and is_set_session(current.date()):
+            worker_scheduler.add_job(
+                send_weekly_long_term_recommendations,
+                "date",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
+                id="weekly-long-term-recommendations-catchup",
                 replace_existing=True,
                 max_instances=1,
             )
