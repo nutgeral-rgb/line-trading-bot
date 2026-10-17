@@ -115,6 +115,7 @@ def set100_universe_warning(as_of=None):
     )
 
 MAX_POSITIONS = 5
+MAX_LONG_TERM_POSITION_PCT = 0.35
 MAX_WATCHLIST = 20
 RISK_PER_TRADE = 0.01
 MAX_HOLDING_SESSIONS = 20
@@ -2005,6 +2006,19 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     )
     remaining_target = max(0.0, target_equity - current_equity_value)
     budget = min(cash, remaining_target)
+    max_position_value = total_value * MAX_LONG_TERM_POSITION_PCT
+    active_holdings = {
+        symbol for symbol, info in holdings.items()
+        if int(info.get("shares", 0) or 0) > 0
+    }
+
+    def purchase_limit(symbol):
+        if symbol not in active_holdings and len(active_holdings) >= MAX_POSITIONS:
+            return 0.0
+        return min(
+            budget,
+            max(0.0, max_position_value - holding_values.get(symbol, 0.0)),
+        )
 
     header = [
         "🧭 แผนสะสมหุ้นระยะยาว | หุ้นเป้าหมาย 100%",
@@ -2143,8 +2157,6 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
 
     eligible = []
     for symbol in UNIVERSE:
-        if symbol in holdings:
-            continue
         frame = frames.get(symbol)
         if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
             continue
@@ -2227,7 +2239,8 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     seen_symbols = {item["symbol"] for item in shortlist}
     affordable_board_lots = [
         item for item in eligible
-        if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE) <= budget / 2
+        if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE)
+        <= purchase_limit(item["symbol"])
     ]
     for item in affordable_board_lots + eligible:
         if len(shortlist) >= 24:
@@ -2345,136 +2358,71 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             + watch_lines
         )
 
-    # Use the standard 100-share lot as an affordability check and spread
-    # purchases across distinct sectors where possible.
-    def pick_distinct_sectors(items, count):
-        selected = []
-        sectors = set()
-        for item in items:
-            sector = str(item["fundamental"].get("sector") or "").strip().lower()
-            sector_key = sector or "__unknown__"
-            if sector_key in sectors:
-                continue
-            selected.append(item)
-            sectors.add(sector_key)
-            if len(selected) == count:
-                return selected
-        return []
-
-    chosen = []
-    per_name_budget = 0.0
-    for count in (3, 2):
-        per_name_budget = budget / count
-        affordable = [
+    # A small account can add one position at a time. Keep the estimated
+    # purchase within recorded cash and 35% of the portfolio for this symbol.
+    board_item = next(
+        (
             item for item in candidates
-            if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE) <= per_name_budget
-        ]
-        chosen = pick_distinct_sectors(affordable, count)
-        if chosen:
-            break
-
-    if not chosen:
-        odd_lot_budget = budget / 2
-        odd_lot_candidates = pick_distinct_sectors(
-            [
-                item for item in candidates
-                if item["close"] * (1 + ESTIMATED_BUY_COST_RATE) <= odd_lot_budget
-            ],
-            2,
-        )
-        if len(odd_lot_candidates) == 2:
-            lines = header + [
-                f"🪙 หน่วยย่อย (Odd Lot) หากโบรกเกอร์รองรับ | งบ {budget:,.0f} บาท",
-            ]
-            for index, item in enumerate(odd_lot_candidates, 1):
-                shares = int(
-                    odd_lot_budget // (item["close"] * (1 + ESTIMATED_BUY_COST_RATE))
-                )
-                estimated_cost = shares * item["close"]
-                estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
-                relative_strength = item.get("relative_strength")
-                lines.append(
-                    f"{index}. {display_stock_symbol(item['symbol'])} — "
-                    f"{item['close']:.2f} บ. | {shares:,} หุ้น | "
-                    f"ซื้อ ~{estimated_cost:,.0f} + ค่าใช้จ่าย ~{estimated_fee:,.0f} บ."
-                )
-                lines.append(
-                    "   " + concise_fundamental(item["fundamental"])
-                )
-                lines.append(
-                    f"   แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}%"
-                    + (
-                        f" | เทียบ SET100 {relative_strength * 100:+.1f}%"
-                        if relative_strength is not None else ""
-                    )
-                    + f" | ซื้อขาย {item['liquidity_days']}/20 วัน"
-                )
-            lines.append(
-                "Odd Lot อาจมีส่วนต่างราคา/สภาพคล่องต่างจากกระดานหลัก; "
-                "ตรวจสอบกับโบรกเกอร์ก่อนซื้อ"
-            )
-            lines.append(
-                "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
-                "หุ้น 100% อาจขาดทุนเกิน 10%"
-            )
-            note_recommendations(odd_lot_candidates, odd_lot=True)
-            return "\n".join(lines)
-        return "\n".join(
-            header
-            + [
-                f"งบ {budget:,.0f} บาทยังไม่พอซื้อ 100 หุ้นอย่างน้อย 2 บริษัท",
-                "แนะนำเก็บเงินสดไว้ก่อน; หุ้นที่ผ่านเกณฑ์: "
-                + ", ".join(
-                    f"{display_stock_symbol(item['symbol'])} {item['close']:.2f} บ."
-                    for item in candidates[:3]
-                ),
-            ]
-        )
-
-    lines = header + ["✅ หุ้นผ่านเกณฑ์ (ใช้พิจารณาสะสม):"]
-    for index, item in enumerate(chosen, 1):
-        shares = int(
-            per_name_budget // (item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE))
-        ) * 100
-        estimated_cost = shares * item["close"]
-        estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
-        fundamental = item["fundamental"]
-        relative_strength = item.get("relative_strength")
-        lines.append(
-            f"{index}. {display_stock_symbol(item['symbol'])} — "
-            f"{item['close']:.2f} บ. | {shares:,} หุ้น | "
-            f"ซื้อ ~{estimated_cost:,.0f} + ค่าใช้จ่าย ~{estimated_fee:,.0f} บ."
-        )
-        lines.append("   " + concise_fundamental(fundamental))
-        lines.append(
-            f"   แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}%"
-            + (
-                f" | เทียบ SET100 {relative_strength * 100:+.1f}%"
-                if relative_strength is not None else ""
-            )
-            + f" | สภาพคล่อง {item['liquidity_days']}/20 วัน, "
-            f"~{item['avg_value']:,.0f} บ./วัน"
-        )
-        risk_text = (
-            f"   ความเสี่ยง: ลดจากจุดสูงสุด {abs(item['max_drawdown']) * 100:.1f}%"
-        )
-        if item.get("portfolio_correlation") is not None:
-            risk_text += f" | สัมพันธ์กับหุ้นเดิม {item['portfolio_correlation']:.2f}"
-        peer = item.get("peer_valuation", {}).get("trailing_pe")
-        if peer:
-            current_pe = fundamental.get("valuation", {}).get("trailing_pe")
-            if isinstance(current_pe, (int, float)):
-                risk_text += (
-                    f" | P/E {current_pe:.1f}x (ค่ากลางกลุ่ม {peer['median']:.1f}x)"
-                )
-        lines.append(risk_text)
-
-    lines.append(
-        "ตรวจราคาและค่าธรรมเนียมกับโบรกเกอร์ก่อนซื้อ; "
-        "ข้อมูลนี้ไม่ใช่คำสั่งซื้ออัตโนมัติหรือการรับประกันผลตอบแทน"
+            if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE)
+            <= purchase_limit(item["symbol"])
+        ),
+        None,
     )
-    lines.append("หุ้น 100% อาจขาดทุนเกิน 10%")
-    note_recommendations(chosen)
+    odd_lot = False
+    item = board_item
+    if item is None:
+        item = next(
+            (
+                candidate for candidate in candidates
+                if candidate["close"] * (1 + ESTIMATED_BUY_COST_RATE)
+                <= purchase_limit(candidate["symbol"])
+            ),
+            None,
+        )
+        odd_lot = item is not None
+    if item is None:
+        return "\n".join(header + [
+            "⚠️ ยังไม่มีหุ้นที่ซื้อได้ภายในเงินสดและเพดานต่อหุ้นรอบนี้",
+            f"เพดานมูลค่าหุ้นแต่ละตัว {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต; "
+            "เงินสดคงไว้และตรวจใหม่เมื่อยอดเงินหรือราคาปรับ",
+        ])
+
+    limit = purchase_limit(item["symbol"])
+    unit_cost = item["close"] * (1 + ESTIMATED_BUY_COST_RATE)
+    affordable_shares = int((limit + 1e-8) / unit_cost)
+    while affordable_shares > 0 and affordable_shares * unit_cost > limit + 1e-8:
+        affordable_shares -= 1
+    shares = min(99, affordable_shares) if odd_lot else (affordable_shares // 100) * 100
+    if shares <= 0:
+        return "\n".join(header + ["⚠️ วงเงินต่อหุ้นยังไม่พอซื้อในรอบนี้"])
+    estimated_cost = shares * item["close"]
+    estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
+    estimated_spend = estimated_cost + estimated_fee
+    cash_left = max(0.0, cash - estimated_spend)
+    symbol = display_stock_symbol(item["symbol"])
+    action = "เพิ่ม" if item["symbol"] in active_holdings else "เริ่มสะสม"
+    lines = header + [
+        "✅ ทยอยสะสม 1 รายการตามเงินสดที่บันทึก",
+        f"{action} {symbol} | ราคาปิด {item['close']:.2f} บาท",
+        f"จำนวนประมาณ {shares:,} หุ้น | ใช้เงิน ~{estimated_spend:,.2f} บาท "
+        f"(รวมค่าใช้จ่ายประมาณ {estimated_fee:,.2f} บาท)",
+        f"เงินสดคงเหลือหลังซื้อประมาณ {cash_left:,.2f} บาท",
+        f"จำกัดมูลค่าหุ้นตัวนี้ไม่เกิน {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต",
+        "งบ: " + concise_fundamental(item["fundamental"]),
+        f"แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}% "
+        f"| สภาพคล่อง {item['liquidity_days']}/20 วัน",
+    ]
+    if odd_lot:
+        lines.append(
+            "🪙 จำนวนนี้เป็น Odd Lot; ตรวจว่าโบรกเกอร์รองรับและดูราคากระดานหน่วยย่อยก่อนซื้อ"
+        )
+    lines.extend([
+        "ตรวจราคาจริงและค่าธรรมเนียมก่อนส่งคำสั่ง; "
+        "หลังซื้อจริงให้แจ้ง บันทึกซื้อ [ชื่อหุ้น] [จำนวน] [ราคา]",
+        "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
+        "หุ้น 100% อาจขาดทุนเกิน 10%",
+    ])
+    note_recommendations([item], odd_lot=odd_lot)
     return "\n".join(lines)
 
 _long_term_users = set()
