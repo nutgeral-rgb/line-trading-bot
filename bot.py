@@ -2773,6 +2773,7 @@ def help_text():
         "หมายเหตุ: ปิดแผนรายวันเมื่อเปิดโหมดระยะยาว\n\n"
         "💰 พอร์ตและเงินสด\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บันทึก\n"
+        "ดูพอร์ตแสดงยอดเงินเติมสะสมที่แจ้งบอตด้วย\n"
         "ตั้งเงินสด 6000 — ตั้งยอดเงินสดรวมให้ตรงบัญชีจริง\n"
         "บันทึกเงินเติม 500 — เพิ่มยอดหลังฝากเงินจริงแล้ว\n"
         "บันทึกซื้อ AOT 100 35.50 — เพิ่มหุ้นและหักเงินสด\n"
@@ -3165,6 +3166,21 @@ def command_reply(user_id, text):
     if text == "ดูพอร์ต":
         cash = portfolio["cash"]
         stocks = portfolio["stocks"]
+        contribution_total = 0.0
+        contribution_month = 0.0
+        current_month = now_bkk().strftime("%Y-%m")
+        for entry in portfolio.get("history", []):
+            if not isinstance(entry, dict) or entry.get("type") != "MONTHLY_CONTRIBUTION":
+                continue
+            try:
+                amount = float(entry.get("amount", 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not np.isfinite(amount) or amount <= 0:
+                continue
+            contribution_total += amount
+            if entry.get("month") == current_month:
+                contribution_month += amount
         total_stock_cost = sum(
             stock["shares"]
             * stock["avg_price"]
@@ -3182,6 +3198,8 @@ def command_reply(user_id, text):
             f"{total_stock_cost:,.2f} บาท",
             "💰 รวมตามข้อมูลที่บันทึก: "
             f"{total_value:,.2f} บาท",
+            f"📥 เงินเติมที่บันทึกสะสม: {contribution_total:,.2f} บาท "
+            f"(เดือนนี้ {contribution_month:,.2f} บาท)",
             "",
         ]
         if stocks:
