@@ -2358,12 +2358,31 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             + watch_lines
         )
 
+    # An entry band is a price discipline, not an estimate of intrinsic value.
+    # Require a valid ATR rather than inventing a range when price bars are absent.
+    for candidate in candidates:
+        atr_pct = candidate.get("atr_pct")
+        atr = candidate["close"] * atr_pct if atr_pct is not None else None
+        if atr is None or not np.isfinite(atr) or atr <= 0:
+            candidate["entry_band"] = None
+            continue
+        low = max(candidate["sma50"], candidate["sma20"] - atr)
+        high = candidate["sma20"] + 0.5 * atr
+        candidate["entry_band"] = (low, high) if low <= high else None
+
+    def within_entry_band(candidate):
+        band = candidate["entry_band"]
+        return band is not None and band[0] <= candidate["close"] <= band[1]
+
+    ready = [candidate for candidate in candidates if within_entry_band(candidate)]
+
     # A small account can add one position at a time. Keep the estimated
     # purchase within recorded cash and 35% of the portfolio for this symbol.
+    # Size at the upper entry price, so a purchase inside the band stays in budget.
     board_item = next(
         (
-            item for item in candidates
-            if item["close"] * 100 * (1 + ESTIMATED_BUY_COST_RATE)
+            item for item in ready
+            if item["entry_band"][1] * 100 * (1 + ESTIMATED_BUY_COST_RATE)
             <= purchase_limit(item["symbol"])
         ),
         None,
@@ -2373,29 +2392,46 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     if item is None:
         item = next(
             (
-                candidate for candidate in candidates
-                if candidate["close"] * (1 + ESTIMATED_BUY_COST_RATE)
+                candidate for candidate in ready
+                if candidate["entry_band"][1] * (1 + ESTIMATED_BUY_COST_RATE)
                 <= purchase_limit(candidate["symbol"])
             ),
             None,
         )
         odd_lot = item is not None
     if item is None:
+        watch = []
+        for candidate in candidates:
+            band = candidate["entry_band"]
+            if band is None:
+                continue
+            status = "รอราคาย่อลง" if candidate["close"] > band[1] else (
+                "ต่ำกว่ากรอบ ให้ทบทวนแนวโน้ม" if candidate["close"] < band[0]
+                else "อยู่ในกรอบ แต่งบ/ล็อตยังไม่พอ"
+            )
+            watch.append(
+                f"• {display_stock_symbol(candidate['symbol'])} "
+                f"ปิด {candidate['close']:.2f} | กรอบ {band[0]:.2f}–{band[1]:.2f} บาท: {status}"
+            )
+            if len(watch) >= 3:
+                break
         return "\n".join(header + [
-            "⚠️ ยังไม่มีหุ้นที่ซื้อได้ภายในเงินสดและเพดานต่อหุ้นรอบนี้",
-            f"เพดานมูลค่าหุ้นแต่ละตัว {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต; "
-            "เงินสดคงไว้และตรวจใหม่เมื่อยอดเงินหรือราคาปรับ",
+            "⏳ รอบนี้ยังไม่มีหุ้นที่อยู่ในกรอบซื้อและซื้อได้ตามวงเงิน",
+            *watch,
+            "กรอบนี้อิง SMA20/SMA50 และ ATR14 ไม่ใช่มูลค่าเหมาะสม; "
+            "รอข้อมูลรอบถัดไปและตรวจราคาจริงก่อนตัดสินใจ",
         ])
 
     limit = purchase_limit(item["symbol"])
-    unit_cost = item["close"] * (1 + ESTIMATED_BUY_COST_RATE)
+    entry_low, entry_high = item["entry_band"]
+    unit_cost = entry_high * (1 + ESTIMATED_BUY_COST_RATE)
     affordable_shares = int((limit + 1e-8) / unit_cost)
     while affordable_shares > 0 and affordable_shares * unit_cost > limit + 1e-8:
         affordable_shares -= 1
     shares = min(99, affordable_shares) if odd_lot else (affordable_shares // 100) * 100
     if shares <= 0:
         return "\n".join(header + ["⚠️ วงเงินต่อหุ้นยังไม่พอซื้อในรอบนี้"])
-    estimated_cost = shares * item["close"]
+    estimated_cost = shares * entry_high
     estimated_fee = estimated_cost * ESTIMATED_BUY_COST_RATE
     estimated_spend = estimated_cost + estimated_fee
     cash_left = max(0.0, cash - estimated_spend)
@@ -2404,9 +2440,10 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     lines = header + [
         "✅ ทยอยสะสม 1 รายการตามเงินสดที่บันทึก",
         f"{action} {symbol} | ราคาปิด {item['close']:.2f} บาท",
-        f"จำนวนประมาณ {shares:,} หุ้น | ใช้เงิน ~{estimated_spend:,.2f} บาท "
+        f"🎯 ช่วงราคาพิจารณาซื้อ {entry_low:.2f}–{entry_high:.2f} บาท",
+        f"จำนวนประมาณ {shares:,} หุ้น | ใช้เงินไม่เกิน ~{estimated_spend:,.2f} บาท "
         f"(รวมค่าใช้จ่ายประมาณ {estimated_fee:,.2f} บาท)",
-        f"เงินสดคงเหลือหลังซื้อประมาณ {cash_left:,.2f} บาท",
+        f"เงินสดคงเหลืออย่างน้อยประมาณ {cash_left:,.2f} บาท",
         f"จำกัดมูลค่าหุ้นตัวนี้ไม่เกิน {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต",
         "งบ: " + concise_fundamental(item["fundamental"]),
         f"แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}% "
@@ -2417,7 +2454,9 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             "🪙 จำนวนนี้เป็น Odd Lot; ตรวจว่าโบรกเกอร์รองรับและดูราคากระดานหน่วยย่อยก่อนซื้อ"
         )
     lines.extend([
-        "ตรวจราคาจริงและค่าธรรมเนียมก่อนส่งคำสั่ง; "
+        "กรอบซื้ออิง SMA20/SMA50 และ ATR14 ไม่ใช่มูลค่าเหมาะสม; "
+        "หากราคาออกนอกกรอบให้ประเมินใหม่ ไม่ไล่ราคา",
+        "ตรวจราคาจริง หน่วยราคา และค่าธรรมเนียมก่อนส่งคำสั่ง; "
         "หลังซื้อจริงให้แจ้ง บันทึกซื้อ [ชื่อหุ้น] [จำนวน] [ราคา]",
         "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
         "หุ้น 100% อาจขาดทุนเกิน 10%",
