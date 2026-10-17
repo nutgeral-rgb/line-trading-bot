@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import copy
 import json
 import hashlib
 import logging
@@ -31,6 +32,7 @@ from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
+from long_term_review import HORIZONS, assess_holding, evaluate_recommendations
 from position_risk import estimate_position
 from set100_constituents import (
     SET100_EFFECTIVE_FROM,
@@ -59,13 +61,13 @@ line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
 # ใช้ฐานข้อมูล PostgreSQL ภายนอกได้ด้วย DATABASE_URL
-# หากไม่ตั้งค่า จะใช้ไฟล์ในเครื่อง ซึ่งอาจหายเมื่อ Render Free รีสตาร์ต
+# การรันในเครื่องใช้ไฟล์ได้ แต่บน Render ต้องตั้ง DATABASE_URL
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORTFOLIO_FILE_PATH = os.getenv("PORTFOLIO_FILE_PATH", "").strip()
 if not DATABASE_URL and not PORTFOLIO_FILE_PATH:
     logger.warning(
-        "ยังไม่ได้ตั้ง DATABASE_URL หรือ PORTFOLIO_FILE_PATH; "
-        "ข้อมูลพอร์ตอาจหายเมื่อ Deploy หรือรีสตาร์ต"
+        "ยังไม่ได้ตั้ง DATABASE_URL; บน Render จะงดบันทึกพอร์ต "
+        "จนกว่าจะเชื่อมฐานข้อมูลถาวร"
     )
 PORTFOLIO_FILE = Path(
     PORTFOLIO_FILE_PATH or "portfolio.json"
@@ -74,24 +76,23 @@ ON_RENDER = bool(os.getenv("RENDER"))
 def portfolio_storage_status():
     """Describe the configured portfolio storage without exposing secrets."""
     if DATABASE_URL:
+        try:
+            with _connect_portfolio_database() as connection:
+                connection.execute("SELECT 1").fetchone()
+        except Exception:
+            logger.exception("ตรวจการเชื่อมฐานข้อมูลพอร์ตไม่สำเร็จ")
+            return ("PostgreSQL ยังไม่พร้อม", "ตรวจ DATABASE_URL และสถานะฐานข้อมูล")
         return (
             "PostgreSQL",
-            "บันทึกในฐานข้อมูล ไม่ผูกกับไฟล์ชั่วคราวของ Web Service",
+            "เชื่อมต่อได้และบันทึกนอกไฟล์ชั่วคราวของ Web Service",
         )
-    if PORTFOLIO_FILE_PATH:
-        if ON_RENDER:
-            return (
-                "ไฟล์ตาม path ที่กำหนด",
-                "บน Render ต้องตรวจสอบว่า path อยู่บน Persistent Disk "
-                "(แผน Free ใช้ดิสก์ถาวรไม่ได้)",
-            )
-        return ("ไฟล์ตาม path ที่กำหนด", str(PORTFOLIO_FILE))
     if ON_RENDER:
         return (
-            "พื้นที่ชั่วคราวของ Render",
-            "ข้อมูลอาจหายเมื่อ Deploy, รีสตาร์ต หรือบริการพักตัว; "
-            "ต้องตั้ง DATABASE_URL เพื่อเก็บพอร์ตถาวร",
+            "ยังไม่เปิดการบันทึกบน Render",
+            "ตั้ง DATABASE_URL ให้เชื่อม PostgreSQL ภายนอกก่อนใช้พอร์ต",
         )
+    if PORTFOLIO_FILE_PATH:
+        return ("ไฟล์ตาม path ที่กำหนด", str(PORTFOLIO_FILE))
     return ("ไฟล์ local", str(PORTFOLIO_FILE))
 
 
@@ -180,10 +181,13 @@ def utc_text():
 
 def _new_portfolio():
     return {
-        "cash": 10000.0,
+        # A plan amount is not a deposit. Start with zero until LINE records
+        # the actual balance, so a new user never sees fictitious buying power.
+        "cash": 0.0,
         "stocks": {},
         "history": [],
         "watchlist": [],
+        "long_term_recommendations": [],
         "overnight_plan": None,
     }
 
@@ -226,6 +230,35 @@ def _connect_portfolio_database():
                         )
                         """
                     )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS line_bot_portfolio_revisions (
+                            revision_id BIGSERIAL PRIMARY KEY,
+                            user_id TEXT NOT NULL,
+                            portfolio JSONB NOT NULL,
+                            saved_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    # Import a local file only while the database is empty.
+                    # Existing database rows always take precedence.
+                    has_rows = connection.execute(
+                        "SELECT EXISTS (SELECT 1 FROM line_bot_portfolios)"
+                    ).fetchone()[0]
+                    if not has_rows:
+                        previous_data = _load_portfolios_file_unlocked()
+                        if previous_data:
+                            connection.executemany(
+                                """
+                                INSERT INTO line_bot_portfolios (user_id, portfolio)
+                                VALUES (%s, %s)
+                                ON CONFLICT (user_id) DO NOTHING
+                                """,
+                                [
+                                    (user_id, Jsonb(portfolio))
+                                    for user_id, portfolio in previous_data.items()
+                                ],
+                            )
                     connection.commit()
                     _portfolio_database_ready = True
         except Exception:
@@ -236,35 +269,15 @@ def _connect_portfolio_database():
 
 def _load_all_portfolios_unlocked():
     if not DATABASE_URL:
+        if ON_RENDER:
+            raise RuntimeError("Render ต้องมี DATABASE_URL เพื่อเก็บพอร์ตถาวร")
         return _load_portfolios_file_unlocked()
 
     with _connect_portfolio_database() as connection:
         rows = connection.execute(
             "SELECT user_id, portfolio FROM line_bot_portfolios"
         ).fetchall()
-        if rows:
-            return {
-                user_id: portfolio
-                for user_id, portfolio in rows
-            }
-
-        # ย้ายข้อมูลไฟล์เดิมเข้า DB ครั้งแรก หากไฟล์นั้นยังมีข้อมูล
-        data = _load_portfolios_file_unlocked()
-        if data:
-            connection.executemany(
-                """
-                INSERT INTO line_bot_portfolios (user_id, portfolio)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET portfolio = EXCLUDED.portfolio,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                [
-                    (user_id, Jsonb(portfolio))
-                    for user_id, portfolio in data.items()
-                ],
-            )
-        return data
+        return {user_id: portfolio for user_id, portfolio in rows}
 
 
 def load_all_portfolios():
@@ -274,21 +287,10 @@ def load_all_portfolios():
 
 def _save_all_portfolios_unlocked(data):
     if DATABASE_URL:
-        with _connect_portfolio_database() as connection:
-            connection.executemany(
-                """
-                INSERT INTO line_bot_portfolios (user_id, portfolio)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET portfolio = EXCLUDED.portfolio,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                [
-                    (user_id, Jsonb(portfolio))
-                    for user_id, portfolio in data.items()
-                ],
-            )
-        return
+        raise RuntimeError("ใช้ mutate_portfolio สำหรับการแก้ไขพอร์ตในฐานข้อมูล")
+
+    if ON_RENDER:
+        raise RuntimeError("Render ต้องมี DATABASE_URL เพื่อเก็บพอร์ตถาวร")
 
     PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
@@ -343,6 +345,9 @@ def export_portfolio_backup(user_id):
                 "investment_strategy": (
                     {
                         "style": "LONG_TERM",
+                        "starting_capital": portfolio.get(
+                            "investment_strategy", {}
+                        ).get("starting_capital", 6000.0),
                         "target_equity_pct": 100.0,
                         "target_cash_pct": 0.0,
                         "allocation_version": 2,
@@ -452,6 +457,7 @@ def validate_portfolio_backup(raw_text):
         if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
             raise ValueError("แผนลงทุนในไฟล์สำรองไม่ถูกต้อง")
         contribution = strategy.get("monthly_contribution_baht", 500.0)
+        starting_capital = strategy.get("starting_capital", 6000.0)
         if (
             isinstance(contribution, bool)
             or not isinstance(contribution, (int, float))
@@ -459,9 +465,16 @@ def validate_portfolio_backup(raw_text):
             or not 500 <= contribution <= 1000
         ):
             raise ValueError("ยอดเงินเติมรายเดือนในไฟล์สำรองต้องอยู่ระหว่าง 500–1,000 บาท")
+        if (
+            isinstance(starting_capital, bool)
+            or not isinstance(starting_capital, (int, float))
+            or not np.isfinite(starting_capital)
+            or starting_capital < 0
+        ):
+            raise ValueError("เงินตั้งต้นอ้างอิงในไฟล์สำรองไม่ถูกต้อง")
         restored["investment_strategy"] = {
             "style": "LONG_TERM",
-            "starting_capital": 10000.0,
+            "starting_capital": float(starting_capital),
             "max_temporary_loss_pct": 10.0,
             "target_equity_pct": 100.0,
             "target_cash_pct": 0.0,
@@ -478,6 +491,46 @@ def validate_portfolio_backup(raw_text):
 
 
 def get_portfolio(user_id):
+    if DATABASE_URL:
+        with _connect_portfolio_database() as connection:
+            connection.execute(
+                """
+                INSERT INTO line_bot_portfolios (user_id, portfolio)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id, Jsonb(_new_portfolio())),
+            )
+            portfolio = connection.execute(
+                "SELECT portfolio FROM line_bot_portfolios WHERE user_id = %s FOR UPDATE",
+                (user_id,),
+            ).fetchone()[0]
+            strategy = portfolio.get("investment_strategy")
+            try:
+                version = (
+                    int(strategy.get("allocation_version", 0) or 0)
+                    if isinstance(strategy, dict) else 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                version = 0
+            if isinstance(strategy, dict) and strategy.get("style") == "LONG_TERM" and version < 2:
+                strategy.update({
+                    "target_equity_pct": 100.0,
+                    "target_cash_pct": 0.0,
+                    "allocation_version": 2,
+                    "updated_at": utc_text(),
+                })
+                portfolio["overnight_plan"] = None
+                connection.execute(
+                    """
+                    UPDATE line_bot_portfolios
+                    SET portfolio = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                    """,
+                    (Jsonb(portfolio), user_id),
+                )
+            return portfolio
+
     with _portfolio_lock:
         all_p = _load_all_portfolios_unlocked()
         if user_id not in all_p:
@@ -508,6 +561,55 @@ def get_portfolio(user_id):
 
 
 def mutate_portfolio(user_id, func):
+    if DATABASE_URL:
+        # Lock only this user. Updating every user's JSON on each command can
+        # overwrite another request, even when the database itself is durable.
+        with _connect_portfolio_database() as connection:
+            connection.execute(
+                """
+                INSERT INTO line_bot_portfolios (user_id, portfolio)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id, Jsonb(_new_portfolio())),
+            )
+            portfolio = connection.execute(
+                """
+                SELECT portfolio FROM line_bot_portfolios
+                WHERE user_id = %s FOR UPDATE
+                """,
+                (user_id,),
+            ).fetchone()[0]
+            previous = copy.deepcopy(portfolio)
+            result = func(portfolio)
+            if portfolio != previous:
+                connection.execute(
+                    """
+                    INSERT INTO line_bot_portfolio_revisions (user_id, portfolio)
+                    VALUES (%s, %s)
+                    """,
+                    (user_id, Jsonb(previous)),
+                )
+                connection.execute(
+                    """
+                    UPDATE line_bot_portfolios
+                    SET portfolio = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                    """,
+                    (Jsonb(portfolio), user_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM line_bot_portfolio_revisions
+                    WHERE user_id = %s AND revision_id NOT IN (
+                        SELECT revision_id FROM line_bot_portfolio_revisions
+                        WHERE user_id = %s ORDER BY revision_id DESC LIMIT 30
+                    )
+                    """,
+                    (user_id, user_id),
+                )
+            return result
+
     with _portfolio_lock:
         all_p = _load_all_portfolios_unlocked()
         if user_id not in all_p:
@@ -616,7 +718,7 @@ def get_stock_history(symbol, period="3mo"):
         return None
 
 
-def get_market_frames(symbols):
+def get_market_frames(symbols, period="6mo"):
     unique_symbols = sorted(set(symbols))
     if not unique_symbols:
         return {}
@@ -626,14 +728,14 @@ def get_market_frames(symbols):
     symbols_to_fetch = []
     with _market_data_cache_lock:
         for sym in unique_symbols:
-            cached = _market_data_cache.get(sym)
+            cached = _market_data_cache.get((sym, period))
             if cached and now - cached[0] < _MARKET_DATA_CACHE_TTL_SECONDS:
                 frames[sym] = cached[1].copy(deep=True)
             else:
                 symbols_to_fetch.append(sym)
 
     def fetch_one(sym):
-        return sym, get_stock_history(sym, period="6mo")
+        return sym, get_stock_history(sym, period=period)
 
     short_history = []
     # Keep provider load modest; failed symbols are retried on the next request.
@@ -644,7 +746,7 @@ def get_market_frames(symbols):
                 if df is not None and len(df) >= 20:
                     frames[sym] = df
                     with _market_data_cache_lock:
-                        _market_data_cache[sym] = (
+                        _market_data_cache[(sym, period)] = (
                             time.monotonic(),
                             df.copy(deep=True),
                         )
@@ -1819,7 +1921,7 @@ def handle_backup_file(event):
     )
 
 
-def build_long_term_accumulation_plan(portfolio):
+def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     """Screen SET100 candidates for a cautious, user-triggered accumulation review."""
     strategy = portfolio.get("investment_strategy", {})
     expected_session = latest_completed_set_session(now_bkk())
@@ -1834,7 +1936,9 @@ def build_long_term_accumulation_plan(portfolio):
         previous_session.isoformat(),
     }
     symbols = sorted(set(UNIVERSE) | set(portfolio.get("stocks", {}).keys()))
-    frames = get_market_frames(symbols)
+    # Six calendar months often contain fewer than the 127 trading closes
+    # required by the trend screen. Fetch one year for this plan.
+    frames = get_market_frames(symbols, period="1y")
     ctx = market_context(frames)
     if not ctx["sufficient"]:
         return (
@@ -1931,6 +2035,19 @@ def build_long_term_accumulation_plan(portfolio):
         elif int(fundamental.get("valuation_concern", 0) or 0) > 0:
             summary += " · ⚠️ ควรทบทวนมูลค่า"
         return summary
+
+    def note_recommendations(items, odd_lot=False):
+        if recommendation_snapshots is None:
+            return
+        for item in items:
+            recommendation_snapshots.append({
+                "signal_date": ctx["date"],
+                "symbol": item["symbol"],
+                "signal_close": item["close"],
+                "fundamental_period": item["fundamental"].get("statement_period"),
+                "estimated_odd_lot": odd_lot,
+                "delivery_status": "PENDING",
+            })
 
     if unpriced_holdings:
         return "\n".join(
@@ -2261,6 +2378,7 @@ def build_long_term_accumulation_plan(portfolio):
                 "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
                 "หุ้น 100% อาจขาดทุนเกิน 10%"
             )
+            note_recommendations(odd_lot_candidates, odd_lot=True)
             return "\n".join(lines)
         return "\n".join(
             header
@@ -2317,6 +2435,7 @@ def build_long_term_accumulation_plan(portfolio):
         "ข้อมูลนี้ไม่ใช่คำสั่งซื้ออัตโนมัติหรือการรับประกันผลตอบแทน"
     )
     lines.append("หุ้น 100% อาจขาดทุนเกิน 10%")
+    note_recommendations(chosen)
     return "\n".join(lines)
 
 _long_term_users = set()
@@ -2325,14 +2444,52 @@ _long_term_users = set()
 def _prepare_long_term_recommendation(user_id):
     try:
         portfolio = get_portfolio(user_id)
+        snapshots = []
         if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
             result = "ยังไม่ได้เปิดแผนลงทุนระยะยาว จึงไม่ได้จัดแผนสะสมหุ้น"
         else:
-            result = build_long_term_accumulation_plan(portfolio)
+            result = build_long_term_accumulation_plan(portfolio, snapshots)
+        if snapshots:
+            def save_pending(current):
+                if (
+                    current.get("cash") != portfolio.get("cash")
+                    or current.get("stocks") != portfolio.get("stocks")
+                ):
+                    return False
+                records = current.setdefault("long_term_recommendations", [])
+                existing = {
+                    (row.get("signal_date"), row.get("symbol")): row
+                    for row in records if isinstance(row, dict)
+                }
+                for snapshot in snapshots:
+                    key = (snapshot["signal_date"], snapshot["symbol"])
+                    if key not in existing:
+                        records.append(snapshot)
+                current["long_term_recommendations"] = records[-600:]
+                return True
+
+            if not mutate_portfolio(user_id, save_pending):
+                result = "พอร์ตเปลี่ยนระหว่างวิเคราะห์ กรุณาเรียก แนะนำหุ้นสะสม ใหม่"
+                snapshots = []
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text=result),
         )
+        if snapshots:
+            def confirm_sent(current):
+                keys = {(row["signal_date"], row["symbol"]) for row in snapshots}
+                for row in current.get("long_term_recommendations", []):
+                    if (row.get("signal_date"), row.get("symbol")) in keys:
+                        row["delivery_status"] = "SENT"
+                        row["sent_at"] = utc_text()
+
+            try:
+                mutate_portfolio(user_id, confirm_sent)
+            except Exception:
+                # The recommendation was already delivered. Reporting that no
+                # advice was sent would be false; keep the unconfirmed record
+                # out of measured results until it can be reconciled.
+                logger.exception("ส่งคำแนะนำแล้ว แต่ยืนยันสถานะบันทึกไม่สำเร็จ")
     except Exception:
         logger.exception("จัดทำหรือส่งแผนสะสมระยะยาวไม่สำเร็จ")
         try:
@@ -2376,14 +2533,237 @@ def queue_long_term_recommendation(user_id):
     return True
 
 
+_long_term_review_users = set()
+
+
+def build_long_term_review(portfolio):
+    """Review saved signals and actual holdings after a completed SET session."""
+    expected = latest_completed_set_session(now_bkk())
+    previous = latest_completed_set_session(
+        datetime.combine(expected, datetime.min.time())
+    )
+    allowed_dates = {expected.isoformat(), previous.isoformat()}
+    cutoff = (now_bkk().date() - timedelta(days=370)).isoformat()
+    records = [
+        row for row in portfolio.get("long_term_recommendations", [])
+        if isinstance(row, dict)
+        and row.get("delivery_status") == "SENT"
+        and isinstance(row.get("signal_date"), str)
+        and row["signal_date"] >= cutoff
+    ]
+    holdings = portfolio.get("stocks", {})
+    symbols = sorted(
+        {row["symbol"] for row in records if isinstance(row.get("symbol"), str)}
+        | set(holdings)
+    )
+    frames = get_market_frames(symbols, period="2y") if symbols else {}
+    benchmark = get_stock_history("^SET.BK", period="2y") if records else None
+    observations, summaries = evaluate_recommendations(
+        records, frames, benchmark, cost_rate=ESTIMATED_BUY_COST_RATE
+    )
+    lines = [
+        "📊 ทบทวนแผนลงทุนระยะยาว",
+        f"ข้อมูลราคาถึงวันซื้อขาย {expected.isoformat()} (เมื่อผู้ให้บริการมีข้อมูล)",
+        "ผลติดตามหุ้นที่บอตเคยแนะนำและส่งสำเร็จ:",
+    ]
+    if not records:
+        lines.append("ยังไม่มีบันทึกคำแนะนำเดิม เริ่มเก็บตั้งแต่ระบบรุ่นนี้")
+    elif not summaries:
+        lines.append("ยังไม่มีคำแนะนำที่ครบ 20 วันซื้อขาย หรือข้อมูลราคายังไม่พอ")
+    else:
+        for horizon in HORIZONS:
+            metric = summaries.get(horizon)
+            if metric is None:
+                continue
+            line = (
+                f"• {horizon} วัน: บวก {metric['positive_count']}/"
+                f"{metric['count']} ตัว | ผลตอบแทนเฉลี่ยหลังต้นทุนประมาณ "
+                f"{metric['mean_net_return'] * 100:+.1f}%"
+            )
+            if metric["comparable_count"]:
+                line += (
+                    f" | ชนะ SET {metric['beat_benchmark_count']}/"
+                    f"{metric['comparable_count']} ตัว"
+                )
+            lines.append(line)
+        latest_rows = sorted(
+            observations,
+            key=lambda row: (row["signal_date"], row["horizon"]),
+            reverse=True,
+        )
+        latest_by_symbol = {}
+        for row in latest_rows:
+            latest_by_symbol.setdefault(row["symbol"], row)
+        for row in list(latest_by_symbol.values())[:3]:
+            lines.append(
+                f"  {display_stock_symbol(row['symbol'])} "
+                f"({row['horizon']} วัน) {row['net_return'] * 100:+.1f}%"
+            )
+    if records:
+        lines.append(
+            "นับจากราคาเปิดวันซื้อขายถัดไป; หักต้นทุนซื้อ/ขายโดยประมาณ "
+            "ผลนี้ไม่รวมงบย้อนหลังหรือการซื้อจริงของคุณ"
+        )
+
+    lines.append("\nหุ้นที่บันทึกว่าถืออยู่:")
+    if not holdings:
+        lines.append("ยังไม่มีหุ้นที่บันทึกไว้")
+    else:
+        symbols_held = [
+            symbol for symbol, info in holdings.items()
+            if int(info.get("shares", 0) or 0) > 0
+        ]
+        if not symbols_held:
+            lines.append("ยังไม่มีหุ้นที่บันทึกไว้")
+        reviewed_symbols = symbols_held[:10]
+        if len(symbols_held) > len(reviewed_symbols):
+            lines.append(f"แสดง 10 จาก {len(symbols_held)} ตัวที่ถือ")
+        if reviewed_symbols:
+            with ThreadPoolExecutor(max_workers=min(2, len(reviewed_symbols))) as executor:
+                fundamentals = list(executor.map(analyze_fundamentals, reviewed_symbols))
+        else:
+            fundamentals = []
+        for symbol, fundamental in zip(reviewed_symbols, fundamentals):
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                lines.append(f"• {display_stock_symbol(symbol)}: ข้อมูลราคาไม่พอ ยังไม่สรุปขาย")
+                continue
+            latest_day = frame.index[-1].strftime("%Y-%m-%d")
+            if latest_day not in allowed_dates:
+                lines.append(f"• {display_stock_symbol(symbol)}: ราคาล่าสุดเก่า ({latest_day}) ยังไม่สรุปขาย")
+                continue
+            review = assess_holding(frame, fundamental, holdings[symbol].get("avg_price"))
+            pnl = review.get("pnl_pct")
+            pnl_text = f" | เทียบต้นทุน {pnl * 100:+.1f}%" if pnl is not None else ""
+            lines.append(
+                f"• {display_stock_symbol(symbol)}: {review['status']}"
+                f"{pnl_text} — {', '.join(review['reasons'])}"
+            )
+    recent_unheld = []
+    for record in sorted(records, key=lambda row: row["signal_date"], reverse=True):
+        symbol = record["symbol"]
+        if symbol not in holdings and symbol not in recent_unheld:
+            recent_unheld.append(symbol)
+        if len(recent_unheld) == 3:
+            break
+    if recent_unheld:
+        lines.append("\nหุ้นที่เคยแนะนำ แต่ไม่ได้บันทึกว่าถือ (ไม่ทราบว่าซื้อจริงหรือไม่):")
+        with ThreadPoolExecutor(max_workers=min(2, len(recent_unheld))) as executor:
+            past_fundamentals = list(executor.map(analyze_fundamentals, recent_unheld))
+        for symbol, fundamental in zip(recent_unheld, past_fundamentals):
+            frame = frames.get(symbol)
+            if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") not in allowed_dates:
+                lines.append(f"• {display_stock_symbol(symbol)}: ราคาล่าสุดไม่พอ ยังไม่สรุป")
+                continue
+            review = assess_holding(frame, fundamental, None)
+            lines.append(
+                f"• {display_stock_symbol(symbol)}: {review['status']} — "
+                + ", ".join(review["reasons"])
+            )
+    lines.append(
+        "คำว่า พิจารณาขาย/ลด เป็นสัญญาณให้ตรวจงบและราคาอีกครั้ง "
+        "บอตไม่ส่งคำสั่งซื้อขาย"
+    )
+    return "\n".join(lines)
+
+
+def _send_long_term_review(user_id):
+    try:
+        portfolio = get_portfolio(user_id)
+        if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+            return
+        result = build_long_term_review(portfolio)
+        line_bot_api.push_message(user_id, TextSendMessage(text=result))
+    except Exception:
+        logger.exception("ทบทวนพอร์ตระยะยาวไม่สำเร็จ")
+    finally:
+        with _on_demand_lock:
+            _long_term_review_users.discard(user_id)
+
+
+def queue_long_term_review(user_id):
+    ensure_scheduler()
+    with _on_demand_lock:
+        if user_id in _long_term_review_users:
+            return False
+        _long_term_review_users.add(user_id)
+    try:
+        scheduler.add_job(
+            _send_long_term_review,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
+            args=[user_id],
+            id="long-term-review-" + hashlib.sha256(user_id.encode()).hexdigest()[:20],
+            replace_existing=True,
+            max_instances=1,
+        )
+    except Exception:
+        with _on_demand_lock:
+            _long_term_review_users.discard(user_id)
+        raise
+    return True
+
+
+def send_closed_day_reviews():
+    """Send at most one automatic review per user per week on closed days."""
+    today = now_bkk().date()
+    if is_set_session(today):
+        return
+    for user_id in registered_users():
+        try:
+            portfolio = get_portfolio(user_id)
+            if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+                continue
+            if not portfolio.get("long_term_recommendations") and not portfolio.get("stocks"):
+                continue
+            previous = portfolio.get("closed_day_review") or {}
+            last_day = previous.get("date")
+            if isinstance(last_day, str):
+                try:
+                    days_ago = (today - datetime.fromisoformat(last_day).date()).days
+                except ValueError:
+                    days_ago = 99
+                if 0 <= days_ago < 6 and previous.get("status") in {"SENT", "UNKNOWN"}:
+                    continue
+                if 0 <= days_ago < 1 and previous.get("status") == "PENDING":
+                    continue
+
+            def mark_pending(current):
+                current["closed_day_review"] = {
+                    "date": today.isoformat(), "status": "PENDING",
+                }
+
+            mutate_portfolio(user_id, mark_pending)
+            report = build_long_term_review(portfolio)
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=report))
+            except Exception:
+                def mark_unknown(current):
+                    current["closed_day_review"] = {
+                        "date": today.isoformat(), "status": "UNKNOWN",
+                    }
+                mutate_portfolio(user_id, mark_unknown)
+                raise
+
+            def mark_sent(current):
+                current["closed_day_review"] = {
+                    "date": today.isoformat(), "status": "SENT",
+                }
+
+            mutate_portfolio(user_id, mark_sent)
+        except Exception:
+            logger.exception("ส่งทบทวนวันตลาดปิดไม่สำเร็จ")
+
+
 def help_text():
     return (
         "📊 PORTFOLIO BOT\n"
         "เมนูคำสั่ง LINE\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "📈 แผนลงทุน\n"
-        "ตั้งแผนลงทุนระยะยาว — เป้าหมายหุ้น 100%\n"
+        "ตั้งแผนลงทุนระยะยาว — ทุนอ้างอิง 6,000 บาท\n"
         "แนะนำหุ้นสะสม — คัดหุ้นใหม่ได้ทุกเมื่อ\n"
+        "ทบทวนหุ้นระยะยาว — ผลคำแนะนำเดิมและหุ้นที่ควรทบทวนขาย\n"
         "ตั้งเงินเติมรายเดือน 500 — กำหนด 500–1,000 บาท/เดือน\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
@@ -2393,8 +2773,11 @@ def help_text():
         "หมายเหตุ: ปิดแผนรายวันเมื่อเปิดโหมดระยะยาว\n\n"
         "💰 พอร์ตและเงินสด\n"
         "ดูพอร์ต — ดูเงินสดและหุ้นที่บันทึก\n"
-        "ตั้งเงินสด 10000 — ตั้งยอดเงินสดรวมให้ตรงบัญชีจริง\n"
+        "ดูพอร์ตแสดงยอดเงินเติมสะสมที่แจ้งบอตด้วย\n"
+        "ตั้งเงินสด 6000 — ตั้งยอดเงินสดรวมให้ตรงบัญชีจริง\n"
         "บันทึกเงินเติม 500 — เพิ่มยอดหลังฝากเงินจริงแล้ว\n"
+        "บันทึกซื้อ AOT 100 35.50 — เพิ่มหุ้นและหักเงินสด\n"
+        "บันทึกขาย AOT 100 40 — ลดหุ้นและเพิ่มเงินสด\n"
         "ตั้งหุ้น AOT 100 35.50 — บันทึกหุ้นและต้นทุน\n"
         "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดแล้ว\n"
         "ตรวจพอร์ตหลังซื้อขายจริง เพื่อให้ยอดในบอตตรงบัญชี\n\n"
@@ -2403,8 +2786,8 @@ def help_text():
         "ติดตาม AOT — เพิ่มหุ้นในรายการติดตาม\n"
         "เลิกติดตาม AOT — นำหุ้นออกจากรายการ\n"
         "รายการติดตาม — ดูหุ้นที่ติดตาม\n\n"
-        "📦 สำรองข้อมูล\n"
-        "สำรองพอร์ต — รับไฟล์ JSON สำหรับเก็บไว้\n"
+        "📦 ข้อมูลพอร์ต\n"
+        "สำรองพอร์ต — รับ JSON สำหรับการย้ายข้อมูลครั้งเดียว\n"
         "กู้คืน — ส่งไฟล์สำรอง JSON กลับเข้าแชต\n"
         "สถานะข้อมูล — ตรวจวิธีจัดเก็บพอร์ต\n\n"
         "พิมพ์ เมนู หรือ ช่วยเหลือ เพื่อเปิดหน้านี้อีกครั้ง\n"
@@ -2421,6 +2804,14 @@ def command_reply(user_id, text):
         "help",
     }:
         return help_text()
+
+    if text == "สถานะข้อมูล":
+        storage_name, storage_detail = portfolio_storage_status()
+        return (
+            "🗄️ สถานะการเก็บข้อมูลพอร์ต\n"
+            f"วิธีเก็บ: {storage_name}\n"
+            f"รายละเอียด: {storage_detail}"
+        )
 
     if text.startswith("วิเคราะห์ "):
         symbol = normalize_stock_symbol(text[len("วิเคราะห์ "):])
@@ -2517,18 +2908,30 @@ def command_reply(user_id, text):
         )
         return "\n".join(lines)
 
-    portfolio = get_portfolio(user_id)
+    try:
+        portfolio = get_portfolio(user_id)
+    except Exception:
+        logger.exception("เปิดข้อมูลพอร์ตไม่สำเร็จ")
+        return (
+            "⚠️ ยังเข้าถึงที่เก็บพอร์ตถาวรไม่ได้ "
+            "ระบบงดบันทึกและแนะนำจากยอดเงินที่อาจหาย "
+            "พิมพ์ สถานะข้อมูล เพื่อตรวจสอบ"
+        )
 
     if text == "ตั้งแผนลงทุนระยะยาว":
         def enable_long_term(p):
+            existing = p.get("investment_strategy") or {}
+            monthly = existing.get("monthly_contribution_baht", 500.0)
+            if not isinstance(monthly, (int, float)) or not 500 <= monthly <= 1000:
+                monthly = 500.0
             p["investment_strategy"] = {
                 "style": "LONG_TERM",
-                "starting_capital": 10000.0,
+                "starting_capital": 6000.0,
                 "max_temporary_loss_pct": 10.0,
                 "target_equity_pct": 100.0,
                 "target_cash_pct": 0.0,
                 "allocation_version": 2,
-                "monthly_contribution_baht": 500.0,
+                "monthly_contribution_baht": float(monthly),
                 "market_scope": "TH",
                 "review_frequency": "on_demand",
                 "updated_at": utc_text(),
@@ -2536,11 +2939,12 @@ def command_reply(user_id, text):
             p["overnight_plan"] = None
             return (
                 "✅ บันทึกแนวทางลงทุนระยะยาวแล้ว\n"
-                "เงินตั้งต้นอ้างอิง 10,000 บาท\n"
+                f"เงินตั้งต้นอ้างอิง 6,000 บาท เติมตามแผน {monthly:,.0f} บาท/เดือน\n"
+                "ยอดเงินสดจริงใช้ค่าที่บันทึกไว้ในพอร์ต "
+                "หากเริ่มใหม่ให้พิมพ์ ตั้งเงินสด 6000 หลังมีเงินลงทุนจริง\n"
                 "เป้าหมาย: หุ้นไทย 100% ของมูลค่าพอร์ตที่บันทึก "
                 "เงินสดเป้าหมาย 0% (เงินสดจริงที่ยังไม่มีหุ้นผ่านเกณฑ์จะคงไว้ชั่วคราว)\n"
-                "ตั้งแผนเติมเงินเริ่มต้น 500 บาท/เดือน "
-                "(ปรับได้ 500–1,000 บาท ด้วยคำสั่ง ตั้งเงินเติมรายเดือน)\n"
+                "ปรับเงินเติมได้ 500–1,000 บาทด้วยคำสั่ง ตั้งเงินเติมรายเดือน\n"
                 "ทบทวนได้ทุกเมื่อด้วยคำสั่ง แนะนำหุ้นสะสม; "
                 "บอตไม่ซื้อขายหรือฝากเงินแทน\n"
                 "⚠️ หุ้น 100% ไม่สอดคล้องกับเป้าหมายขาดทุนไม่เกิน 10% "
@@ -2585,6 +2989,19 @@ def command_reply(user_id, text):
             "(อาจใช้เวลาสักครู่)"
         )
 
+    if text in {"ทบทวนหุ้นระยะยาว", "ผลคำแนะนำ", "หุ้นไหนควรขาย"}:
+        if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+            return "เปิดแผนก่อนด้วยคำสั่ง ตั้งแผนลงทุนระยะยาว"
+        try:
+            started = queue_long_term_review(user_id)
+        except Exception:
+            logger.exception("เริ่มทบทวนหุ้นระยะยาวไม่สำเร็จ")
+            return "ยังเริ่มทบทวนไม่ได้ โปรดลองใหม่ภายหลัง"
+        return (
+            "กำลังตรวจผลคำแนะนำและหุ้นที่ถือ เมื่อเสร็จจะส่งในแชตนี้"
+            if started else "กำลังทบทวนอยู่ เมื่อเสร็จจะส่งผลในแชตนี้"
+        )
+
     if text == "ดูแนวทางลงทุน":
         strategy = portfolio.get("investment_strategy")
         if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
@@ -2595,7 +3012,7 @@ def command_reply(user_id, text):
         return (
             "📌 แนวทางลงทุนที่บันทึกไว้\n"
             "ตลาด: หุ้นไทย\n"
-            f"เงินตั้งต้นอ้างอิง: {strategy.get('starting_capital', 10000):,.0f} บาท\n"
+            f"เงินตั้งต้นอ้างอิง: {strategy.get('starting_capital', 6000):,.0f} บาท\n"
             f"หุ้นเป้าหมาย: {strategy.get('target_equity_pct', 100):.0f}% | "
             f"เงินสดเป้าหมาย: {strategy.get('target_cash_pct', 0):.0f}%\n"
             f"แผนเติมเงิน: {strategy.get('monthly_contribution_baht', 500):,.0f} บาท/เดือน "
@@ -2681,14 +3098,6 @@ def command_reply(user_id, text):
         ])
         return "\n".join(lines)
 
-    if text == "สถานะข้อมูล":
-        storage_name, storage_detail = portfolio_storage_status()
-        return (
-            "🗄️ สถานะการเก็บข้อมูลพอร์ต\n"
-            f"วิธีเก็บ: {storage_name}\n"
-            f"รายละเอียด: {storage_detail}"
-        )
-
     if text == "สำรองพอร์ต":
         try:
             backup = export_portfolio_backup(user_id)
@@ -2757,6 +3166,21 @@ def command_reply(user_id, text):
     if text == "ดูพอร์ต":
         cash = portfolio["cash"]
         stocks = portfolio["stocks"]
+        contribution_total = 0.0
+        contribution_month = 0.0
+        current_month = now_bkk().strftime("%Y-%m")
+        for entry in portfolio.get("history", []):
+            if not isinstance(entry, dict) or entry.get("type") != "MONTHLY_CONTRIBUTION":
+                continue
+            try:
+                amount = float(entry.get("amount", 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not np.isfinite(amount) or amount <= 0:
+                continue
+            contribution_total += amount
+            if entry.get("month") == current_month:
+                contribution_month += amount
         total_stock_cost = sum(
             stock["shares"]
             * stock["avg_price"]
@@ -2774,6 +3198,8 @@ def command_reply(user_id, text):
             f"{total_stock_cost:,.2f} บาท",
             "💰 รวมตามข้อมูลที่บันทึก: "
             f"{total_value:,.2f} บาท",
+            f"📥 เงินเติมที่บันทึกสะสม: {contribution_total:,.2f} บาท "
+            f"(เดือนนี้ {contribution_month:,.2f} บาท)",
             "",
         ]
         if stocks:
@@ -2835,10 +3261,10 @@ def command_reply(user_id, text):
 
     if text.startswith("บันทึกเงินเติม "):
         parts = text.split()
-        if len(parts) != 3:
+        if len(parts) != 2:
             return "รูปแบบ: บันทึกเงินเติม 500 (ใช้หลังฝากเงินจริงแล้ว)"
         try:
-            amount = float(parts[2].replace(",", ""))
+            amount = float(parts[1].replace(",", ""))
         except ValueError:
             return "ยอดเงินเติมต้องเป็นตัวเลขมากกว่า 0 บาท"
         if not np.isfinite(amount) or amount <= 0:
@@ -2886,10 +3312,85 @@ def command_reply(user_id, text):
 
         return mutate_portfolio(user_id, record_contribution)
 
+    if text.startswith("บันทึกซื้อ ") or text.startswith("บันทึกขาย "):
+        parts = text.split()
+        if len(parts) not in {4, 5}:
+            return "รูปแบบ: บันทึกซื้อ AOT 100 35.50 [ค่าใช้จ่ายจริง] หรือ บันทึกขาย AOT 100 40 [ค่าใช้จ่ายจริง]"
+        buying = parts[0] == "บันทึกซื้อ"
+        symbol = normalize_stock_symbol(parts[1])
+        try:
+            shares = int(parts[2].replace(",", ""))
+            price = float(parts[3].replace(",", ""))
+            gross = shares * price
+            fee = (
+                float(parts[4].replace(",", ""))
+                if len(parts) == 5 else gross * ESTIMATED_BUY_COST_RATE
+            )
+        except ValueError:
+            return "จำนวนหุ้น ราคา และค่าใช้จ่ายต้องเป็นตัวเลขที่ถูกต้อง"
+        if (
+            symbol is None or shares <= 0 or shares > 1_000_000_000
+            or not np.isfinite(price) or price <= 0
+            or not np.isfinite(fee) or fee < 0 or fee > gross * 0.05
+        ):
+            return "ข้อมูลรายการซื้อขายไม่ถูกต้อง ตรวจชื่อหุ้น จำนวน ราคา และค่าใช้จ่าย"
+
+        def record_trade(p):
+            cash = float(p.get("cash", 0) or 0)
+            holdings = p.setdefault("stocks", {})
+            old = holdings.get(symbol, {})
+            old_shares = int(old.get("shares", 0) or 0)
+            old_cost = float(old.get("avg_price", 0) or 0)
+            if buying:
+                total = gross + fee
+                if total > cash + 0.005:
+                    return (
+                        f"เงินสดในบอต {cash:,.2f} บาท ไม่พอซื้อรวมค่าใช้จ่าย "
+                        f"{total:,.2f} บาท; ตรวจยอดด้วยคำสั่ง ดูพอร์ต"
+                    )
+                new_shares = old_shares + shares
+                holdings[symbol] = {
+                    "shares": new_shares,
+                    "avg_price": (old_shares * old_cost + total) / new_shares,
+                }
+                p["cash"] = max(0.0, cash - total)
+                action = "ซื้อ"
+            else:
+                if shares > old_shares:
+                    return f"ถือ {display_stock_symbol(symbol)} เพียง {old_shares:,} หุ้น บันทึกขาย {shares:,} หุ้นไม่ได้"
+                new_shares = old_shares - shares
+                if new_shares:
+                    holdings[symbol] = {"shares": new_shares, "avg_price": old_cost}
+                else:
+                    holdings.pop(symbol, None)
+                p["cash"] = cash + gross - fee
+                action = "ขาย"
+                realized_pnl = gross - fee - shares * old_cost
+            p["overnight_plan"] = None
+            p.setdefault("history", []).append({
+                "type": "RECORDED_BUY" if buying else "RECORDED_SELL",
+                "symbol": symbol,
+                "shares": shares,
+                "price": price,
+                "fee": fee,
+                "fee_estimated": len(parts) == 4,
+                **({"realized_pnl": realized_pnl} if not buying else {}),
+                "recorded_at": utc_text(),
+            })
+            fee_note = " (ค่าใช้จ่ายประมาณ)" if len(parts) == 4 else ""
+            pnl_note = f" | กำไร/ขาดทุนตามต้นทุน {realized_pnl:+,.2f} บาท" if not buying else ""
+            return (
+                f"บันทึก{action} {display_stock_symbol(symbol)} {shares:,} หุ้น "
+                f"ราคา {price:,.2f} บาท ค่าใช้จ่าย {fee:,.2f} บาท{fee_note}\n"
+                f"คงเหลือ {new_shares:,} หุ้น | เงินสดในบอต {p['cash']:,.2f} บาท{pnl_note}"
+            )
+
+        return mutate_portfolio(user_id, record_trade)
+
     if text.startswith("ตั้งเงินสด "):
         parts = text.split()
         if len(parts) != 2:
-            return "รูปแบบ: ตั้งเงินสด 10000"
+            return "รูปแบบ: ตั้งเงินสด 6000"
         try:
             amount = float(parts[1].replace(",", ""))
         except ValueError:
@@ -3104,6 +3605,28 @@ def ensure_scheduler():
             max_instances=1,
             coalesce=True,
         )
+        worker_scheduler.add_job(
+            send_closed_day_reviews,
+            "cron",
+            hour=10,
+            minute="5,45",
+            id="closed-day-long-term-review",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        # Render Free can sleep through a cron time. A later wake-up on a
+        # closed day should still attempt the idempotent weekly review.
+        current = now_bkk()
+        if current.hour >= 10 and not is_set_session(current.date()):
+            worker_scheduler.add_job(
+                send_closed_day_reviews,
+                "date",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
+                id="closed-day-long-term-review-catchup",
+                replace_existing=True,
+                max_instances=1,
+            )
         worker_scheduler.start()
         scheduler = worker_scheduler
         _scheduler_pid = pid
