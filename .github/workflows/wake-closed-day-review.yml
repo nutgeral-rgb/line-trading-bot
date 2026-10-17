@@ -1,0 +1,14 @@
+name: Wake bot for closed-day portfolio review
+
+on:
+  schedule:
+    # 10:00 Asia/Bangkok daily. The bot itself checks the SET calendar.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake Render web service
+        run: curl --fail --silent --show-error --max-time 120 --retry 2 https://line-trading-bot-kj4a.onrender.com/
