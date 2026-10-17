@@ -1,9 +1,11 @@
-name: Wake bot for closed-day portfolio review
+name: Wake bot for portfolio schedules
 
 on:
   schedule:
     # 10:00 Asia/Bangkok daily. The bot itself checks the SET calendar.
     - cron: "0 3 * * *"
+    # 19:15-19:45 Asia/Bangkok on weekdays; free instances can sleep mid-screen.
+    - cron: "15,25,35,45 12 * * 1-5"
   workflow_dispatch:
 
 jobs:
