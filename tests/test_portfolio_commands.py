@@ -28,6 +28,7 @@ class PortfolioCommandTests(unittest.TestCase):
         bot.command_reply(self.user, "ตั้งเงินสด 6000")
         contribution = bot.command_reply(self.user, "บันทึกเงินเติม 500")
         self.assertIn("6,500.00", contribution)
+        self.assertIn("เงินเติมที่บันทึกสะสม: 500.00 บาท", bot.command_reply(self.user, "ดูพอร์ต"))
         purchase = bot.command_reply(self.user, "บันทึกซื้อ AOT 100 35.50 10")
         self.assertIn("100 หุ้น", purchase)
         portfolio = bot.get_portfolio(self.user)
