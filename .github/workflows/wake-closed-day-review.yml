@@ -2,6 +2,8 @@ name: Wake bot for portfolio schedules
 
 on:
   schedule:
+    # 08:20 and 08:50 Asia/Bangkok on weekdays for the morning long-term screen.
+    - cron: "20,50 1 * * 1-5"
     # 10:00 Asia/Bangkok daily. The bot itself checks the SET calendar.
     - cron: "0 3 * * *"
     # 19:15-19:45 Asia/Bangkok on weekdays; free instances can sleep mid-screen.

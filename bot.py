@@ -2562,10 +2562,10 @@ def queue_long_term_recommendation(user_id):
 
 
 def send_weekly_long_term_recommendations():
-    """Send one long-term screen per user each trading week after the close."""
+    """Send one long-term screen per user each trading week, starting in the morning."""
     current = now_bkk()
     today = current.date()
-    if current.hour < 19 or not is_set_session(today):
+    if current.hour < 8 or not is_set_session(today):
         return
     universe_warning = set100_universe_warning(today)
     year, week, _ = today.isocalendar()
@@ -2588,7 +2588,8 @@ def send_weekly_long_term_recommendations():
                 previous = current_portfolio.get("weekly_long_term_recommendation") or {}
                 if previous.get("week") == week_key and (
                     previous.get("status") == "SENT"
-                    or previous.get("date") == today.isoformat()
+                    or (previous.get("date") == today.isoformat()
+                        and previous.get("status") == "PENDING")
                 ):
                     return False
                 current_portfolio["weekly_long_term_recommendation"] = {
@@ -3743,6 +3744,28 @@ def ensure_scheduler():
             send_weekly_long_term_recommendations,
             "cron",
             day_of_week="mon-fri",
+            hour=8,
+            minute="30,50",
+            id="weekly-long-term-recommendations-morning-8",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_weekly_long_term_recommendations,
+            "cron",
+            day_of_week="mon-fri",
+            hour=9,
+            minute=5,
+            id="weekly-long-term-recommendations-morning-9",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_weekly_long_term_recommendations,
+            "cron",
+            day_of_week="mon-fri",
             hour=19,
             minute="20,50",
             id="weekly-long-term-recommendations",
@@ -3762,7 +3785,7 @@ def ensure_scheduler():
                 replace_existing=True,
                 max_instances=1,
             )
-        if current.hour >= 19 and is_set_session(current.date()):
+        if current.hour >= 8 and is_set_session(current.date()):
             worker_scheduler.add_job(
                 send_weekly_long_term_recommendations,
                 "date",
