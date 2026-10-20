@@ -114,8 +114,18 @@ def evaluate_recommendations(recommendations, frames, benchmark=None,
             })
 
     grouped = defaultdict(list)
-    for item in observations:
+    # A daily screen can repeat the same stock for many consecutive mornings.
+    # Keep every observation for the audit trail, but count only non-overlapping
+    # holding windows for that stock in aggregate accuracy statistics.
+    last_exit_by_horizon_symbol = {}
+    for item in sorted(observations, key=lambda row: (
+        row["entry_date"], row["signal_date"], row["symbol"], row["horizon"]
+    )):
+        key = (item["horizon"], item["symbol"])
+        if item["entry_date"] <= last_exit_by_horizon_symbol.get(key, ""):
+            continue
         grouped[item["horizon"]].append(item)
+        last_exit_by_horizon_symbol[key] = item["exit_date"]
     summaries = {}
     for horizon in horizons:
         rows = grouped[horizon]

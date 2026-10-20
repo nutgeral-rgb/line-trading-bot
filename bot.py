@@ -2458,6 +2458,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         "หากราคาออกนอกกรอบให้ประเมินใหม่ ไม่ไล่ราคา",
         "ตรวจราคาจริง หน่วยราคา และค่าธรรมเนียมก่อนส่งคำสั่ง; "
         "หลังซื้อจริงให้แจ้ง บันทึกซื้อ [ชื่อหุ้น] [จำนวน] [ราคา]",
+        "ข้อความรายวันไม่ได้หมายความว่าต้องซื้อทุกวัน",
         "ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำสั่งซื้ออัตโนมัติ; "
         "หุ้น 100% อาจขาดทุนเกิน 10%",
     ])
@@ -2500,6 +2501,10 @@ def _prepare_long_term_recommendation(user_id):
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text=result),
+        )
+        logger.info(
+            "ส่งผลคัดหุ้นสะสมสำเร็จ: มีหุ้นแนะนำ=%s",
+            bool(snapshots),
         )
         if snapshots:
             def confirm_sent(current):
@@ -2561,19 +2566,18 @@ def queue_long_term_recommendation(user_id):
     return True
 
 
-def send_weekly_long_term_recommendations():
-    """Send one long-term screen per user each trading week, starting in the morning."""
+def send_daily_long_term_recommendations():
+    """Send one long-term screen per user on each SET trading day."""
     current = now_bkk()
     today = current.date()
     if current.hour < 8 or not is_set_session(today):
         return
     universe_warning = set100_universe_warning(today)
-    year, week, _ = today.isocalendar()
-    week_key = f"{year}-W{week:02d}"
+    day_key = today.isoformat()
     try:
         users = registered_users()
     except Exception:
-        logger.exception("อ่านรายชื่อผู้ใช้เพื่อส่งหุ้นสะสมรายสัปดาห์ไม่สำเร็จ")
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อส่งหุ้นสะสมรายวันไม่สำเร็จ")
         return
 
     for user_id in users:
@@ -2581,20 +2585,13 @@ def send_weekly_long_term_recommendations():
             portfolio = get_portfolio(user_id)
             if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
                 continue
-            if float(portfolio.get("cash", 0) or 0) <= 0:
-                continue
 
             def claim(current_portfolio):
-                previous = current_portfolio.get("weekly_long_term_recommendation") or {}
-                if previous.get("week") == week_key and (
-                    previous.get("status") == "SENT"
-                    or (previous.get("date") == today.isoformat()
-                        and previous.get("status") == "PENDING")
-                ):
+                previous = current_portfolio.get("daily_long_term_recommendation") or {}
+                if previous.get("date") == day_key and previous.get("status") in {"SENT", "PENDING"}:
                     return False
-                current_portfolio["weekly_long_term_recommendation"] = {
-                    "week": week_key,
-                    "date": today.isoformat(),
+                current_portfolio["daily_long_term_recommendation"] = {
+                    "date": day_key,
                     "status": "PENDING",
                 }
                 return True
@@ -2608,7 +2605,7 @@ def send_weekly_long_term_recommendations():
                     _long_term_users.add(user_id)
             if busy:
                 def mark_busy(current_portfolio):
-                    current_portfolio["weekly_long_term_recommendation"]["status"] = "FAILED"
+                    current_portfolio["daily_long_term_recommendation"]["status"] = "FAILED"
                 mutate_portfolio(user_id, mark_busy)
                 continue
 
@@ -2626,12 +2623,12 @@ def send_weekly_long_term_recommendations():
                 sent = _prepare_long_term_recommendation(user_id)
 
             def record_result(current_portfolio):
-                previous = current_portfolio.get("weekly_long_term_recommendation") or {}
-                if previous.get("week") == week_key and previous.get("date") == today.isoformat():
+                previous = current_portfolio.get("daily_long_term_recommendation") or {}
+                if previous.get("date") == day_key:
                     previous["status"] = "SENT" if sent else "FAILED"
             mutate_portfolio(user_id, record_result)
         except Exception:
-            logger.exception("ส่งหุ้นสะสมรายสัปดาห์หนึ่งรายการไม่สำเร็จ")
+            logger.exception("ส่งหุ้นสะสมรายวันหนึ่งรายการไม่สำเร็จ")
 
 
 _long_term_review_users = set()
@@ -3024,7 +3021,7 @@ def command_reply(user_id, text):
 
     if text == "สถานะหุ้นสะสม":
         strategy = portfolio.get("investment_strategy") or {}
-        weekly = portfolio.get("weekly_long_term_recommendation") or {}
+        daily = portfolio.get("daily_long_term_recommendation") or {}
         sent_records = [
             row for row in portfolio.get("long_term_recommendations", [])
             if isinstance(row, dict) and row.get("delivery_status") == "SENT"
@@ -3032,14 +3029,14 @@ def command_reply(user_id, text):
         status_text = {
             "SENT": "ส่งข้อความแล้ว",
             "PENDING": "กำลังจัดทำหรือรอบก่อนถูกขัดจังหวะ",
-            "FAILED": "รอบล่าสุดไม่สำเร็จ จะลองใหม่ในวันซื้อขายถัดไป",
-        }.get(weekly.get("status"), "ยังไม่มีรอบส่ง")
+            "FAILED": "รอบล่าสุดไม่สำเร็จ จะลองใหม่ในรอบถัดไป",
+        }.get(daily.get("status"), "ยังไม่มีรอบส่ง")
         return (
             "🧭 สถานะหุ้นสะสม\n"
             f"แผนระยะยาว: {'เปิด' if strategy.get('style') == 'LONG_TERM' else 'ยังไม่เปิด'}\n"
-            f"รอบอัตโนมัติ: {weekly.get('week', 'ยังไม่มี')} — {status_text}\n"
+            f"รอบอัตโนมัติ: {daily.get('date', 'ยังไม่มี')} — {status_text}\n"
             f"คำแนะนำที่ส่งและบันทึกแล้ว: {len(sent_records)} รายการ\n"
-            "ระบบพยายามส่งสัปดาห์ละหนึ่งครั้งหลังตลาดปิด; "
+            "ระบบพยายามส่งทุกเช้าวันซื้อขาย โดยใช้ราคาปิดล่าสุดที่ตรวจสอบได้; "
             "สั่ง แนะนำหุ้นสะสม เองได้ทุกเมื่อ"
         )
 
@@ -3741,34 +3738,34 @@ def ensure_scheduler():
             coalesce=True,
         )
         worker_scheduler.add_job(
-            send_weekly_long_term_recommendations,
+            send_daily_long_term_recommendations,
             "cron",
             day_of_week="mon-fri",
             hour=8,
             minute="30,50",
-            id="weekly-long-term-recommendations-morning-8",
+            id="daily-long-term-recommendations-morning-8",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
         worker_scheduler.add_job(
-            send_weekly_long_term_recommendations,
+            send_daily_long_term_recommendations,
             "cron",
             day_of_week="mon-fri",
             hour=9,
             minute=5,
-            id="weekly-long-term-recommendations-morning-9",
+            id="daily-long-term-recommendations-morning-9",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
         worker_scheduler.add_job(
-            send_weekly_long_term_recommendations,
+            send_daily_long_term_recommendations,
             "cron",
             day_of_week="mon-fri",
             hour=19,
             minute="20,50",
-            id="weekly-long-term-recommendations",
+            id="daily-long-term-recommendations-evening-retry",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -3787,10 +3784,10 @@ def ensure_scheduler():
             )
         if current.hour >= 8 and is_set_session(current.date()):
             worker_scheduler.add_job(
-                send_weekly_long_term_recommendations,
+                send_daily_long_term_recommendations,
                 "date",
                 run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
-                id="weekly-long-term-recommendations-catchup",
+                id="daily-long-term-recommendations-catchup",
                 replace_existing=True,
                 max_instances=1,
             )
