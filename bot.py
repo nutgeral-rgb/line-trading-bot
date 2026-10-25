@@ -2634,6 +2634,67 @@ def send_daily_long_term_recommendations():
 _long_term_review_users = set()
 
 
+def build_recommendation_accuracy(portfolio):
+    """Report only saved, delivered signals using completed daily bars."""
+    records = []
+    for row in portfolio.get("long_term_recommendations", []):
+        if not isinstance(row, dict) or row.get("delivery_status") != "SENT":
+            continue
+        try:
+            datetime.strptime(row.get("signal_date", ""), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(row.get("symbol"), str) and row["symbol"]:
+            records.append(row)
+    lines = ["🎯 ความแม่นยำคำแนะนำหุ้นระยะยาว"]
+    if not records:
+        return "\n".join(lines + ["ยังไม่มีบันทึกคำแนะนำที่ส่งสำเร็จ จึงยังคำนวณไม่ได้"])
+    expected = latest_completed_set_session(now_bkk()).isoformat()
+    symbols = sorted({row["symbol"] for row in records})
+    # Fetch the retained history, including signals older than one year.
+    frames = get_market_frames(symbols + ["^SET.BK"], period="max")
+    completed = {
+        symbol: frame.loc[frame.index.strftime("%Y-%m-%d") <= expected]
+        for symbol, frame in frames.items() if frame is not None and not frame.empty
+    }
+    _, summaries = evaluate_recommendations(
+        records, completed, completed.get("^SET.BK"), cost_rate=ESTIMATED_BUY_COST_RATE
+    )
+    count = len({(row["symbol"], row["signal_date"]) for row in records})
+    lines += [f"ราคาถึงวันซื้อขาย {expected} เมื่อแหล่งข้อมูลมีให้",
+              f"คำแนะนำที่ส่งแล้ว {count} รายการ (หุ้นและวันไม่ซ้ำ)"]
+    for horizon in HORIZONS:
+        metric = summaries.get(horizon)
+        if not metric:
+            lines.append(f"• {horizon} วันซื้อขาย: ยังไม่ครบระยะหรือข้อมูลราคาไม่พอ")
+            continue
+        n = metric['count']
+        lines += [f"• {horizon} วันซื้อขาย | ตัวอย่าง {n} ช่วง",
+                  f"  ผลตอบแทนบวก {metric['positive_count']}/{n} "
+                  f"({metric['positive_count'] / n:.1%}) | เฉลี่ยสุทธิ {metric['mean_net_return']:+.1%}"]
+        comparable = metric['comparable_count']
+        if comparable:
+            lines.append(f"  ชนะ SET {metric['beat_benchmark_count']}/{comparable} "
+                         f"({metric['beat_benchmark_count'] / comparable:.1%}) | "
+                         f"ส่วนเกินเฉลี่ย {metric['mean_excess_return'] * 100:+.1f} จุดเปอร์เซ็นต์")
+        else:
+            lines.append("  ชนะ SET: ข้อมูลดัชนีไม่พอ")
+        if metric['max_drawdown'] is not None:
+            lines.append(f"  Drawdown ต่ำสุดรายคำแนะนำ {metric['max_drawdown']:.1%} "
+                         f"(คำนวณได้ {metric['drawdown_count']}/{n} ช่วง)")
+        else:
+            lines.append("  Drawdown: ข้อมูลราคาไม่ครบ")
+    missing = [symbol for symbol in symbols if symbol not in completed or completed[symbol].empty]
+    if missing:
+        lines.append(f"ข้อมูลราคาหุ้นขาด {len(missing)} ตัว จึงประเมินไม่ได้บางรายการ")
+    lines += ["นับเฉพาะช่วงถือหุ้นตัวเดียวกันที่ไม่ซ้อนกัน แยกตามระยะ",
+              f"จำลองซื้อราคาเปิดวันถัดไป หักต้นทุน {ESTIMATED_BUY_COST_RATE:.2%} ต่อด้าน",
+              "Drawdown วัดจากราคาปิดรายวันต่อคำแนะนำ ไม่ใช่ขาดทุนสูงสุดของพอร์ตรวม",
+              "เป็นผลติดตามคำแนะนำที่ส่งจริง ไม่ใช่ผลซื้อขายจริงหรือการเปรียบเทียบเกณฑ์เก่า/ใหม่",
+              "ตัวอย่างน้อยยังสรุปความแม่นยำไม่ได้ ผลในอดีตไม่รับประกันอนาคต"]
+    return "\n".join(lines)
+
+
 def build_long_term_review(portfolio):
     """Review saved signals and actual holdings after a completed SET session."""
     expected = latest_completed_set_session(now_bkk())
@@ -2765,12 +2826,13 @@ def build_long_term_review(portfolio):
     return "\n".join(lines)
 
 
-def _send_long_term_review(user_id):
+def _send_long_term_review(user_id, accuracy_only=False):
     try:
         portfolio = get_portfolio(user_id)
-        if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+        if not accuracy_only and portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
             return
-        result = build_long_term_review(portfolio)
+        result = (build_recommendation_accuracy(portfolio) if accuracy_only
+                  else build_long_term_review(portfolio))
         line_bot_api.push_message(user_id, TextSendMessage(text=result))
     except Exception:
         logger.exception("ทบทวนพอร์ตระยะยาวไม่สำเร็จ")
@@ -2779,7 +2841,7 @@ def _send_long_term_review(user_id):
             _long_term_review_users.discard(user_id)
 
 
-def queue_long_term_review(user_id):
+def queue_long_term_review(user_id, accuracy_only=False):
     ensure_scheduler()
     with _on_demand_lock:
         if user_id in _long_term_review_users:
@@ -2790,7 +2852,7 @@ def queue_long_term_review(user_id):
             _send_long_term_review,
             "date",
             run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
-            args=[user_id],
+            args=[user_id, accuracy_only],
             id="long-term-review-" + hashlib.sha256(user_id.encode()).hexdigest()[:20],
             replace_existing=True,
             max_instances=1,
@@ -2863,6 +2925,7 @@ def help_text():
         "แนะนำหุ้นสะสม — คัดหุ้นใหม่ได้ทุกเมื่อ\n"
         "สถานะหุ้นสะสม — ดูรอบส่งอัตโนมัติและข้อมูลที่บันทึก\n"
         "ทบทวนหุ้นระยะยาว — ผลคำแนะนำเดิมและหุ้นที่ควรทบทวนขาย\n"
+        "ความแม่นยำคำแนะนำ — ผลตอบแทน อัตราชนะ SET และ Drawdown\n"
         "ตั้งเงินเติมรายเดือน 500 — กำหนด 500–1,000 บาท/เดือน\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
@@ -3018,6 +3081,15 @@ def command_reply(user_id, text):
             "ระบบงดบันทึกและแนะนำจากยอดเงินที่อาจหาย "
             "พิมพ์ สถานะข้อมูล เพื่อตรวจสอบ"
         )
+
+    if text in {"ความแม่นยำคำแนะนำ", "สถิติคำแนะนำ", "ทดสอบความแม่นยำ"}:
+        try:
+            started = queue_long_term_review(user_id, accuracy_only=True)
+        except Exception:
+            logger.exception("เริ่มประเมินความแม่นยำไม่สำเร็จ")
+            return "ยังเริ่มประเมินไม่ได้ โปรดลองใหม่ภายหลัง"
+        return ("กำลังประเมินคำแนะนำที่ส่งแล้ว เมื่อเสร็จจะส่งผลในแชตนี้"
+                if started else "กำลังประเมินหรือทบทวนอยู่ เมื่อเสร็จจะส่งผลในแชตนี้")
 
     if text == "สถานะหุ้นสะสม":
         strategy = portfolio.get("investment_strategy") or {}

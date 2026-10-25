@@ -103,6 +103,19 @@ def evaluate_recommendations(recommendations, frames, benchmark=None,
                     benchmark_close = _adjusted_close(exit_benchmark.iloc[0])
                     if benchmark_open is not None and benchmark_close is not None:
                         benchmark_return = benchmark_close / benchmark_open - 1
+            # Include the entry capital as the first peak; measure daily-close
+            # drawdown for this signal, not a combined portfolio equity curve.
+            values = [1.0]
+            for _, price_row in later.iloc[:horizon].iterrows():
+                price = _adjusted_close(price_row)
+                if price is None:
+                    values = []
+                    break
+                values.append(price * (1 - cost_rate) / (entry_open * (1 + cost_rate)))
+            peak, drawdown = 1.0, 0.0
+            for value in values:
+                peak = max(peak, value)
+                drawdown = min(drawdown, value / peak - 1)
             observations.append({
                 "symbol": symbol,
                 "signal_date": signal_date,
@@ -110,6 +123,7 @@ def evaluate_recommendations(recommendations, frames, benchmark=None,
                 "exit_date": exit_date,
                 "horizon": horizon,
                 "net_return": net_return,
+                "max_drawdown": drawdown if values else None,
                 "benchmark_return": benchmark_return,
             })
 
@@ -136,6 +150,11 @@ def evaluate_recommendations(recommendations, frames, benchmark=None,
             "count": len(rows),
             "positive_count": sum(row["net_return"] > 0 for row in rows),
             "mean_net_return": sum(row["net_return"] for row in rows) / len(rows),
+            "max_drawdown": min(
+                (row["max_drawdown"] for row in rows if row["max_drawdown"] is not None),
+                default=None,
+            ),
+            "drawdown_count": sum(row["max_drawdown"] is not None for row in rows),
             "comparable_count": len(comparable),
             "beat_benchmark_count": sum(
                 row["net_return"] > row["benchmark_return"] for row in comparable

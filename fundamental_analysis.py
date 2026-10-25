@@ -13,6 +13,8 @@ import logging
 import math
 import re
 import time
+import threading
+from copy import deepcopy
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,8 @@ _FINANCIALS = {
 }
 _MAX_STATEMENT_AGE_DAYS = 180
 _MAX_STATEMENT_DATE_SPREAD_DAYS = 100
+# Bound lock storage while coalescing concurrent requests for the same symbol.
+_ANALYSIS_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
 def _normalise(value):
@@ -38,14 +42,15 @@ def _latest_values(frame, aliases, count):
     for label in frame.index:
         if _normalise(label) not in wanted:
             continue
-        values = frame.loc[label].dropna()
+        values = frame.loc[label]
         try:
             keys = sorted(values.index, key=lambda item: str(item), reverse=True)
             result = []
             for key in keys[:count]:
                 value = float(values.loc[key])
-                if math.isfinite(value):
-                    result.append(value)
+                if not math.isfinite(value):
+                    return []
+                result.append(value)
             return result
         except (TypeError, ValueError, OverflowError):
             return []
@@ -95,7 +100,11 @@ def _finite_info_value(info, *keys):
 def analyze_fundamentals(symbol):
     """Refresh fundamentals/valuation context once per Bangkok calendar day."""
     day = datetime.now(ZoneInfo("Asia/Bangkok")).date().isoformat()
-    return _analyze_fundamentals_for_day(symbol, day)
+    symbol = symbol.strip().upper()
+    with _ANALYSIS_LOCKS[hash(symbol) % len(_ANALYSIS_LOCKS)]:
+        # Recheck the daily cache after acquiring the lock. Callers receive
+        # independent objects so display/planning changes cannot poison it.
+        return deepcopy(_analyze_fundamentals_for_day(symbol, day))
 
 
 @lru_cache(maxsize=200)
@@ -177,6 +186,7 @@ def _analyze_fundamentals_for_day(symbol, day):
             dates_aligned = (newest - oldest).days <= _MAX_STATEMENT_DATE_SPREAD_DAYS
             fresh = (
                 0 <= statement_age_days <= _MAX_STATEMENT_AGE_DAYS
+                and newest <= reference_day
                 and dates_aligned
             )
             checks["financial_freshness"] = fresh
@@ -187,7 +197,7 @@ def _analyze_fundamentals_for_day(symbol, day):
                 quality_warnings.append("งบแต่ละชุดอาจเป็นคนละงวด")
             if statement_age_days > _MAX_STATEMENT_AGE_DAYS:
                 quality_warnings.append("งบเก่ากว่า 180 วัน")
-            elif statement_age_days < 0:
+            elif newest > reference_day:
                 quality_warnings.append("วันที่งบใหม่กว่าวันปัจจุบัน")
         except (TypeError, ValueError):
             details.append("วันงบ: อ่านวันที่ไม่ได้")
