@@ -175,6 +175,16 @@ class BotAutomationTests(unittest.TestCase):
             with self.assertRaises(bot.requests.ConnectionError):
                 bot.fetch_dividend_history("AOT.BK")
 
+    def test_valuation_line_warns_when_missing_and_flags_derived(self):
+        missing = bot.format_valuation_line({"valuation": {"trailing_pe": None, "price_to_book": None}})
+        self.assertIn("ไม่ได้ตรวจ P/E และ P/B", missing)
+        derived = bot.format_valuation_line({"valuation": {
+            "trailing_pe": 12.5, "price_to_book": 2.5, "source": "คำนวณจากงบและราคา"}})
+        self.assertIn("P/E 12.5 | P/B 2.50", derived)
+        self.assertIn("คำนวณเอง", derived)
+        self.assertNotIn("คำนวณเอง", bot.format_valuation_line(
+            {"valuation": {"trailing_pe": 9.0, "price_to_book": None, "source": "Yahoo"}}))
+
     def test_monthly_summary_sent_once_for_previous_month(self):
         with patch.object(bot, "line_bot_api") as api, \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 12, 2, 9, 25, tzinfo=bot.timezone.utc)):

@@ -19,6 +19,56 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+
+def _last_close(symbol):
+    """Latest daily close from Yahoo's chart endpoint, or None.
+
+    This endpoint keeps working when yfinance's quote pages are rate-limited,
+    so valuation ratios can still be derived from statements plus price.
+    """
+    try:
+        import requests
+
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?range=5d&interval=1d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        response.raise_for_status()
+        closes = response.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        values = [float(c) for c in closes if c is not None]
+        return values[-1] if values and math.isfinite(values[-1]) and values[-1] > 0 else None
+    except Exception as exc:
+        logger.info("ดึงราคาล่าสุดเพื่อคำนวณมูลค่าไม่สำเร็จ: symbol=%s error_type=%s",
+                    symbol, type(exc).__name__)
+        return None
+
+
+def derive_valuation(price, shares_out, ttm_profit, equity, total_assets):
+    """P/E, P/B, ROE, ROA from statements and price; each None if unusable.
+
+    Approximations: ROE/ROA use period-end equity/assets, and P/E uses the
+    latest share count, so they can differ from vendor figures when share
+    counts or one-off items changed.
+    """
+    def ok(value):
+        return value is not None and math.isfinite(value)
+
+    result = {"trailing_pe": None, "price_to_book": None,
+              "return_on_equity": None, "return_on_assets": None}
+    if ok(price) and price > 0 and ok(shares_out) and shares_out > 0:
+        cap = price * shares_out
+        if ok(ttm_profit) and ttm_profit > 0:
+            pe = cap / ttm_profit
+            result["trailing_pe"] = pe if pe < 1000 else None
+        if ok(equity) and equity > 0:
+            result["price_to_book"] = cap / equity
+    if ok(ttm_profit) and ok(equity) and equity > 0:
+        result["return_on_equity"] = ttm_profit / equity
+    if ok(ttm_profit) and ok(total_assets) and total_assets > 0:
+        result["return_on_assets"] = ttm_profit / total_assets
+    return result
+
 # Debt/equity is not a useful comparable screen for banks and lenders.
 _FINANCIALS = {
     "AEONTS.BK", "BAM.BK", "BBL.BK", "KBANK.BK", "KKP.BK", "KTB.BK",
@@ -327,7 +377,29 @@ def _analyze_fundamentals_for_day(symbol, day):
     pb = _number(info, "priceToBook")
     roe = _finite_info_value(info, "returnOnEquity")
     roa = _finite_info_value(info, "returnOnAssets")
+    valuation_source = "Yahoo" if (pe is not None or pb is not None) else None
+    if pe is None or pb is None or roe is None or roa is None:
+        equity_now = _latest_values(
+            balance,
+            ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"), 1)
+        assets_now = _latest_values(balance, ("Total Assets",), 1)
+        shares_out = _latest_values(balance, ("Ordinary Shares Number", "Share Issued"), 1)
+        derived = derive_valuation(
+            _last_close(symbol) if shares_out else None,
+            shares_out[0] if shares_out else None, ttm_profit,
+            equity_now[0] if equity_now else None,
+            assets_now[0] if assets_now else None)
+        used = [k for k, v in derived.items() if v is not None and {
+            "trailing_pe": pe, "price_to_book": pb,
+            "return_on_equity": roe, "return_on_assets": roa}[k] is None]
+        pe = pe if pe is not None else derived["trailing_pe"]
+        pb = pb if pb is not None else derived["price_to_book"]
+        roe = roe if roe is not None else derived["return_on_equity"]
+        roa = roa if roa is not None else derived["return_on_assets"]
+        if used:
+            valuation_source = "คำนวณจากงบและราคา" if valuation_source is None else "Yahoo+คำนวณ"
     valuation = {
+        "source": valuation_source,
         "trailing_pe": pe,
         "price_to_book": pb,
         "return_on_equity": roe,
@@ -362,6 +434,7 @@ def _analyze_fundamentals_for_day(symbol, day):
             ("P/E " + (f"{pe:.1f}" if pe is not None else "ไม่มีข้อมูล"))
             + ", "
             + ("P/B " + (f"{pb:.2f}" if pb is not None else "ไม่มีข้อมูล"))
+            + (" (คำนวณจากงบและราคา)" if valuation_source == "คำนวณจากงบและราคา" else "")
         )
     if elevated:
         details.append("ควรทบทวนมูลค่า: " + ", ".join(elevated))

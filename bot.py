@@ -1957,6 +1957,19 @@ def handle_backup_file(event):
     )
 
 
+def format_valuation_line(fundamental):
+    valuation = fundamental.get("valuation") or {}
+    pe, pb = valuation.get("trailing_pe"), valuation.get("price_to_book")
+    if pe is None and pb is None:
+        return ("⚠️ มูลค่า: ไม่ได้ตรวจ P/E และ P/B รอบนี้ (ข้อมูลไม่พร้อม) "
+                "ตรวจ P/E, P/B เองก่อนซื้อ")
+    text = ("มูลค่า: P/E " + (f"{pe:.1f}" if pe is not None else "ไม่มีข้อมูล")
+            + " | P/B " + (f"{pb:.2f}" if pb is not None else "ไม่มีข้อมูล"))
+    if valuation.get("source") in {"คำนวณจากงบและราคา", "Yahoo+คำนวณ"}:
+        text += " (คำนวณเองจากงบและราคา ใช้เป็นแนวทาง)"
+    return text
+
+
 def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     """Screen SET100 candidates for a cautious, user-triggered accumulation review."""
     universe_warning = set100_universe_warning()
@@ -2461,6 +2474,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         f"เงินสดคงเหลืออย่างน้อยประมาณ {cash_left:,.2f} บาท",
         f"จำกัดมูลค่าหุ้นตัวนี้ไม่เกิน {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต",
         "งบ: " + concise_fundamental(item["fundamental"]),
+        format_valuation_line(item["fundamental"]),
         f"แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}% "
         f"| สภาพคล่อง {item['liquidity_days']}/20 วัน",
     ]
