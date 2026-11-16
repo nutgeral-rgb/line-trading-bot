@@ -89,6 +89,33 @@ def confirm_planned_contribution(portfolio, today, recorded_at):
     return {"ok": True, "amount": amount, **status}
 
 
+def _plus_year(day):
+    try:
+        return day.replace(year=day.year + 1)
+    except ValueError:  # 29 February
+        return day.replace(year=day.year + 1, day=28)
+
+
+def estimate_next_event(history, today, window=EX_DATE_WINDOW_DAYS, tolerance=30):
+    """Project last year's ex-dividend dates forward. Returns an event or None.
+
+    `history` is a list of (date, per_share_amount). A date counts only when
+    the same payment happened one year earlier and no payment has already
+    occurred near the projected date this year. This is an estimate: the
+    company may skip, move or change the dividend.
+    """
+    candidates = []
+    for day, amount in history:
+        projected = _plus_year(day)
+        if not 0 <= (projected - today).days <= window:
+            continue
+        if any(abs((d - projected).days) <= tolerance and d <= today for d, _ in history):
+            continue
+        candidates.append({"ex_date": projected, "amount": _number(amount) or None,
+                           "estimated": True})
+    return min(candidates, key=lambda e: e["ex_date"]) if candidates else None
+
+
 def upcoming_dividends(holdings, events, today, window=EX_DATE_WINDOW_DAYS):
     """Holdings with an ex-dividend date within `window` days.
 
@@ -109,7 +136,8 @@ def upcoming_dividends(holdings, events, today, window=EX_DATE_WINDOW_DAYS):
         rows.append({"symbol": symbol, "ex_date": event["ex_date"], "days": days,
                      "per_share": per_share or None, "shares": shares,
                      "gross": round(per_share * shares, 2) if per_share else None,
-                     "net": round(per_share * shares * (1 - DIVIDEND_TAX_RATE), 2) if per_share else None})
+                     "net": round(per_share * shares * (1 - DIVIDEND_TAX_RATE), 2) if per_share else None,
+                     "estimated": bool(event.get("estimated"))})
     return sorted(rows, key=lambda r: (r["ex_date"], r["symbol"]))
 
 
@@ -123,13 +151,15 @@ def format_dividend_calendar(rows, window=EX_DATE_WINDOW_DAYS, failed=()):
     lines = [f"🗓 หุ้นที่จะขึ้น XD ภายใน {window} วัน", "━━━━━━━━━━━━━━━━━━"]
     for r in rows:
         when = "วันนี้" if r["days"] == 0 else f"อีก {r['days']} วัน"
-        lines.append(f"• {r['symbol'].removesuffix('.BK')} XD {r['ex_date'].isoformat()} ({when})")
+        tag = " ประมาณการจากปีก่อน" if r["estimated"] else ""
+        lines.append(f"• {r['symbol'].removesuffix('.BK')} XD {r['ex_date'].isoformat()} ({when}){tag}")
         if r["per_share"]:
             lines.append(f"  ประมาณ {r['per_share']:.4f} บาท/หุ้น × {r['shares']:,} หุ้น "
                          f"= {r['gross']:,.2f} บาท ก่อนภาษี (หลังภาษี 10% ≈ {r['net']:,.2f})")
         else:
             lines.append("  ยังไม่ทราบอัตราปันผลต่อหุ้น")
     lines += ["",
+              "วันและยอดเป็นประมาณการจากรอบปีก่อน บริษัทอาจเลื่อน งด หรือเปลี่ยนยอด ยืนยันจากประกาศ SET ก่อน",
               "ต้องถือหุ้นไว้ก่อนวัน XD จึงมีสิทธิ จำนวนเงินจริงและวันจ่ายดูจากประกาศบริษัท",
               "เมื่อเงินเข้าบัญชีจริง ให้บันทึกด้วย บันทึกปันผล SYMBOL ก่อนภาษี ภาษี วันรับ เลขอ้างอิง",
               "ข้อมูลจากแหล่งฟรี อาจคลาดเคลื่อน ตรวจกับ SET ก่อนตัดสินใจ"]

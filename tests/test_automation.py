@@ -61,6 +61,21 @@ class AutomationLogicTests(unittest.TestCase):
         self.assertIn("KBANK XD 2026-11-20", text)
         self.assertIn("ไม่พบ", automation.format_dividend_calendar([]))
 
+    def test_estimate_projects_last_year_and_skips_paid_or_new(self):
+        today = date(2026, 11, 16)
+        history = [(date(2025, 11, 20), 2.0), (date(2025, 5, 5), 1.5)]
+        event = automation.estimate_next_event(history, today)
+        self.assertEqual((event["ex_date"], event["amount"], event["estimated"]),
+                         (date(2026, 11, 20), 2.0, True))
+        # Out of window, and nothing projected from a payment too recent.
+        self.assertIsNone(automation.estimate_next_event([(date(2025, 5, 5), 1.5)], today))
+        self.assertIsNone(automation.estimate_next_event([], today))
+        # Already paid near the projected date this year -> do not repeat it.
+        paid = history + [(date(2026, 11, 10), 2.0)]
+        self.assertIsNone(automation.estimate_next_event(paid, today))
+        self.assertIn("ประมาณการจากปีก่อน", automation.format_dividend_calendar(
+            automation.upcoming_dividends({"KBANK.BK": {"shares": 10}}, {"KBANK.BK": event}, today)))
+
     def test_monthly_summary_ignores_reversed_and_other_months(self):
         p = portfolio(dividend_goal={"monthly_net": 10000})
         p["history"] = [
@@ -139,6 +154,26 @@ class BotAutomationTests(unittest.TestCase):
                 bot.send_dividend_alerts()
                 bot.send_dividend_alerts()
                 self.assertEqual(api.push_message.call_count, 1)
+
+    def test_fetch_dividend_history_parses_chart_and_caches(self):
+        payload = {"chart": {"result": [{"events": {"dividends": {
+            "1": {"amount": 2.0, "date": 1763600000}, "2": {"amount": 0, "date": 1700000000}}}}]}}
+
+        class Response:
+            def raise_for_status(self): pass
+            def json(self): return payload
+        bot._dividend_cache.clear()
+        with patch.object(bot.requests, "get", return_value=Response()) as get:
+            first = bot.fetch_dividend_history("KBANK.BK")
+            second = bot.fetch_dividend_history("KBANK.BK")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0][1], 2.0)
+        self.assertEqual(first, second)
+        self.assertEqual(get.call_count, 1)
+        bot._dividend_cache.clear()
+        with patch.object(bot.requests, "get", side_effect=bot.requests.ConnectionError("x")):
+            with self.assertRaises(bot.requests.ConnectionError):
+                bot.fetch_dividend_history("AOT.BK")
 
     def test_monthly_summary_sent_once_for_previous_month(self):
         with patch.object(bot, "line_bot_api") as api, \
