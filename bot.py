@@ -34,7 +34,6 @@ import requests
 
 from fundamental_analysis import analyze_fundamentals
 import automation
-import yfinance as yf
 from dividend_goal import (create_goal, validate_goal, money, record_distribution,
                            reverse_distribution, income_summary, validate_distribution_history)
 from portfolio_manager import format_manager_report, instrument_type
@@ -3000,25 +2999,42 @@ def queue_portfolio_manager(user_id):
     return True
 
 
-def fetch_dividend_event(symbol):
-    """Next ex-dividend date and per-share amount from Yahoo, or None.
+_dividend_cache = {}
+_dividend_cache_lock = threading.Lock()
+_DIVIDEND_CACHE_TTL_SECONDS = 12 * 3600
 
-    Raises when the lookup itself fails so callers can tell "no upcoming
-    dividend" apart from "could not check". A missing field means unknown.
+
+def fetch_dividend_history(symbol):
+    """Past (ex-date, per-share amount) pairs from Yahoo's chart endpoint.
+
+    Uses the same endpoint as price data, which still works when yfinance's
+    quote pages are rate-limited. Raises on a failed lookup; an empty list
+    means the company paid nothing in the period.
     """
-    calendar = yf.Ticker(symbol).calendar
-    if not isinstance(calendar, dict):
-        return None
-    ex_date = calendar.get("Ex-Dividend Date")
-    if isinstance(ex_date, datetime):
-        ex_date = ex_date.date()
-    if not isinstance(ex_date, type(now_bkk().date())):
-        return None
-    try:
-        amount = float(calendar.get("Dividend") or calendar.get("Dividend Amount") or 0)
-    except (TypeError, ValueError):
-        amount = 0.0
-    return {"ex_date": ex_date, "amount": amount if np.isfinite(amount) and amount > 0 else None}
+    now = time.monotonic()
+    with _dividend_cache_lock:
+        cached = _dividend_cache.get(symbol)
+        if cached and now - cached[0] < _DIVIDEND_CACHE_TTL_SECONDS:
+            return cached[1]
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+           f"{url_quote(symbol, safe='')}?range=3y&interval=1mo&events=div")
+    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    response.raise_for_status()
+    result = response.json()["chart"]["result"][0]
+    rows = []
+    for item in (result.get("events") or {}).get("dividends", {}).values():
+        amount = float(item["amount"])
+        if np.isfinite(amount) and amount > 0:
+            rows.append((datetime.fromtimestamp(int(item["date"]), timezone.utc).date(), amount))
+    rows.sort()
+    with _dividend_cache_lock:
+        _dividend_cache[symbol] = (now, rows)
+    return rows
+
+
+def fetch_dividend_event(symbol):
+    """Estimated next ex-dividend event from last year's pattern, or None."""
+    return automation.estimate_next_event(fetch_dividend_history(symbol), now_bkk().date())
 
 
 def collect_dividend_rows(portfolio, today):
