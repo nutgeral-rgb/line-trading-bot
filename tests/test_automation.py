@@ -129,6 +129,10 @@ class BotAutomationTests(unittest.TestCase):
         bot.command_reply(self.user, "ตั้งหุ้น KBANK 10 134.23")
         today = bot.now_bkk().date()
         event = {"ex_date": today + bot.timedelta(days=3), "amount": 2.0}
+        with patch.object(bot, "fetch_dividend_event", side_effect=RuntimeError("blocked")):
+            failed = bot.command_reply(self.user, "ปฏิทินปันผล")
+            self.assertIn("ดึงข้อมูลปฏิทินปันผลไม่สำเร็จ", failed)
+            self.assertNotIn("ไม่พบหุ้น", failed)
         with patch.object(bot, "fetch_dividend_event", return_value=event):
             self.assertIn("KBANK XD", bot.command_reply(self.user, "ปฏิทินปันผล"))
             with patch.object(bot, "line_bot_api") as api:

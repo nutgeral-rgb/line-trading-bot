@@ -113,7 +113,11 @@ def upcoming_dividends(holdings, events, today, window=EX_DATE_WINDOW_DAYS):
     return sorted(rows, key=lambda r: (r["ex_date"], r["symbol"]))
 
 
-def format_dividend_calendar(rows, window=EX_DATE_WINDOW_DAYS):
+def format_dividend_calendar(rows, window=EX_DATE_WINDOW_DAYS, failed=()):
+    names = ", ".join(s.removesuffix(".BK") for s in failed)
+    if not rows and failed:
+        return ("⚠️ ดึงข้อมูลปฏิทินปันผลไม่สำเร็จ: " + names + "\n"
+                "นี่ไม่ได้แปลว่าไม่มี XD ตรวจวัน XD ที่ SET หรือแอปโบรกเกอร์ก่อน")
     if not rows:
         return f"🗓 ไม่พบหุ้นในพอร์ตที่ขึ้น XD ภายใน {window} วัน (ตามข้อมูลที่ดึงได้ อาจไม่ครบ)"
     lines = [f"🗓 หุ้นที่จะขึ้น XD ภายใน {window} วัน", "━━━━━━━━━━━━━━━━━━"]
@@ -129,6 +133,8 @@ def format_dividend_calendar(rows, window=EX_DATE_WINDOW_DAYS):
               "ต้องถือหุ้นไว้ก่อนวัน XD จึงมีสิทธิ จำนวนเงินจริงและวันจ่ายดูจากประกาศบริษัท",
               "เมื่อเงินเข้าบัญชีจริง ให้บันทึกด้วย บันทึกปันผล SYMBOL ก่อนภาษี ภาษี วันรับ เลขอ้างอิง",
               "ข้อมูลจากแหล่งฟรี อาจคลาดเคลื่อน ตรวจกับ SET ก่อนตัดสินใจ"]
+    if failed:
+        lines.append("⚠️ ดึงข้อมูลไม่สำเร็จ ไม่ได้ตรวจ: " + names)
     return "\n".join(lines)
 
 

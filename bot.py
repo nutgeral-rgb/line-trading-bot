@@ -3003,14 +3003,10 @@ def queue_portfolio_manager(user_id):
 def fetch_dividend_event(symbol):
     """Next ex-dividend date and per-share amount from Yahoo, or None.
 
-    Free data is incomplete; a missing or malformed field means "unknown",
-    never a guess.
+    Raises when the lookup itself fails so callers can tell "no upcoming
+    dividend" apart from "could not check". A missing field means unknown.
     """
-    try:
-        calendar = yf.Ticker(symbol).calendar
-    except Exception:
-        logger.warning("ดึงปฏิทินปันผลไม่สำเร็จ: %s", symbol)
-        return None
+    calendar = yf.Ticker(symbol).calendar
     if not isinstance(calendar, dict):
         return None
     ex_date = calendar.get("Ex-Dividend Date")
@@ -3026,12 +3022,23 @@ def fetch_dividend_event(symbol):
 
 
 def collect_dividend_rows(portfolio, today):
+    """Return (rows, failed_symbols)."""
     holdings = {s: h for s, h in portfolio.get("stocks", {}).items()
                 if int(h.get("shares", 0) or 0) > 0
                 and instrument_type(s, h) in {"STOCK", "REIT"}
                 and h.get("status", "ACTIVE") == "ACTIVE"}
-    events = {s: fetch_dividend_event(s) for s in list(holdings)[:30]}
-    return automation.upcoming_dividends(holdings, {s: e for s, e in events.items() if e}, today)
+    events, failed = {}, []
+    for symbol in list(holdings)[:30]:
+        try:
+            event = fetch_dividend_event(symbol)
+        except Exception as exc:
+            failed.append(symbol)
+            logger.warning("ดึงปฏิทินปันผลไม่สำเร็จ: %s %s: %s", symbol,
+                           type(exc).__name__, str(exc)[:200])
+            continue
+        if event:
+            events[symbol] = event
+    return automation.upcoming_dividends(holdings, events, today), failed
 
 
 def _quick_reply(*pairs):
@@ -3129,7 +3136,7 @@ def send_dividend_alerts():
             portfolio = get_portfolio(user_id)
             if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
                 continue
-            rows = collect_dividend_rows(portfolio, today)
+            rows, _failed = collect_dividend_rows(portfolio, today)
             signature = ",".join(f"{r['symbol']}:{r['ex_date']}" for r in rows)
             if not rows or not _claim_once(user_id, "dividend_alert", signature):
                 continue
@@ -3175,8 +3182,8 @@ def automation_command(user_id, text):
         portfolio = get_portfolio(user_id)
         if not portfolio.get("stocks"):
             return "ยังไม่มีหุ้นที่บันทึกไว้"
-        return automation.format_dividend_calendar(
-            collect_dividend_rows(portfolio, now_bkk().date()))
+        rows, failed = collect_dividend_rows(portfolio, now_bkk().date())
+        return automation.format_dividend_calendar(rows, failed=failed)
     if text == "สรุปรายเดือน":
         today = now_bkk().date()
         return automation.format_monthly_summary(
