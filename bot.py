@@ -32,6 +32,9 @@ from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
+from dividend_goal import (create_goal, validate_goal, money, record_distribution,
+                           reverse_distribution, income_summary, validate_distribution_history)
+from portfolio_manager import format_manager_report, instrument_type
 from long_term_review import HORIZONS, assess_holding, evaluate_recommendations
 from position_risk import estimate_position
 from set100_constituents import (
@@ -355,6 +358,8 @@ def export_portfolio_backup(user_id):
                 "cash": portfolio.get("cash", 0),
                 "stocks": portfolio.get("stocks", {}),
                 "watchlist": portfolio.get("watchlist", []),
+                "dividend_goal": portfolio.get("dividend_goal"),
+                "history": portfolio.get("history", []),
                 "investment_strategy": (
                     {
                         "style": "LONG_TERM",
@@ -436,18 +441,24 @@ def validate_portfolio_backup(raw_text):
             or not isinstance(avg_price, (int, float))
             or not np.isfinite(avg_price)
             or avg_price < 0
-            or (shares > 0 and avg_price <= 0)
         ):
             raise ValueError(f"ข้อมูลจำนวนหุ้น/ต้นทุน {symbol} ไม่ถูกต้อง")
         normalized_stocks[symbol] = {
             "shares": shares,
             "avg_price": float(avg_price),
         }
+        for key, allowed in (("instrument_type", {"STOCK", "REIT", "WARRANT"}),
+                             ("status", {"ACTIVE", "SP", "DELISTED"})):
+            if key in info:
+                if info[key] not in allowed:
+                    raise ValueError("ประเภทหรือสถานะหลักทรัพย์ไม่ถูกต้อง")
+                normalized_stocks[symbol][key] = info[key]
 
     history = portfolio.get("history", [])
     watchlist = portfolio.get("watchlist")
     if not isinstance(history, list) or len(history) > 5000:
         raise ValueError("ประวัติในไฟล์สำรองไม่ถูกต้อง")
+    validate_distribution_history(history, now_bkk().date())
     if not isinstance(watchlist, list) or len(watchlist) > MAX_WATCHLIST:
         raise ValueError("รายการติดตามในไฟล์สำรองไม่ถูกต้อง")
     normalized_watchlist = []
@@ -466,6 +477,8 @@ def validate_portfolio_backup(raw_text):
         "overnight_plan": None,
     }
     strategy = portfolio.get("investment_strategy")
+    if portfolio.get("dividend_goal") is not None:
+        restored["dividend_goal"] = validate_goal(portfolio["dividend_goal"])
     if strategy is not None:
         if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
             raise ValueError("แผนลงทุนในไฟล์สำรองไม่ถูกต้อง")
@@ -475,9 +488,9 @@ def validate_portfolio_backup(raw_text):
             isinstance(contribution, bool)
             or not isinstance(contribution, (int, float))
             or not np.isfinite(contribution)
-            or not 500 <= contribution <= 1000
+            or not 0 <= contribution <= 1e12
         ):
-            raise ValueError("ยอดเงินเติมรายเดือนในไฟล์สำรองต้องอยู่ระหว่าง 500–1,000 บาท")
+            raise ValueError("ยอดเงินเติมรายเดือนในไฟล์สำรองไม่ถูกต้อง")
         if (
             isinstance(starting_capital, bool)
             or not isinstance(starting_capital, (int, float))
@@ -787,7 +800,7 @@ def normalize_stock_symbol(value):
     if not isinstance(value, str):
         return None
     base = value.strip().upper().removesuffix(".BK")
-    if not re.fullmatch(r"[A-Z0-9]{1,10}", base):
+    if not re.fullmatch(r"[A-Z0-9]{1,10}(?:-[A-Z0-9]{1,5})?", base):
         return None
     return base + ".BK"
 
@@ -2864,6 +2877,12 @@ def queue_long_term_review(user_id, accuracy_only=False):
     return True
 
 
+def build_closed_day_report(portfolio):
+    if portfolio.get("dividend_goal"):
+        return build_portfolio_manager_report(portfolio) + "\n\n" + build_recommendation_accuracy(portfolio)
+    return build_long_term_review(portfolio)
+
+
 def send_closed_day_reviews():
     """Send at most one automatic review per user per week on closed days."""
     today = now_bkk().date()
@@ -2874,7 +2893,7 @@ def send_closed_day_reviews():
             portfolio = get_portfolio(user_id)
             if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
                 continue
-            if not portfolio.get("long_term_recommendations") and not portfolio.get("stocks"):
+            if not portfolio.get("long_term_recommendations") and not portfolio.get("stocks") and not portfolio.get("dividend_goal"):
                 continue
             previous = portfolio.get("closed_day_review") or {}
             last_day = previous.get("date")
@@ -2894,9 +2913,9 @@ def send_closed_day_reviews():
                 }
 
             mutate_portfolio(user_id, mark_pending)
-            report = build_long_term_review(portfolio)
+            report = build_closed_day_report(portfolio)
             try:
-                line_bot_api.push_message(user_id, TextSendMessage(text=report))
+                _push_portfolio_report(user_id, report)
             except Exception:
                 def mark_unknown(current):
                     current["closed_day_review"] = {
@@ -2915,6 +2934,147 @@ def send_closed_day_reviews():
             logger.exception("ส่งทบทวนวันตลาดปิดไม่สำเร็จ")
 
 
+def build_portfolio_manager_report(portfolio):
+    today = now_bkk().date()
+    expected = latest_completed_set_session(now_bkk())
+    holdings = portfolio.get("stocks", {})
+    symbols = [s for s, h in holdings.items() if int(h.get("shares", 0)) > 0]
+    frames = get_market_frames(symbols, period="2y") if symbols else {}
+    # Avoid an incomplete intraday bar making a valid last close look stale.
+    frames = {s: f.loc[f.index.strftime("%Y-%m-%d") <= expected.isoformat()]
+              for s, f in frames.items() if f is not None and not f.empty}
+    ordinary = [s for s in symbols[:20]
+                if instrument_type(s, holdings[s]) == "STOCK"
+                and holdings[s].get("status", "ACTIVE") == "ACTIVE"]
+    fundamentals = {}
+    for symbol in ordinary:
+        try:
+            fundamentals[symbol] = analyze_fundamentals(symbol)
+        except Exception:
+            logger.exception("ตรวจงบสำหรับรายงานพอร์ตไม่สำเร็จ: %s", symbol)
+    return format_manager_report(portfolio, frames, fundamentals, expected, today)
+
+
+def _push_portfolio_report(user_id, report):
+    messages = [TextSendMessage(text=report[i:i + 4000]) for i in range(0, len(report), 4000)]
+    for start in range(0, len(messages), 5):
+        line_bot_api.push_message(user_id, messages[start:start + 5])
+
+
+_portfolio_manager_users = set()
+
+
+def _send_portfolio_manager(user_id):
+    try:
+        _push_portfolio_report(user_id, build_portfolio_manager_report(get_portfolio(user_id)))
+    except Exception:
+        logger.exception("จัดทำรายงานเป้าปันผลไม่สำเร็จ")
+        try:
+            _push_portfolio_report(user_id, "⚠️ รายงานพอร์ตยังไม่สำเร็จ ข้อมูลเดิมยังอยู่ โปรดลอง วิเคราะห์พอร์ต อีกครั้ง")
+        except Exception:
+            logger.exception("แจ้งข้อผิดพลาดรายงานพอร์ตไม่ได้")
+    finally:
+        with _on_demand_lock:
+            _portfolio_manager_users.discard(user_id)
+
+
+def queue_portfolio_manager(user_id):
+    ensure_scheduler()
+    with _on_demand_lock:
+        if user_id in _portfolio_manager_users:
+            return False
+        _portfolio_manager_users.add(user_id)
+    try:
+        scheduler.add_job(_send_portfolio_manager, "date",
+                          run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
+                          args=[user_id],
+                          id="portfolio-manager-" + hashlib.sha256(user_id.encode()).hexdigest()[:20],
+                          replace_existing=True, max_instances=1)
+    except Exception:
+        with _on_demand_lock:
+            _portfolio_manager_users.discard(user_id)
+        raise
+    return True
+
+
+def manager_command(user_id, text, portfolio):
+    """Return None for unrelated commands; all writes use the per-user lock."""
+    if text in {"เป้าปันผล", "วิเคราะห์พอร์ต", "ตรวจพอร์ตระยะยาว"}:
+        try:
+            started = queue_portfolio_manager(user_id)
+        except Exception:
+            logger.exception("เริ่มรายงานพอร์ตไม่ได้")
+            return "ยังเริ่มรายงานไม่ได้ โปรดลองใหม่ภายหลัง"
+        return ("กำลังตรวจพอร์ตและคำนวณเป้าปันผล เมื่อเสร็จจะส่งรายงานในแชตนี้"
+                if started else "กำลังตรวจพอร์ตอยู่ เมื่อเสร็จจะส่งรายงานในแชตนี้")
+    if text.startswith("ตั้งเป้าปันผล "):
+        parts = text.split()
+        if len(parts) != 3:
+            return "รูปแบบ: ตั้งเป้าปันผล 15000 10 (สุทธิเฉลี่ยต่อเดือน ระยะเวลาปี)"
+        try:
+            amount, years = money(parts[1].replace(",", ""), positive=True), int(parts[2])
+            def set_goal(p):
+                goal = create_goal(amount, years, now_bkk().date(), p.get("dividend_goal"))
+                p["dividend_goal"] = goal
+                return (f"✅ ตั้งเป้าปันผลสุทธิเฉลี่ย {amount:,.0f} บาท/เดือน ภายใน {goal['target_date']}\n"
+                        "พิมพ์ เป้าปันผล เพื่อดูเงินเติมที่ต้องใช้; การตั้งเป้าไม่เพิ่มเงินสดหรือเปลี่ยนหุ้นที่ถือ "
+                        "สมมติฐานผลตอบแทนไม่ใช่การรับประกัน")
+            return mutate_portfolio(user_id, set_goal)
+        except (ValueError, OverflowError) as exc:
+            return f"ตั้งเป้าไม่ได้: {exc}"
+    if text == "รายได้ปันผล":
+        income = income_summary(portfolio, now_bkk().date())
+        return ("💵 เงินรับจริงที่แจ้งบอตย้อนหลัง 365 วัน\n"
+                f"ปันผลสุทธิ {income['net_dividends']:,.2f} บาท\n"
+                f"เฉลี่ย {income['monthly_average']:,.2f} บาท/เดือน\n"
+                f"เงินคืนทุน {income['capital_returns']:,.2f} บาท (แยกจากปันผล)\n"
+                "เฉพาะรายการที่บันทึก ไม่ใช่ยอดตรวจยืนยันกับโบรกเกอร์")
+    if text.startswith(("บันทึกปันผล ", "บันทึกคืนทุน ")):
+        parts = text.split()
+        if len(parts) != 6:
+            return "รูปแบบ: บันทึกปันผล AOT 100 10 2026-11-01 ref1 (ก่อนภาษี ภาษี วันรับ เลขอ้างอิงไม่ซ้ำ)"
+        symbol = normalize_stock_symbol(parts[1])
+        kind = "DIVIDEND" if parts[0] == "บันทึกปันผล" else "CAPITAL_RETURN"
+        try:
+            def save_income(p):
+                saved = record_distribution(p, symbol, parts[2].replace(",", ""),
+                                            parts[3].replace(",", ""), parts[4], parts[5], kind, now_bkk().date())
+                if not saved:
+                    return "รายการนี้บันทึกไว้แล้ว จึงไม่เพิ่มเงินสดซ้ำ"
+                amount = round(float(parts[2].replace(",", "")) - float(parts[3].replace(",", "")), 2)
+                return (f"✅ บันทึกเงินรับสุทธิ {amount:,.2f} บาทแล้ว เลขอ้างอิง {parts[5]}\n"
+                        f"เงินสด {p['cash']:,.2f} บาท" +
+                        ("\nเงินคืนทุนไม่นับเป็นปันผล โปรดตรวจต้นทุนใหม่จากโบรกเกอร์" if kind == "CAPITAL_RETURN" else ""))
+            return mutate_portfolio(user_id, save_income)
+        except ValueError as exc:
+            return f"บันทึกไม่ได้: {exc}"
+    if text.startswith("ยกเลิกเงินรับ "):
+        parts = text.split()
+        if len(parts) != 2:
+            return "รูปแบบ: ยกเลิกเงินรับ ref1"
+        try:
+            def reverse_income(p):
+                changed = reverse_distribution(p, parts[1], now_bkk().date())
+                return "ยกเลิกรายการและหักเงินสดกลับแล้ว" if changed else "ยกเลิกรายการนี้ไว้แล้ว ไม่หักเงินซ้ำ"
+            return mutate_portfolio(user_id, reverse_income)
+        except ValueError as exc:
+            return f"ยกเลิกไม่ได้: {exc}"
+    if text.startswith("ตั้งหลักทรัพย์ "):
+        parts = text.split()
+        if len(parts) != 4 or parts[2].upper() not in {"STOCK", "REIT", "WARRANT"} or parts[3].upper() not in {"ACTIVE", "SP", "DELISTED"}:
+            return "รูปแบบ: ตั้งหลักทรัพย์ BTS-W8 WARRANT SP (ประเภท STOCK/REIT/WARRANT สถานะ ACTIVE/SP/DELISTED)"
+        symbol = normalize_stock_symbol(parts[1])
+        def set_instrument(p):
+            holding = p.get("stocks", {}).get(symbol)
+            if not holding:
+                return "ยังไม่มีหลักทรัพย์นี้ในพอร์ต บันทึกจำนวนและต้นทุนด้วย ตั้งหุ้น ก่อน"
+            holding.update(instrument_type=parts[2].upper(), status=parts[3].upper())
+            p["overnight_plan"] = None
+            return "บันทึกประเภทและสถานะหลักทรัพย์แล้ว ไม่ได้เปลี่ยนจำนวนหรือเงินสด"
+        return mutate_portfolio(user_id, set_instrument)
+    return None
+
+
 def help_text():
     return (
         "📊 PORTFOLIO BOT\n"
@@ -2926,7 +3086,10 @@ def help_text():
         "สถานะหุ้นสะสม — ดูรอบส่งอัตโนมัติและข้อมูลที่บันทึก\n"
         "ทบทวนหุ้นระยะยาว — ผลคำแนะนำเดิมและหุ้นที่ควรทบทวนขาย\n"
         "ความแม่นยำคำแนะนำ — ผลตอบแทน อัตราชนะ SET และ Drawdown\n"
-        "ตั้งเงินเติมรายเดือน 500 — กำหนด 500–1,000 บาท/เดือน\n"
+        "ตั้งเงินเติมรายเดือน 1000 — แผนเงินเติม ปรับเพิ่มได้\n"
+        "ตั้งเป้าปันผล 15000 10 — สุทธิต่อเดือน ภายในกี่ปี\n"
+        "เป้าปันผล หรือ วิเคราะห์พอร์ต — เงินเติมที่ต้องใช้และทบทวนพอร์ต\n"
+        "รายได้ปันผล — เงินรับจริงย้อนหลัง\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
         "🗓 แผนรายวัน\n"
@@ -2940,6 +3103,10 @@ def help_text():
         "บันทึกเงินเติม 500 — เพิ่มยอดหลังฝากเงินจริงแล้ว\n"
         "บันทึกซื้อ AOT 100 35.50 — เพิ่มหุ้นและหักเงินสด\n"
         "บันทึกขาย AOT 100 40 — ลดหุ้นและเพิ่มเงินสด\n"
+        "บันทึกปันผล AOT 100 10 2026-11-01 ref1 — ยอดก่อนภาษี ภาษี วันรับ เลขอ้างอิง\n"
+        "บันทึกคืนทุน QHBREIT 78 0 2026-11-27 ref2 — ใช้หลังรับเงินจริง\n"
+        "ยกเลิกเงินรับ ref1 — แก้รายการเงินรับที่บันทึกผิด\n"
+        "ตั้งหลักทรัพย์ BTS-W8 WARRANT SP — ระบุประเภทและสถานะ\n"
         "ตั้งหุ้น AOT 100 35.50 — บันทึกหุ้นและต้นทุน\n"
         "ตั้งหุ้น AOT 0 0 — ลบหุ้นที่ขายหมดแล้ว\n"
         "ตรวจพอร์ตหลังซื้อขายจริง เพื่อให้ยอดในบอตตรงบัญชี\n\n"
@@ -3082,6 +3249,10 @@ def command_reply(user_id, text):
             "พิมพ์ สถานะข้อมูล เพื่อตรวจสอบ"
         )
 
+    manager_result = manager_command(user_id, text, portfolio)
+    if manager_result is not None:
+        return manager_result
+
     if text in {"ความแม่นยำคำแนะนำ", "สถิติคำแนะนำ", "ทดสอบความแม่นยำ"}:
         try:
             started = queue_long_term_review(user_id, accuracy_only=True)
@@ -3116,7 +3287,7 @@ def command_reply(user_id, text):
         def enable_long_term(p):
             existing = p.get("investment_strategy") or {}
             monthly = existing.get("monthly_contribution_baht", 500.0)
-            if not isinstance(monthly, (int, float)) or not 500 <= monthly <= 1000:
+            if isinstance(monthly, bool) or not isinstance(monthly, (int, float)) or not 0 <= monthly <= 1e12:
                 monthly = 500.0
             p["investment_strategy"] = {
                 "style": "LONG_TERM",
@@ -3138,7 +3309,7 @@ def command_reply(user_id, text):
                 "หากเริ่มใหม่ให้พิมพ์ ตั้งเงินสด 6000 หลังมีเงินลงทุนจริง\n"
                 "เป้าหมาย: หุ้นไทย 100% ของมูลค่าพอร์ตที่บันทึก "
                 "เงินสดเป้าหมาย 0% (เงินสดจริงที่ยังไม่มีหุ้นผ่านเกณฑ์จะคงไว้ชั่วคราว)\n"
-                "ปรับเงินเติมได้ 500–1,000 บาทด้วยคำสั่ง ตั้งเงินเติมรายเดือน\n"
+                "ปรับเงินเติมตามกำลังได้ด้วยคำสั่ง ตั้งเงินเติมรายเดือน\n"
                 "ทบทวนได้ทุกเมื่อด้วยคำสั่ง แนะนำหุ้นสะสม; "
                 "บอตไม่ซื้อขายหรือฝากเงินแทน\n"
                 "⚠️ หุ้น 100% ไม่สอดคล้องกับเป้าหมายขาดทุนไม่เกิน 10% "
@@ -3302,7 +3473,7 @@ def command_reply(user_id, text):
         "🔐 JSON สำรองพอร์ตของคุณ — คัดลอกทั้งหมดนี้บันทึกเป็นไฟล์ "
             "`portfolio-backup.json` เก็บไว้เป็นความลับ\n"
             "กู้คืนโดยส่งไฟล์ .json นี้เข้าแชตกับบอต "
-            "(ไม่รวมประวัติรายการและแผนเก่า)\n\n"
+            "(รวมประวัติที่บันทึกและเป้าปันผล ไม่รวมผลคัดหุ้นเก่า)\n\n"
             f"{backup}"
         )
 
@@ -3427,13 +3598,13 @@ def command_reply(user_id, text):
     if text.startswith("ตั้งเงินเติมรายเดือน "):
         parts = text.split()
         if len(parts) != 2:
-            return "รูปแบบ: ตั้งเงินเติมรายเดือน 500 (กำหนด 500–1,000 บาท)"
+            return "รูปแบบ: ตั้งเงินเติมรายเดือน 1000 (เป็นแผน ไม่ใช่ฝากเงินจริง)"
         try:
             amount = float(parts[1].replace(",", ""))
         except ValueError:
-            return "ยอดเงินเติมรายเดือนต้องอยู่ระหว่าง 500–1,000 บาท"
-        if not np.isfinite(amount) or not 500 <= amount <= 1000:
-            return "ยอดเงินเติมรายเดือนต้องอยู่ระหว่าง 500–1,000 บาท"
+            return "ยอดเงินเติมรายเดือนต้องเป็นตัวเลขไม่ติดลบ"
+        if not np.isfinite(amount) or not 0 <= amount <= 1e12:
+            return "ยอดเงินเติมรายเดือนต้องเป็นตัวเลขไม่ติดลบและไม่เกิน 1 ล้านล้านบาท"
         configured_strategy = portfolio.get("investment_strategy")
         if (
             not isinstance(configured_strategy, dict)
@@ -3461,7 +3632,7 @@ def command_reply(user_id, text):
             amount = float(parts[1].replace(",", ""))
         except ValueError:
             return "ยอดเงินเติมต้องเป็นตัวเลขมากกว่า 0 บาท"
-        if not np.isfinite(amount) or amount <= 0:
+        if not np.isfinite(amount) or not 0 < amount <= 1e12:
             return "ยอดเงินเติมต้องเป็นตัวเลขมากกว่า 0 บาท"
 
         def record_contribution(p):
@@ -3470,25 +3641,6 @@ def command_reply(user_id, text):
                 strategy = {}
             month = now_bkk().strftime("%Y-%m")
             history = p.setdefault("history", [])
-            if strategy.get("style") == "LONG_TERM":
-                month_total = 0.0
-                for entry in history:
-                    if (
-                        isinstance(entry, dict)
-                        and entry.get("type") == "MONTHLY_CONTRIBUTION"
-                        and entry.get("month") == month
-                    ):
-                        try:
-                            month_total += float(entry.get("amount", 0) or 0)
-                        except (TypeError, ValueError, OverflowError):
-                            continue
-                if month_total + amount > 1000:
-                    remaining = max(0.0, 1000 - month_total)
-                    return (
-                        f"เดือนนี้บันทึกเงินเติมแล้ว {month_total:,.2f} บาท "
-                        f"บันทึกเพิ่มได้อีกไม่เกิน {remaining:,.2f} บาท "
-                        "ตามกรอบแผน 1,000 บาท/เดือน"
-                    )
             p["cash"] = max(0.0, float(p.get("cash", 0) or 0)) + amount
             history.append({
                 "type": "MONTHLY_CONTRIBUTION",
@@ -3544,6 +3696,7 @@ def command_reply(user_id, text):
                     )
                 new_shares = old_shares + shares
                 holdings[symbol] = {
+                    **old,
                     "shares": new_shares,
                     "avg_price": (old_shares * old_cost + total) / new_shares,
                 }
@@ -3554,7 +3707,7 @@ def command_reply(user_id, text):
                     return f"ถือ {display_stock_symbol(symbol)} เพียง {old_shares:,} หุ้น บันทึกขาย {shares:,} หุ้นไม่ได้"
                 new_shares = old_shares - shares
                 if new_shares:
-                    holdings[symbol] = {"shares": new_shares, "avg_price": old_cost}
+                    holdings[symbol] = {**old, "shares": new_shares, "avg_price": old_cost}
                 else:
                     holdings.pop(symbol, None)
                 p["cash"] = cash + gross - fee
@@ -3621,7 +3774,7 @@ def command_reply(user_id, text):
         if (
             symbol is None or shares < 0 or shares > 1_000_000_000
             or not np.isfinite(avg_price)
-            or (shares > 0 and avg_price <= 0)
+            or avg_price < 0
             or (shares == 0 and avg_price != 0)
         ):
             return "ข้อมูลหุ้นไม่ถูกต้อง ลองพิมพ์: ตั้งหุ้น AOT 100 35.50"
@@ -3630,6 +3783,7 @@ def command_reply(user_id, text):
             holdings = p.setdefault("stocks", {})
             if shares:
                 holdings[symbol] = {
+                    **holdings.get(symbol, {}),
                     "shares": shares,
                     "avg_price": avg_price,
                 }
