@@ -24,7 +24,8 @@ except ImportError:
 from flask import Flask, abort, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import FileMessage, MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (FileMessage, MessageAction, MessageEvent, QuickReply,
+                            QuickReplyButton, TextMessage, TextSendMessage)
 import numpy as np
 import pandas as pd
 import psycopg
@@ -32,6 +33,8 @@ from psycopg.types.json import Jsonb
 import requests
 
 from fundamental_analysis import analyze_fundamentals
+import automation
+import yfinance as yf
 from dividend_goal import (create_goal, validate_goal, money, record_distribution,
                            reverse_distribution, income_summary, validate_distribution_history)
 from portfolio_manager import format_manager_report, instrument_type
@@ -2997,6 +3000,190 @@ def queue_portfolio_manager(user_id):
     return True
 
 
+def fetch_dividend_event(symbol):
+    """Next ex-dividend date and per-share amount from Yahoo, or None.
+
+    Free data is incomplete; a missing or malformed field means "unknown",
+    never a guess.
+    """
+    try:
+        calendar = yf.Ticker(symbol).calendar
+    except Exception:
+        logger.warning("ดึงปฏิทินปันผลไม่สำเร็จ: %s", symbol)
+        return None
+    if not isinstance(calendar, dict):
+        return None
+    ex_date = calendar.get("Ex-Dividend Date")
+    if isinstance(ex_date, datetime):
+        ex_date = ex_date.date()
+    if not isinstance(ex_date, type(now_bkk().date())):
+        return None
+    try:
+        amount = float(calendar.get("Dividend") or calendar.get("Dividend Amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return {"ex_date": ex_date, "amount": amount if np.isfinite(amount) and amount > 0 else None}
+
+
+def collect_dividend_rows(portfolio, today):
+    holdings = {s: h for s, h in portfolio.get("stocks", {}).items()
+                if int(h.get("shares", 0) or 0) > 0
+                and instrument_type(s, h) in {"STOCK", "REIT"}
+                and h.get("status", "ACTIVE") == "ACTIVE"}
+    events = {s: fetch_dividend_event(s) for s in list(holdings)[:30]}
+    return automation.upcoming_dividends(holdings, {s: e for s, e in events.items() if e}, today)
+
+
+def _quick_reply(*pairs):
+    return QuickReply(items=[QuickReplyButton(action=MessageAction(label=label, text=text))
+                             for label, text in pairs])
+
+
+def _claim_once(user_id, field, key):
+    """Atomically claim a (field, key) send slot; False if already claimed."""
+    def claim(p):
+        previous = p.get(field) or {}
+        if previous.get("key") == key and previous.get("status") in {"SENT", "PENDING"}:
+            return False
+        p[field] = {"key": key, "status": "PENDING"}
+        return True
+    return mutate_portfolio(user_id, claim)
+
+
+def _finish_claim(user_id, field, key, sent):
+    def finish(p):
+        previous = p.get(field) or {}
+        if previous.get("key") == key:
+            previous["status"] = "SENT" if sent else "FAILED"
+    mutate_portfolio(user_id, finish)
+
+
+def send_contribution_reminders():
+    """Remind once per month after the user's chosen day; never records cash."""
+    today = now_bkk().date()
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อเตือนเติมเงินไม่สำเร็จ")
+        return
+    for user_id in users:
+        try:
+            status = automation.contribution_reminder_due(get_portfolio(user_id), today)
+            if status is None or not _claim_once(user_id, "contribution_reminder", status["month"]):
+                continue
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(
+                    text=automation.format_contribution_reminder(status),
+                    quick_reply=_quick_reply(("เติมเงินตามแผน", "เติมเงินตามแผน"))))
+                sent = True
+            except Exception:
+                sent = False
+                logger.exception("ส่งเตือนเติมเงินไม่สำเร็จ")
+            _finish_claim(user_id, "contribution_reminder", status["month"], sent)
+        except Exception:
+            logger.exception("เตือนเติมเงินหนึ่งรายการไม่สำเร็จ")
+
+
+def send_monthly_summaries():
+    """Send last month's summary once, during the first days of a month."""
+    today = now_bkk().date()
+    if today.day > 5:
+        return
+    last_month = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+    key = automation.month_key(last_month)
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อสรุปรายเดือนไม่สำเร็จ")
+        return
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+                continue
+            if not _claim_once(user_id, "monthly_summary", key):
+                continue
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(
+                    text=automation.format_monthly_summary(
+                        automation.monthly_summary(portfolio, last_month))))
+                sent = True
+            except Exception:
+                sent = False
+                logger.exception("ส่งสรุปรายเดือนไม่สำเร็จ")
+            _finish_claim(user_id, "monthly_summary", key, sent)
+        except Exception:
+            logger.exception("สรุปรายเดือนหนึ่งรายการไม่สำเร็จ")
+
+
+def send_dividend_alerts():
+    """Alert once per upcoming ex-date for stocks the user records holding."""
+    today = now_bkk().date()
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อเตือนปันผลไม่สำเร็จ")
+        return
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            if portfolio.get("investment_strategy", {}).get("style") != "LONG_TERM":
+                continue
+            rows = collect_dividend_rows(portfolio, today)
+            signature = ",".join(f"{r['symbol']}:{r['ex_date']}" for r in rows)
+            if not rows or not _claim_once(user_id, "dividend_alert", signature):
+                continue
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(
+                    text=automation.format_dividend_calendar(rows)))
+                sent = True
+            except Exception:
+                sent = False
+                logger.exception("ส่งเตือนปันผลไม่สำเร็จ")
+            _finish_claim(user_id, "dividend_alert", signature, sent)
+        except Exception:
+            logger.exception("เตือนปันผลหนึ่งรายการไม่สำเร็จ")
+
+
+def automation_command(user_id, text):
+    """Commands for the reminder features; None when `text` is not one of them."""
+    if text == "เติมเงินตามแผน":
+        today = now_bkk().date()
+        result = mutate_portfolio(
+            user_id, lambda p: automation.confirm_planned_contribution(p, today, utc_text()))
+        if result["ok"]:
+            return (f"บันทึกเงินเติมตามแผน {result['amount']:,.2f} บาท เดือน {result['month']} แล้ว "
+                    "(ต้องโอนเข้าบัญชีโบรกเกอร์จริงแล้ว) พิมพ์ แนะนำหุ้นสะสม เพื่อคัดหุ้นด้วยเงินสดใหม่")
+        if result["reason"] == "NO_PLAN":
+            return "ยังไม่ได้ตั้งแผนเติมเงิน พิมพ์ ตั้งเงินเติมรายเดือน 5000 ก่อน"
+        return (f"เดือน {result['month']} บันทึกเงินเติมครบตามแผนแล้ว "
+                f"({result['recorded']:,.2f} จากแผน {result['plan']:,.2f} บาท) ไม่บันทึกซ้ำ")
+    if text.startswith("ตั้งวันเตือนเติมเงิน"):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit() or not 1 <= int(parts[1]) <= 28:
+            return "รูปแบบ: ตั้งวันเตือนเติมเงิน 25 (วันที่ 1–28 ของเดือน)"
+        day = int(parts[1])
+
+        def set_day(p):
+            strategy = p.get("investment_strategy")
+            if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+                return "เปิดแผนก่อนด้วยคำสั่ง ตั้งแผนลงทุนระยะยาว"
+            strategy["reminder_day"] = day
+            return f"จะเตือนเติมเงินตั้งแต่วันที่ {day} ของทุกเดือน (เฉพาะเมื่อยังเติมไม่ครบตามแผน)"
+        return mutate_portfolio(user_id, set_day)
+    if text == "ปฏิทินปันผล":
+        portfolio = get_portfolio(user_id)
+        if not portfolio.get("stocks"):
+            return "ยังไม่มีหุ้นที่บันทึกไว้"
+        return automation.format_dividend_calendar(
+            collect_dividend_rows(portfolio, now_bkk().date()))
+    if text == "สรุปรายเดือน":
+        today = now_bkk().date()
+        return automation.format_monthly_summary(
+            automation.monthly_summary(get_portfolio(user_id), today.replace(day=1)))
+    return None
+
+
 def manager_command(user_id, text, portfolio):
     """Return None for unrelated commands; all writes use the per-user lock."""
     if text in {"เป้าปันผล", "วิเคราะห์พอร์ต", "ตรวจพอร์ตระยะยาว"}:
@@ -3090,6 +3277,10 @@ def help_text():
         "ตั้งเป้าปันผล 15000 10 — สุทธิต่อเดือน ภายในกี่ปี\n"
         "เป้าปันผล หรือ วิเคราะห์พอร์ต — เงินเติมที่ต้องใช้และทบทวนพอร์ต\n"
         "รายได้ปันผล — เงินรับจริงย้อนหลัง\n"
+        "เติมเงินตามแผน — บันทึกเงินเติมคงเหลือของเดือนนี้ครั้งเดียว (บอตเตือนให้เอง)\n"
+        "ตั้งวันเตือนเติมเงิน 25 — วันที่เริ่มเตือนทุกเดือน\n"
+        "ปฏิทินปันผล — หุ้นที่ถืออยู่ที่จะขึ้น XD ใน 14 วัน\n"
+        "สรุปรายเดือน — เติมเงิน ปันผล และรายการซื้อขายของเดือนนี้\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
         "🗓 แผนรายวัน\n"
@@ -3252,6 +3443,10 @@ def command_reply(user_id, text):
     manager_result = manager_command(user_id, text, portfolio)
     if manager_result is not None:
         return manager_result
+
+    automation_result = automation_command(user_id, text)
+    if automation_result is not None:
+        return automation_result
 
     if text in {"ความแม่นยำคำแนะนำ", "สถิติคำแนะนำ", "ทดสอบความแม่นยำ"}:
         try:
@@ -3952,6 +4147,24 @@ def ensure_scheduler():
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_contribution_reminders,
+            "cron", hour="9,18", minute=10,
+            id="contribution-reminder", replace_existing=True,
+            max_instances=1, coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_monthly_summaries,
+            "cron", day="1-5", hour="9,18", minute=25,
+            id="monthly-summary", replace_existing=True,
+            max_instances=1, coalesce=True,
+        )
+        worker_scheduler.add_job(
+            send_dividend_alerts,
+            "cron", day_of_week="mon", hour=9, minute=40,
+            id="dividend-alert", replace_existing=True,
+            max_instances=1, coalesce=True,
         )
         worker_scheduler.add_job(
             send_closed_day_reviews,
