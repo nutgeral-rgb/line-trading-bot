@@ -228,6 +228,31 @@ class BotAutomationTests(unittest.TestCase):
         self.assertIn("ไม่นับในมูลค่าพอร์ต", text)
         self.assertIn("BANPU.BK (2026-11-13)", text)
 
+    def test_position_cap_is_named_instead_of_blaming_budget(self):
+        import numpy as np
+        import pandas as pd
+        days = pd.bdate_range(end="2026-11-16", periods=260)
+        px = np.concatenate([np.linspace(50, 80, 235), np.linspace(80.0, 80.5, 25)])
+        flat = pd.DataFrame({"Open": px, "High": px * 1.01, "Low": px * .99, "Close": px,
+                             "Adj Close": px, "Volume": [5e6] * 260}, index=days)
+        held = [f"ZZ{i}.BK" for i in range(6)]  # six holdings outside SET100 -> cap reached
+        frames = {s: flat for s in list(bot.UNIVERSE) + held}
+        portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM"},
+                     "stocks": {s: {"shares": 100, "avg_price": 70.0} for s in held}}
+        passing = {"score": 5, "available": 5, "required": 5,
+                   "checks": {k: True for k in ("earnings", "revenue_growth", "operating_cashflow",
+                                                "leverage", "financial_freshness")},
+                   "valuation": {}, "valuation_concern": None, "quality_warnings": [],
+                   "quality_penalty": 0, "sector": None, "summary": "", "statement_age_days": 30}
+        with patch.object(bot, "get_market_frames", return_value=frames), \
+                patch.object(bot, "set100_universe_warning", return_value=None), \
+                patch.object(bot, "analyze_fundamentals", return_value=passing), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 9, 0)):
+            text = bot.build_long_term_accumulation_plan(portfolio, [])
+        self.assertIn("ถือหุ้น 6 ตัว เกินเพดาน 5 ตัว", text)
+        self.assertIn("ถือครบ 5 ตัวแล้ว", text)
+        self.assertNotIn("งบ/ล็อตยังไม่พอ", text)
+
     def test_small_stale_holding_is_excluded_with_a_warning(self):
         text = self._plan_for("2026-08-11")  # ~4% of cost, like BANPU
         self.assertNotIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
