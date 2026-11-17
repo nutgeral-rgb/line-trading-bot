@@ -194,6 +194,45 @@ class BotAutomationTests(unittest.TestCase):
         self.assertTrue(bot.is_unvaluable_holding(
             "XYZ.BK", {"instrument_type": "WARRANT", "shares": 1}))
 
+    def _plan_for(self, banpu_last_day):
+        import numpy as np
+        import pandas as pd
+        days = pd.bdate_range(end="2026-11-17", periods=260)  # last bar is today's partial one
+
+        def frame(last_day):
+            idx = days[days <= pd.Timestamp(last_day)]
+            px = np.linspace(50, 80, len(idx))
+            return pd.DataFrame({"Open": px, "High": px * 1.01, "Low": px * .99, "Close": px,
+                                 "Adj Close": px, "Volume": [5e6] * len(idx)}, index=idx)
+        frames = {s: frame("2026-11-17") for s in bot.UNIVERSE}
+        frames["BANPU.BK"] = frame(banpu_last_day)
+        portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM"},
+                     "stocks": {"AOT.BK": {"shares": 100, "avg_price": 71.12},
+                                "BANPU.BK": {"shares": 38, "avg_price": 28.47},
+                                "BTS-W8.BK": {"shares": 60, "avg_price": 0.0}}}
+        empty = {"score": None, "available": 0, "required": 5, "checks": {}, "valuation": {},
+                 "valuation_concern": None, "quality_warnings": [], "quality_penalty": 0,
+                 "sector": None, "summary": ""}
+        with patch.object(bot, "get_market_frames", return_value=frames), \
+                patch.object(bot, "set100_universe_warning", return_value=None), \
+                patch.object(bot, "analyze_fundamentals", return_value=empty), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 11, 21)):
+            return bot.build_long_term_accumulation_plan(portfolio, [])
+
+    def test_midday_request_ignores_unfinished_bar_and_tolerates_warrant_and_lag(self):
+        text = self._plan_for("2026-11-13")
+        self.assertNotIn("เก่าเกิน", text)
+        self.assertNotIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
+        self.assertIn("ราคาปิด 2026-11-16", text)
+        self.assertIn("ไม่นับในมูลค่าพอร์ต", text)
+        self.assertIn("BANPU.BK (2026-11-13)", text)
+
+    def test_holding_too_stale_still_blocks_and_names_its_date(self):
+        text = self._plan_for("2026-11-05")
+        self.assertIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
+        self.assertIn("BANPU.BK (ราคาล่าสุด 2026-11-05)", text)
+        self.assertNotIn("BTS-W8", text.split("ประเมินหุ้นในพอร์ตได้ไม่ครบ")[1])
+
     def test_monthly_summary_sent_once_for_previous_month(self):
         with patch.object(bot, "line_bot_api") as api, \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 12, 2, 9, 25, tzinfo=bot.timezone.utc)):

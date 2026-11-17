@@ -1997,6 +1997,16 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     # Six calendar months often contain fewer than the 127 trading closes
     # required by the trend screen. Fetch one year for this plan.
     frames = get_market_frames(symbols, period="1y")
+    # During trading hours Yahoo includes today's unfinished bar. A screen is
+    # defined on completed closes, so drop bars after the last completed session
+    # (otherwise an on-demand request at midday is refused as "stale").
+    cutoff = expected_session.isoformat()
+    frames = {
+        sym: frame.loc[frame.index.strftime("%Y-%m-%d") <= cutoff]
+        for sym, frame in frames.items()
+        if frame is not None and not frame.empty
+    }
+    frames = {sym: frame for sym, frame in frames.items() if not frame.empty}
     ctx = market_context(frames)
     if not ctx["sufficient"]:
         return (
@@ -2016,6 +2026,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     holding_values = {}
     unpriced_holdings = []
     unvalued_holdings = []
+    lagging_holdings = []
     for symbol, info in holdings.items():
         shares = int(info.get("shares", 0))
         if shares <= 0:
@@ -2026,14 +2037,19 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             unvalued_holdings.append(symbol)
             continue
         frame = frames.get(symbol)
-        if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
-            unpriced_holdings.append(symbol)
+        if frame is None or frame.empty:
+            unpriced_holdings.append(f"{symbol} (ไม่มีข้อมูลราคา)")
             continue
         close_col = "Close" if "Close" in frame.columns else "Adj Close"
         close = pd.to_numeric(frame[close_col], errors="coerce").dropna()
-        if close.empty or close.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
-            unpriced_holdings.append(symbol)
+        last_day = close.index[-1].strftime("%Y-%m-%d") if not close.empty else None
+        # Free feeds can lag one session for a single symbol; accept the same
+        # latest/previous session window the screen already allows.
+        if last_day not in allowed_data_dates:
+            unpriced_holdings.append(f"{symbol} (ราคาล่าสุด {last_day or 'ไม่มี'})")
             continue
+        if last_day != ctx["date"]:
+            lagging_holdings.append(f"{symbol} ({last_day})")
         market_value = shares * float(close.iloc[-1])
         current_equity_value += market_value
         holding_values[symbol] = market_value
@@ -2130,6 +2146,10 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         header.append(
             "ℹ️ ไม่นับในมูลค่าพอร์ต (วอร์แรนต์/พักการซื้อขาย ไม่มีราคาตลาดที่ใช้ได้): "
             + ", ".join(display_stock_symbol(s) for s in unvalued_holdings[:5])
+        )
+    if lagging_holdings:
+        header.append(
+            "ℹ️ ใช้ราคาปิดล่าสุดที่เก่ากว่าวันอ้างอิงเล็กน้อย: " + ", ".join(lagging_holdings[:5])
         )
     if unpriced_holdings:
         return "\n".join(
