@@ -34,6 +34,7 @@ import requests
 
 from fundamental_analysis import analyze_fundamentals
 import automation
+import rotation_sleeve
 from dividend_goal import (create_goal, validate_goal, money, record_distribution,
                            reverse_distribution, income_summary, validate_distribution_history)
 from portfolio_manager import format_manager_report, instrument_type
@@ -361,6 +362,7 @@ def export_portfolio_backup(user_id):
                 "stocks": portfolio.get("stocks", {}),
                 "watchlist": portfolio.get("watchlist", []),
                 "dividend_goal": portfolio.get("dividend_goal"),
+                "rotation_sleeve": portfolio.get("rotation_sleeve"),
                 "history": portfolio.get("history", []),
                 "investment_strategy": (
                     {
@@ -481,6 +483,8 @@ def validate_portfolio_backup(raw_text):
     strategy = portfolio.get("investment_strategy")
     if portfolio.get("dividend_goal") is not None:
         restored["dividend_goal"] = validate_goal(portfolio["dividend_goal"])
+    if portfolio.get("rotation_sleeve") is not None:
+        restored["rotation_sleeve"] = rotation_sleeve.validate_sleeve(portfolio["rotation_sleeve"])
     if strategy is not None:
         if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
             raise ValueError("แผนลงทุนในไฟล์สำรองไม่ถูกต้อง")
@@ -1035,7 +1039,8 @@ def market_context(frames):
         ],
     }
 
-def build_daily_plan(portfolio, frames=None):
+def build_daily_plan(portfolio, frames=None, *, risk_fraction=RISK_PER_TRADE,
+                     max_positions=MAX_POSITIONS, title="แผนหมุนทุน"):
     universe_warning = set100_universe_warning()
     if universe_warning:
         return universe_warning, []
@@ -1057,7 +1062,7 @@ def build_daily_plan(portfolio, frames=None):
     data_date = ctx["date"] if ctx["date"] else "ไม่ทราบ"
 
     report_lines.append(
-        f"📊 แผนหมุนทุน | จัดทำ {now_str}"
+        f"📊 {title} | จัดทำ {now_str}"
     )
     report_lines.append(
         f"📅 วันที่ข้อมูลราคา: {data_date}"
@@ -1117,7 +1122,7 @@ def build_daily_plan(portfolio, frames=None):
         ranked.sort(
             key=lambda item: (-item[0], item[1])
         )
-        selected_rows = ranked[:MAX_POSITIONS]
+        selected_rows = ranked[:max_positions]
         selected = [
             row[1] for row in selected_rows
         ]
@@ -1147,7 +1152,7 @@ def build_daily_plan(portfolio, frames=None):
             )
             report_lines.append(
                 "กรอบทดลอง: ถือประมาณ 1–4 สัปดาห์ "
-                f"และตั้งงบขาดทุนตาม Stop ประมาณ {RISK_PER_TRADE:.0%} "
+                f"และตั้งงบขาดทุนตาม Stop ประมาณ {risk_fraction:.0%} "
                 "ของพอร์ตต่อรายการ"
             )
             for index, (
@@ -1186,7 +1191,7 @@ def build_daily_plan(portfolio, frames=None):
                         cash, equity = portfolio_value
                         estimate = estimate_position(
                             equity, cash, close, stop, 1,
-                            risk_fraction=RISK_PER_TRADE,
+                            risk_fraction=risk_fraction,
                         )
                         if estimate["shares"]:
                             detail += (
@@ -1212,7 +1217,7 @@ def build_daily_plan(portfolio, frames=None):
                 "วันซื้อขายถัดไป"
             )
             report_lines.append(
-                "ทบทวนขายเมื่อหลุด 5 อันดับแรก"
+                f"ทบทวนขายเมื่อหลุด {max_positions} อันดับแรก"
                 "หรือปิดต่ำกว่า SMA20 และทบทวนเมื่อถือครบ "
                 f"{MAX_HOLDING_SESSIONS} วันซื้อขาย"
             )
@@ -3317,6 +3322,195 @@ def automation_command(user_id, text):
     return None
 
 
+_rotation_users = set()
+
+
+def build_rotation_plan(portfolio):
+    """Status, sell flags and (if allowed) new candidates for the sleeve."""
+    sleeve = portfolio.get("rotation_sleeve")
+    if not isinstance(sleeve, dict):
+        return "ยังไม่ได้ตั้งถุงหมุนเวียน พิมพ์ ตั้งถุงหมุนเวียน 12000"
+    universe_warning = set100_universe_warning()
+    if universe_warning:
+        return universe_warning
+    expected = latest_completed_set_session(now_bkk()).isoformat()
+    held = list(sleeve["positions"])
+    frames = trim_to_completed_sessions(
+        get_market_frames(sorted(set(UNIVERSE) | set(held))), expected)
+    ctx = market_context(frames)
+    day = ctx["date"]
+    if not ctx["sufficient"] or not day:
+        return "⚠️ ข้อมูลหุ้นไม่ครบพอสร้างแผนถุงหมุนเวียนรอบนี้ ลองใหม่ภายหลัง"
+    prices = {}
+    for symbol in held:
+        frame = frames.get(symbol)
+        if frame is not None and frame.index[-1].strftime("%Y-%m-%d") == day:
+            prices[symbol] = float(frame["Close"].iloc[-1])
+    lines = [rotation_sleeve.format_status(sleeve, prices if len(prices) == len(held) else None)]
+    if held and len(prices) < len(held):
+        missing = ", ".join(s.removesuffix(".BK") for s in held if s not in prices)
+        lines.append(f"⚠️ ไม่มีราคาล่าสุดของ: {missing} จึงประเมินมูลค่ารวมและสัญญาณขายของตัวนี้ไม่ได้")
+    for symbol in held:
+        if symbol not in prices:
+            continue
+        pos = sleeve["positions"][symbol]
+        values = _close_and_sma20(frames.get(symbol), day)
+        reference = _risk_reference(frames.get(symbol), day)
+        flags = []
+        if values and values[0] < values[1]:
+            flags.append("ปิดต่ำกว่า SMA20")
+        if reference and prices[symbol] <= reference[1]:
+            flags.append(f"ถึงจุด Stop อ้างอิง {reference[1]:.2f}")
+        opened = pos.get("opened")
+        try:
+            age = (now_bkk().date() - datetime.fromisoformat(opened).date()).days
+        except (TypeError, ValueError):
+            age = 0
+        if age > MAX_HOLDING_SESSIONS * 7 // 5:
+            flags.append(f"ถือเกิน {MAX_HOLDING_SESSIONS} วันซื้อขาย")
+        lines.append(f"• {symbol.removesuffix('.BK')}: "
+                     + ("⚠️ พิจารณาขาย — " + ", ".join(flags) if flags else "ยังไม่พบสัญญาณขาย"))
+    current = rotation_sleeve.equity(sleeve, prices)
+    if rotation_sleeve.is_halted(sleeve, current):
+        lines.append("งดเสนอหุ้นใหม่รอบนี้")
+        return "\n".join(lines)
+    if len(held) >= sleeve["max_positions"]:
+        lines.append(f"ถุงเต็ม {len(held)}/{sleeve['max_positions']} ตัว งดเสนอหุ้นใหม่จนกว่าจะปิดบางตัว")
+        return "\n".join(lines)
+    view = {"cash": sleeve["cash"], "watchlist": [],
+            "stocks": {s: {"shares": p["shares"], "avg_price": p["avg_price"]}
+                       for s, p in sleeve["positions"].items()}}
+    report, _selected = build_daily_plan(
+        view, frames, risk_fraction=sleeve["risk_per_trade"],
+        max_positions=sleeve["max_positions"], title="แผนถุงหมุนเวียน")
+    lines += ["", report, "",
+              "บอตไม่ส่งคำสั่งซื้อขาย กดซื้อขายเองที่โบรกเกอร์ แล้วบันทึกด้วย ซื้อหมุนเวียน/ขายหมุนเวียน",
+              "การเทรดรอบสั้นกับเงินก้อนเล็กเสี่ยงขาดทุนได้ ไม่รับประกันผลตอบแทน"]
+    return "\n".join(lines)
+
+
+def _send_rotation_plan(user_id):
+    try:
+        _push_portfolio_report(user_id, build_rotation_plan(get_portfolio(user_id)))
+    except Exception:
+        logger.exception("จัดทำแผนถุงหมุนเวียนไม่สำเร็จ")
+        try:
+            _push_portfolio_report(user_id, "⚠️ แผนถุงหมุนเวียนยังไม่สำเร็จ ข้อมูลเดิมยังอยู่ โปรดลองใหม่")
+        except Exception:
+            logger.exception("แจ้งข้อผิดพลาดแผนถุงหมุนเวียนไม่ได้")
+    finally:
+        with _on_demand_lock:
+            _rotation_users.discard(user_id)
+
+
+def queue_rotation_plan(user_id):
+    ensure_scheduler()
+    with _on_demand_lock:
+        if user_id in _rotation_users:
+            return False
+        _rotation_users.add(user_id)
+    try:
+        scheduler.add_job(_send_rotation_plan, "date",
+                          run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
+                          args=[user_id],
+                          id="rotation-plan-" + hashlib.sha256(user_id.encode()).hexdigest()[:20],
+                          replace_existing=True, max_instances=1)
+    except Exception:
+        with _on_demand_lock:
+            _rotation_users.discard(user_id)
+        raise
+    return True
+
+
+def sleeve_command(user_id, text):
+    """Rotation-sleeve commands; None when `text` is not one of them."""
+    parts = text.split()
+    if not parts:
+        return None
+    head = parts[0]
+    stamp, today = utc_text(), now_bkk().date().isoformat()
+
+    def number(token):
+        return float(token.replace(",", ""))
+
+    def run(func):
+        try:
+            return mutate_portfolio(user_id, func)
+        except ValueError as exc:
+            return str(exc)
+
+    if head in {"ตั้งถุงหมุนเวียน", "โอนเข้าถุงหมุนเวียน", "โอนออกถุงหมุนเวียน"}:
+        if len(parts) != 2:
+            return f"รูปแบบ: {head} 12000"
+        try:
+            amount = number(parts[1])
+        except ValueError:
+            return "ยอดเงินต้องเป็นตัวเลข"
+
+        def move(p):
+            exists = isinstance(p.get("rotation_sleeve"), dict)
+            if head == "ตั้งถุงหมุนเวียน" and exists:
+                return "มีถุงหมุนเวียนอยู่แล้ว ใช้ โอนเข้าถุงหมุนเวียน หรือ โอนออกถุงหมุนเวียน"
+            if head == "โอนเข้าถุงหมุนเวียน" and not exists:
+                return "ยังไม่ได้ตั้งถุง พิมพ์ ตั้งถุงหมุนเวียน 12000"
+            if head == "โอนออกถุงหมุนเวียน":
+                sleeve = rotation_sleeve.transfer_out(p, amount, stamp)
+                return (f"โอนออก {amount:,.2f} บาท เข้าพอร์ตหลักแล้ว | เงินสดถุง {sleeve['cash']:,.2f} | "
+                        f"เงินสดพอร์ตหลัก {p['cash']:,.2f}")
+            sleeve = rotation_sleeve.transfer_in(p, amount, stamp)
+            return (f"โอนเข้าถุงหมุนเวียน {amount:,.2f} บาทแล้ว (บันทึกในบอตเท่านั้น ไม่ได้ย้ายเงินในโบรกเกอร์) | "
+                    f"เงินสดถุง {sleeve['cash']:,.2f} | เงินสดพอร์ตหลักเหลือ {p['cash']:,.2f}\n"
+                    f"กติกา: เสี่ยงไม่เกิน {sleeve['risk_per_trade']:.0%} ของถุงต่อตัว ถือไม่เกิน {sleeve['max_positions']} ตัว "
+                    f"งดเปิดสถานะใหม่เมื่อถุงลดลง {rotation_sleeve.HALT_DRAWDOWN:.0%} พิมพ์ แผนหมุนเวียน เพื่อคัดหุ้น "
+                    "ไม่รับประกันผลตอบแทน")
+        return run(move)
+
+    if head in {"ซื้อหมุนเวียน", "ขายหมุนเวียน"}:
+        if len(parts) not in {4, 5}:
+            return f"รูปแบบ: {head} XYZ 100 12.50 [ค่าใช้จ่ายจริง]"
+        symbol = normalize_stock_symbol(parts[1])
+        try:
+            shares = int(parts[2].replace(",", ""))
+            price = number(parts[3])
+            fee = number(parts[4]) if len(parts) == 5 else None
+        except ValueError:
+            return "จำนวนหุ้น ราคา และค่าใช้จ่ายต้องเป็นตัวเลข"
+        if symbol is None:
+            return "ชื่อหุ้นไม่ถูกต้อง"
+
+        def trade(p):
+            if head == "ซื้อหมุนเวียน":
+                r = rotation_sleeve.record_buy(p, symbol, shares, price, fee, today, stamp, ESTIMATED_BUY_COST_RATE)
+                note = (f"\n⚠️ เกินจำนวนตัวสูงสุดของถุง ({p['rotation_sleeve']['max_positions']} ตัว) "
+                        "ตามกติกาควรไม่เปิดตัวใหม่" if r["over_cap"] else "")
+                return (f"บันทึกซื้อในถุง {display_stock_symbol(symbol)} {shares:,} หุ้น ราคา {price:,.2f} "
+                        f"ค่าใช้จ่าย {r['fee']:,.2f} บาท{' (ประมาณ)' if fee is None else ''}\n"
+                        f"ถือ {r['shares']:,} หุ้น | เงินสดถุง {r['cash']:,.2f}" + note)
+            r = rotation_sleeve.record_sell(p, symbol, shares, price, fee, stamp, ESTIMATED_BUY_COST_RATE)
+            return (f"บันทึกขายในถุง {display_stock_symbol(symbol)} {shares:,} หุ้น ราคา {price:,.2f} "
+                    f"| กำไร/ขาดทุนตามต้นทุน {r['pnl']:+,.2f} บาท\n"
+                    f"คงเหลือ {r['remaining']:,} หุ้น | เงินสดถุง {r['cash']:,.2f}")
+        return run(trade)
+
+    if text == "ดูถุงหมุนเวียน":
+        sleeve = get_portfolio(user_id).get("rotation_sleeve")
+        if not isinstance(sleeve, dict):
+            return "ยังไม่ได้ตั้งถุงหมุนเวียน พิมพ์ ตั้งถุงหมุนเวียน 12000"
+        return rotation_sleeve.format_status(sleeve) + "\n(ต้นทุนเท่านั้น พิมพ์ แผนหมุนเวียน เพื่อดูราคาล่าสุดและสัญญาณ)"
+
+    if text == "แผนหมุนเวียน":
+        if not isinstance(get_portfolio(user_id).get("rotation_sleeve"), dict):
+            return "ยังไม่ได้ตั้งถุงหมุนเวียน พิมพ์ ตั้งถุงหมุนเวียน 12000"
+        try:
+            started = queue_rotation_plan(user_id)
+        except Exception:
+            logger.exception("เริ่มแผนถุงหมุนเวียนไม่ได้")
+            return "ยังเริ่มแผนไม่ได้ โปรดลองใหม่ภายหลัง"
+        return ("กำลังคัดหุ้นสำหรับถุงหมุนเวียน เมื่อเสร็จจะส่งในแชตนี้ (อาจใช้เวลาสักครู่)"
+                if started else "กำลังจัดทำแผนอยู่ เมื่อเสร็จจะส่งในแชตนี้")
+    return None
+
+
 def manager_command(user_id, text, portfolio):
     """Return None for unrelated commands; all writes use the per-user lock."""
     if text in {"เป้าปันผล", "วิเคราะห์พอร์ต", "ตรวจพอร์ตระยะยาว"}:
@@ -3410,6 +3604,11 @@ def help_text():
         "ตั้งเป้าปันผล 15000 10 — สุทธิต่อเดือน ภายในกี่ปี\n"
         "เป้าปันผล หรือ วิเคราะห์พอร์ต — เงินเติมที่ต้องใช้และทบทวนพอร์ต\n"
         "รายได้ปันผล — เงินรับจริงย้อนหลัง\n"
+        "ตั้งถุงหมุนเวียน 12000 — แยกเงินจากพอร์ตหลักไว้เทรดรอบสั้น (ไม่กระทบแผนปันผล)\n"
+        "โอนเข้าถุงหมุนเวียน 1000 / โอนออกถุงหมุนเวียน 1000 — ย้ายเงินสดระหว่างถุงกับพอร์ตหลัก\n"
+        "แผนหมุนเวียน — คัดหุ้นรอบสั้น ขนาดซื้อ Stop และสัญญาณขายของหุ้นในถุง\n"
+        "ซื้อหมุนเวียน XYZ 100 12.50 / ขายหมุนเวียน XYZ 100 13 — บันทึกรายการจริงของถุง\n"
+        "ดูถุงหมุนเวียน — เงินสด หุ้น กำไรขาดทุนที่รับรู้\n"
         "เติมเงินตามแผน — บันทึกเงินเติมคงเหลือของเดือนนี้ครั้งเดียว (บอตเตือนให้เอง)\n"
         "ตั้งวันเตือนเติมเงิน 25 — วันที่เริ่มเตือนทุกเดือน\n"
         "ปฏิทินปันผล — หุ้นที่ถืออยู่ที่จะขึ้น XD ใน 14 วัน\n"
@@ -3580,6 +3779,10 @@ def command_reply(user_id, text):
     automation_result = automation_command(user_id, text)
     if automation_result is not None:
         return automation_result
+
+    sleeve_result = sleeve_command(user_id, text)
+    if sleeve_result is not None:
+        return sleeve_result
 
     if text in {"ความแม่นยำคำแนะนำ", "สถิติคำแนะนำ", "ทดสอบความแม่นยำ"}:
         try:
@@ -3913,6 +4116,13 @@ def command_reply(user_id, text):
                 "📌 ยังไม่มีหุ้นที่บันทึกไว้"
             )
 
+        sleeve = portfolio.get("rotation_sleeve")
+        if isinstance(sleeve, dict):
+            lines.extend([
+                "",
+                f"🔄 ถุงหมุนเวียน (แยกบัญชี ไม่รวมด้านบน): เงินสด {sleeve['cash']:,.2f} บาท "
+                f"| หุ้น {len(sleeve['positions'])} ตัว | พิมพ์ ดูถุงหมุนเวียน",
+            ])
         lines.extend(
             [
                 "",
