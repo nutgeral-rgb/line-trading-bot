@@ -2170,6 +2170,11 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             f"{MAX_EXCLUDED_UNPRICED_COST_SHARE:.0%}): " + ", ".join(excluded_unpriced[:5])
             + " สัดส่วนหุ้นอื่นอาจสูงกว่าจริงเล็กน้อย ตรวจราคากับโบรกเกอร์"
         )
+    if len(active_holdings) > MAX_POSITIONS:
+        header.append(
+            f"ℹ️ ถือหุ้น {len(active_holdings)} ตัว เกินเพดาน {MAX_POSITIONS} ตัวของแผนนี้ "
+            "บอตจึงไม่เสนอหุ้นตัวใหม่ (ปรับเพดานได้ที่ MAX_POSITIONS)"
+        )
     if lagging_holdings:
         header.append(
             "ℹ️ ใช้ราคาปิดล่าสุดที่เก่ากว่าวันอ้างอิงเล็กน้อย: " + ", ".join(lagging_holdings[:5])
@@ -2493,10 +2498,16 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             band = candidate["entry_band"]
             if band is None:
                 continue
-            status = "รอราคาย่อลง" if candidate["close"] > band[1] else (
-                "ต่ำกว่ากรอบ ให้ทบทวนแนวโน้ม" if candidate["close"] < band[0]
-                else "อยู่ในกรอบ แต่งบ/ล็อตยังไม่พอ"
-            )
+            if candidate["close"] > band[1]:
+                status = "รอราคาย่อลง"
+            elif candidate["close"] < band[0]:
+                status = "ต่ำกว่ากรอบ ให้ทบทวนแนวโน้ม"
+            elif (candidate["symbol"] not in active_holdings
+                  and len(active_holdings) >= MAX_POSITIONS):
+                status = (f"อยู่ในกรอบ แต่ถือครบ {MAX_POSITIONS} ตัวแล้ว "
+                          "บอตเสนอเพิ่มได้เฉพาะหุ้นที่ถืออยู่")
+            else:
+                status = "อยู่ในกรอบ แต่งบ/ล็อตยังไม่พอ"
             watch.append(
                 f"• {display_stock_symbol(candidate['symbol'])} "
                 f"ปิด {candidate['close']:.2f} | กรอบ {band[0]:.2f}–{band[1]:.2f} บาท: {status}"
