@@ -185,6 +185,15 @@ class BotAutomationTests(unittest.TestCase):
         self.assertNotIn("คำนวณเอง", bot.format_valuation_line(
             {"valuation": {"trailing_pe": 9.0, "price_to_book": None, "source": "Yahoo"}}))
 
+    def test_warrant_or_suspended_holdings_do_not_block_recommendations(self):
+        self.assertTrue(bot.is_unvaluable_holding("BTS-W8.BK", {"shares": 60}))
+        self.assertTrue(bot.is_unvaluable_holding("ABC.BK", {"status": "SP"}))
+        self.assertTrue(bot.is_unvaluable_holding("ABC.BK", {"status": "DELISTED"}))
+        self.assertFalse(bot.is_unvaluable_holding("QHBREIT.BK", {"shares": 600}))
+        self.assertFalse(bot.is_unvaluable_holding("AOT.BK", {"shares": 100, "status": "ACTIVE"}))
+        self.assertTrue(bot.is_unvaluable_holding(
+            "XYZ.BK", {"instrument_type": "WARRANT", "shares": 1}))
+
     def test_monthly_summary_sent_once_for_previous_month(self):
         with patch.object(bot, "line_bot_api") as api, \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 12, 2, 9, 25, tzinfo=bot.timezone.utc)):

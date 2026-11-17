@@ -1957,6 +1957,12 @@ def handle_backup_file(event):
     )
 
 
+def is_unvaluable_holding(symbol, holding):
+    """True for warrants and suspended/delisted holdings with no usable quote."""
+    return (instrument_type(symbol, holding) == "WARRANT"
+            or holding.get("status", "ACTIVE") in {"SP", "DELISTED"})
+
+
 def format_valuation_line(fundamental):
     valuation = fundamental.get("valuation") or {}
     pe, pb = valuation.get("trailing_pe"), valuation.get("price_to_book")
@@ -2009,9 +2015,15 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     current_equity_value = 0.0
     holding_values = {}
     unpriced_holdings = []
+    unvalued_holdings = []
     for symbol, info in holdings.items():
         shares = int(info.get("shares", 0))
         if shares <= 0:
+            continue
+        if is_unvaluable_holding(symbol, info):
+            # Warrants and suspended/delisted securities have no tradable
+            # quote; treating them as "unpriced" would block every buy plan.
+            unvalued_holdings.append(symbol)
             continue
         frame = frames.get(symbol)
         if frame is None or frame.empty or frame.index[-1].strftime("%Y-%m-%d") != ctx["date"]:
@@ -2114,6 +2126,11 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
                 "delivery_status": "PENDING",
             })
 
+    if unvalued_holdings:
+        header.append(
+            "ℹ️ ไม่นับในมูลค่าพอร์ต (วอร์แรนต์/พักการซื้อขาย ไม่มีราคาตลาดที่ใช้ได้): "
+            + ", ".join(display_stock_symbol(s) for s in unvalued_holdings[:5])
+        )
     if unpriced_holdings:
         return "\n".join(
             header
