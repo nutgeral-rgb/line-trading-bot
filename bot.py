@@ -1960,6 +1960,18 @@ def handle_backup_file(event):
 MAX_EXCLUDED_UNPRICED_COST_SHARE = 0.10
 
 
+def trim_to_completed_sessions(frames, cutoff_day):
+    """Drop bars after `cutoff_day` (ISO date), e.g. Yahoo's unfinished intraday bar."""
+    trimmed = {}
+    for sym, frame in frames.items():
+        if frame is None or frame.empty:
+            continue
+        frame = frame.loc[frame.index.strftime("%Y-%m-%d") <= cutoff_day]
+        if not frame.empty:
+            trimmed[sym] = frame
+    return trimmed
+
+
 def is_unvaluable_holding(symbol, holding):
     """True for warrants and suspended/delisted holdings with no usable quote."""
     return (instrument_type(symbol, holding) == "WARRANT"
@@ -2004,12 +2016,23 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     # defined on completed closes, so drop bars after the last completed session
     # (otherwise an on-demand request at midday is refused as "stale").
     cutoff = expected_session.isoformat()
-    frames = {
-        sym: frame.loc[frame.index.strftime("%Y-%m-%d") <= cutoff]
-        for sym, frame in frames.items()
-        if frame is not None and not frame.empty
-    }
-    frames = {sym: frame for sym, frame in frames.items() if not frame.empty}
+    frames = trim_to_completed_sessions(frames, cutoff)
+    # Yahoo's 1y series for a single symbol can end months early while its 2y
+    # series is current. Re-request held symbols that look stale before the
+    # staleness check below turns them into a warning.
+    stale_held = [
+        sym for sym, info in portfolio.get("stocks", {}).items()
+        if int(info.get("shares", 0) or 0) > 0
+        and not is_unvaluable_holding(sym, info)
+        and (sym not in frames
+             or frames[sym].index[-1].strftime("%Y-%m-%d") not in allowed_data_dates)
+    ]
+    if stale_held:
+        retry = trim_to_completed_sessions(get_market_frames(stale_held, period="2y"), cutoff)
+        for sym, frame in retry.items():
+            if (sym not in frames
+                    or frame.index[-1] > frames[sym].index[-1]):
+                frames[sym] = frame
     ctx = market_context(frames)
     if not ctx["sufficient"]:
         return (
@@ -2816,6 +2839,8 @@ def build_long_term_review(portfolio):
         | set(holdings)
     )
     frames = get_market_frames(symbols, period="2y") if symbols else {}
+    # Reviews are defined on completed closes; ignore today's unfinished bar.
+    frames = trim_to_completed_sessions(frames, expected.isoformat())
     benchmark = get_stock_history("^SET.BK", period="2y") if records else None
     observations, summaries = evaluate_recommendations(
         records, frames, benchmark, cost_rate=ESTIMATED_BUY_COST_RATE

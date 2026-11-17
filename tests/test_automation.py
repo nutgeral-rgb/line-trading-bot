@@ -228,6 +228,61 @@ class BotAutomationTests(unittest.TestCase):
         self.assertIn("ไม่นับในมูลค่าพอร์ต", text)
         self.assertIn("BANPU.BK (2026-11-13)", text)
 
+    def test_review_ignores_todays_unfinished_bar(self):
+        import numpy as np
+        import pandas as pd
+        days = pd.bdate_range(end="2026-11-17", periods=260)  # includes the partial bar
+        px = np.linspace(50, 80, 260)
+        frame = pd.DataFrame({"Open": px, "High": px, "Low": px, "Close": px,
+                              "Adj Close": px, "Volume": [5e6] * 260}, index=days)
+        passing = {"score": 5, "available": 5, "required": 5,
+                   "checks": {k: True for k in ("earnings", "revenue_growth", "operating_cashflow",
+                                                "leverage", "financial_freshness")},
+                   "valuation": {}, "valuation_concern": None, "quality_warnings": [],
+                   "quality_penalty": 0, "sector": None, "summary": ""}
+        portfolio = {"stocks": {"AOT.BK": {"shares": 100, "avg_price": 71.12}},
+                     "long_term_recommendations": []}
+        with patch.object(bot, "get_market_frames", return_value={"AOT.BK": frame}), \
+                patch.object(bot, "analyze_fundamentals", return_value=passing), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 15, 42)):
+            text = bot.build_long_term_review(portfolio)
+        self.assertNotIn("ราคาล่าสุดเก่า", text)
+        self.assertIn("AOT", text)
+
+    def test_single_symbol_stale_in_1y_is_recovered_from_2y(self):
+        import numpy as np
+        import pandas as pd
+        days = pd.bdate_range(end="2026-11-17", periods=260)
+
+        def frame(last_day):
+            idx = days[days <= pd.Timestamp(last_day)]
+            px = np.linspace(50, 80, len(idx))
+            return pd.DataFrame({"Open": px, "High": px * 1.01, "Low": px * .99, "Close": px,
+                                 "Adj Close": px, "Volume": [5e6] * len(idx)}, index=idx)
+        current = {s: frame("2026-11-17") for s in bot.UNIVERSE}
+        one_year = dict(current)
+        one_year["BANPU.BK"] = frame("2026-08-11")
+        calls = []
+
+        def fake(symbols, period="6mo"):
+            calls.append((tuple(symbols), period))
+            return one_year if period == "1y" else {"BANPU.BK": frame("2026-11-17")}
+        portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM"},
+                     "stocks": {"AOT.BK": {"shares": 100, "avg_price": 71.12},
+                                "BDMS.BK": {"shares": 400, "avg_price": 18.53},
+                                "BANPU.BK": {"shares": 38, "avg_price": 28.47}}}
+        empty = {"score": None, "available": 0, "required": 5, "checks": {}, "valuation": {},
+                 "valuation_concern": None, "quality_warnings": [], "quality_penalty": 0,
+                 "sector": None, "summary": ""}
+        with patch.object(bot, "get_market_frames", side_effect=fake), \
+                patch.object(bot, "set100_universe_warning", return_value=None), \
+                patch.object(bot, "analyze_fundamentals", return_value=empty), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 9, 0)):
+            text = bot.build_long_term_accumulation_plan(portfolio, [])
+        self.assertIn((("BANPU.BK",), "2y"), calls)
+        self.assertNotIn("ไม่นับในมูลค่าพอร์ต (ไม่มีราคา", text)
+        self.assertNotIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
+
     def test_position_cap_is_named_instead_of_blaming_budget(self):
         import numpy as np
         import pandas as pd
