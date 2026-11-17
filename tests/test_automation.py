@@ -194,7 +194,7 @@ class BotAutomationTests(unittest.TestCase):
         self.assertTrue(bot.is_unvaluable_holding(
             "XYZ.BK", {"instrument_type": "WARRANT", "shares": 1}))
 
-    def _plan_for(self, banpu_last_day):
+    def _plan_for(self, banpu_last_day, banpu_shares=38):
         import numpy as np
         import pandas as pd
         days = pd.bdate_range(end="2026-11-17", periods=260)  # last bar is today's partial one
@@ -208,7 +208,8 @@ class BotAutomationTests(unittest.TestCase):
         frames["BANPU.BK"] = frame(banpu_last_day)
         portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM"},
                      "stocks": {"AOT.BK": {"shares": 100, "avg_price": 71.12},
-                                "BANPU.BK": {"shares": 38, "avg_price": 28.47},
+                                "BDMS.BK": {"shares": 400, "avg_price": 18.53},
+                                "BANPU.BK": {"shares": banpu_shares, "avg_price": 28.47},
                                 "BTS-W8.BK": {"shares": 60, "avg_price": 0.0}}}
         empty = {"score": None, "available": 0, "required": 5, "checks": {}, "valuation": {},
                  "valuation_concern": None, "quality_warnings": [], "quality_penalty": 0,
@@ -227,11 +228,17 @@ class BotAutomationTests(unittest.TestCase):
         self.assertIn("ไม่นับในมูลค่าพอร์ต", text)
         self.assertIn("BANPU.BK (2026-11-13)", text)
 
-    def test_holding_too_stale_still_blocks_and_names_its_date(self):
-        text = self._plan_for("2026-11-05")
-        self.assertIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
-        self.assertIn("BANPU.BK (ราคาล่าสุด 2026-11-05)", text)
-        self.assertNotIn("BTS-W8", text.split("ประเมินหุ้นในพอร์ตได้ไม่ครบ")[1])
+    def test_small_stale_holding_is_excluded_with_a_warning(self):
+        text = self._plan_for("2026-08-11")  # ~4% of cost, like BANPU
+        self.assertNotIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
+        self.assertIn("ไม่นับในมูลค่าพอร์ต (ไม่มีราคาที่ใช้ได้", text)
+        self.assertIn("BANPU.BK (ราคาล่าสุด 2026-08-11)", text)
+        self.assertIn("🔎 ผ่านแนวโน้ม", text)
+
+    def test_large_stale_holding_still_blocks_and_names_its_date(self):
+        text = self._plan_for("2026-08-11", banpu_shares=2000)
+        self.assertIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ: BANPU.BK (ราคาล่าสุด 2026-08-11)", text)
+        self.assertNotIn("🔎 ผ่านแนวโน้ม", text)
 
     def test_monthly_summary_sent_once_for_previous_month(self):
         with patch.object(bot, "line_bot_api") as api, \

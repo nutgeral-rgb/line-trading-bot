@@ -1957,6 +1957,9 @@ def handle_backup_file(event):
     )
 
 
+MAX_EXCLUDED_UNPRICED_COST_SHARE = 0.10
+
+
 def is_unvaluable_holding(symbol, holding):
     """True for warrants and suspended/delisted holdings with no usable quote."""
     return (instrument_type(symbol, holding) == "WARRANT"
@@ -2027,6 +2030,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     unpriced_holdings = []
     unvalued_holdings = []
     lagging_holdings = []
+    unpriced_cost = 0.0
     for symbol, info in holdings.items():
         shares = int(info.get("shares", 0))
         if shares <= 0:
@@ -2039,6 +2043,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         frame = frames.get(symbol)
         if frame is None or frame.empty:
             unpriced_holdings.append(f"{symbol} (ไม่มีข้อมูลราคา)")
+            unpriced_cost += shares * float(info.get("avg_price", 0) or 0)
             continue
         close_col = "Close" if "Close" in frame.columns else "Adj Close"
         close = pd.to_numeric(frame[close_col], errors="coerce").dropna()
@@ -2047,12 +2052,24 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         # latest/previous session window the screen already allows.
         if last_day not in allowed_data_dates:
             unpriced_holdings.append(f"{symbol} (ราคาล่าสุด {last_day or 'ไม่มี'})")
+            unpriced_cost += shares * float(info.get("avg_price", 0) or 0)
             continue
         if last_day != ctx["date"]:
             lagging_holdings.append(f"{symbol} ({last_day})")
         market_value = shares * float(close.iloc[-1])
         current_equity_value += market_value
         holding_values[symbol] = market_value
+
+    # A small holding with no usable quote must not silence every plan. Leaving
+    # it out of the total only raises the other weights, so the per-stock cap
+    # errs on the cautious side. A large unpriced position still blocks.
+    excluded_unpriced = []
+    total_cost = sum(
+        int(i.get("shares", 0) or 0) * float(i.get("avg_price", 0) or 0)
+        for i in holdings.values()
+    )
+    if unpriced_holdings and total_cost > 0 and unpriced_cost / total_cost <= MAX_EXCLUDED_UNPRICED_COST_SHARE:
+        excluded_unpriced, unpriced_holdings = unpriced_holdings, []
 
     total_value = cash + current_equity_value
     target_equity_pct = float(strategy.get("target_equity_pct", 100.0))
@@ -2146,6 +2163,12 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         header.append(
             "ℹ️ ไม่นับในมูลค่าพอร์ต (วอร์แรนต์/พักการซื้อขาย ไม่มีราคาตลาดที่ใช้ได้): "
             + ", ".join(display_stock_symbol(s) for s in unvalued_holdings[:5])
+        )
+    if excluded_unpriced:
+        header.append(
+            "⚠️ ไม่นับในมูลค่าพอร์ต (ไม่มีราคาที่ใช้ได้ ต้นทุนรวมไม่เกิน "
+            f"{MAX_EXCLUDED_UNPRICED_COST_SHARE:.0%}): " + ", ".join(excluded_unpriced[:5])
+            + " สัดส่วนหุ้นอื่นอาจสูงกว่าจริงเล็กน้อย ตรวจราคากับโบรกเกอร์"
         )
     if lagging_holdings:
         header.append(
