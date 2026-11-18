@@ -111,6 +111,46 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(restored["rotation_sleeve"]["positions"]["ABC.BK"]["shares"], 100)
 
 
+class DailyRotationTests(unittest.TestCase):
+    def setUp(self):
+        CommandTests.setUp(self)
+        bot.command_reply(self.user, "ตั้งถุงหมุนเวียน 12000")
+
+    def _run(self, when, plan="PLAN", push_error=None):
+        pushed = []
+        with patch.object(bot, "line_bot_api") as api, \
+                patch.object(bot, "build_rotation_plan", return_value=plan), \
+                patch.object(bot, "now_bkk", return_value=when):
+            api.push_message.side_effect = push_error or (lambda uid, msgs: pushed.append(msgs))
+            bot.send_daily_rotation_plans()
+            bot.send_daily_rotation_plans()
+        return pushed
+
+    def test_sent_once_per_session_day_with_header(self):
+        pushed = self._run(bot.datetime(2026, 11, 18, 8, 40))
+        self.assertEqual(len(pushed), 1)
+        self.assertIn("แผนถุงหมุนเวียนประจำเช้า", pushed[0][0].text)
+        self.assertIn("PLAN", pushed[0][0].text)
+        self.assertEqual(bot.get_portfolio(self.user)["daily_rotation_plan"]["status"], "SENT")
+
+    def test_skips_weekend_early_hour_and_users_without_sleeve(self):
+        self.assertEqual(self._run(bot.datetime(2026, 11, 21, 9, 0)), [])   # Saturday
+        self.assertEqual(self._run(bot.datetime(2026, 11, 18, 7, 0)), [])   # before 08:00
+        other = "u2"
+        bot.command_reply(other, "ตั้งแผนลงทุนระยะยาว")
+        with patch.object(bot, "registered_users", return_value=[other]), \
+                patch.object(bot, "line_bot_api") as api, \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 18, 9, 0)):
+            bot.send_daily_rotation_plans()
+        api.push_message.assert_not_called()
+
+    def test_failed_push_is_retried_by_next_run(self):
+        self._run(bot.datetime(2026, 11, 18, 8, 40), push_error=RuntimeError("down"))
+        self.assertEqual(bot.get_portfolio(self.user)["daily_rotation_plan"]["status"], "FAILED")
+        pushed = self._run(bot.datetime(2026, 11, 18, 8, 55))
+        self.assertEqual(len(pushed), 1)
+
+
 class PlanTests(unittest.TestCase):
     def _frames(self, drop_held=False):
         days = pd.bdate_range(end="2026-11-17", periods=260)

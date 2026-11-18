@@ -3422,6 +3422,47 @@ def queue_rotation_plan(user_id):
     return True
 
 
+def send_daily_rotation_plans():
+    """Morning rotation-sleeve plan for users who set one up; once per day."""
+    current = now_bkk()
+    today = current.date()
+    if current.hour < 8 or not is_set_session(today):
+        return
+    key = today.isoformat()
+    try:
+        users = registered_users()
+    except Exception:
+        logger.exception("อ่านรายชื่อผู้ใช้เพื่อส่งแผนถุงหมุนเวียนไม่สำเร็จ")
+        return
+    for user_id in users:
+        try:
+            portfolio = get_portfolio(user_id)
+            if not isinstance(portfolio.get("rotation_sleeve"), dict):
+                continue
+            if not _claim_once(user_id, "daily_rotation_plan", key):
+                continue
+            with _on_demand_lock:
+                busy = user_id in _rotation_users
+                if not busy:
+                    _rotation_users.add(user_id)
+            if busy:
+                _finish_claim(user_id, "daily_rotation_plan", key, False)
+                continue
+            try:
+                _push_portfolio_report(
+                    user_id, "🌅 แผนถุงหมุนเวียนประจำเช้า\n" + build_rotation_plan(portfolio))
+                sent = True
+            except Exception:
+                sent = False
+                logger.exception("ส่งแผนถุงหมุนเวียนรายวันไม่สำเร็จ")
+            finally:
+                with _on_demand_lock:
+                    _rotation_users.discard(user_id)
+            _finish_claim(user_id, "daily_rotation_plan", key, sent)
+        except Exception:
+            logger.exception("แผนถุงหมุนเวียนรายวันหนึ่งรายการไม่สำเร็จ")
+
+
 def sleeve_command(user_id, text):
     """Rotation-sleeve commands; None when `text` is not one of them."""
     parts = text.split()
@@ -3606,7 +3647,7 @@ def help_text():
         "รายได้ปันผล — เงินรับจริงย้อนหลัง\n"
         "ตั้งถุงหมุนเวียน 12000 — แยกเงินจากพอร์ตหลักไว้เทรดรอบสั้น (ไม่กระทบแผนปันผล)\n"
         "โอนเข้าถุงหมุนเวียน 1000 / โอนออกถุงหมุนเวียน 1000 — ย้ายเงินสดระหว่างถุงกับพอร์ตหลัก\n"
-        "แผนหมุนเวียน — คัดหุ้นรอบสั้น ขนาดซื้อ Stop และสัญญาณขายของหุ้นในถุง\n"
+        "แผนหมุนเวียน — คัดหุ้นรอบสั้น ขนาดซื้อ Stop และสัญญาณขายของหุ้นในถุง (ส่งให้เองทุกเช้าวันซื้อขาย)\n"
         "ซื้อหมุนเวียน XYZ 100 12.50 / ขายหมุนเวียน XYZ 100 13 — บันทึกรายการจริงของถุง\n"
         "ดูถุงหมุนเวียน — เงินสด หุ้น กำไรขาดทุนที่รับรู้\n"
         "เติมเงินตามแผน — บันทึกเงินเติมคงเหลือของเดือนนี้ครั้งเดียว (บอตเตือนให้เอง)\n"
@@ -4491,6 +4532,14 @@ def ensure_scheduler():
             max_instances=1,
             coalesce=True,
         )
+        for job_id, hour, minute in (("rotation-plan-morning-8", 8, "40,55"),
+                                     ("rotation-plan-morning-9", 9, "15"),
+                                     ("rotation-plan-evening-retry", 19, "30")):
+            worker_scheduler.add_job(
+                send_daily_rotation_plans, "cron", day_of_week="mon-fri",
+                hour=hour, minute=minute, id=job_id, replace_existing=True,
+                max_instances=1, coalesce=True,
+            )
         worker_scheduler.add_job(
             send_contribution_reminders,
             "cron", hour="9,18", minute=10,
@@ -4572,6 +4621,12 @@ def ensure_scheduler():
                 id="daily-long-term-recommendations-catchup",
                 replace_existing=True,
                 max_instances=1,
+            )
+        if current.hour >= 8 and is_set_session(current.date()):
+            worker_scheduler.add_job(
+                send_daily_rotation_plans, "date",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=40),
+                id="rotation-plan-catchup", replace_existing=True, max_instances=1,
             )
         worker_scheduler.start()
         scheduler = worker_scheduler
