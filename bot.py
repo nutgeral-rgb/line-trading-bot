@@ -2417,6 +2417,19 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         if available != required or score is None or int(score) != required:
             watch_candidates.append(item)
             continue
+        # A dividend plan only accumulates companies that actually pay:
+        # a payment in the last 12 months and in both previous calendar years.
+        profile = dividend_profile_for(
+            item["symbol"], item["close"],
+            (fundamental.get("valuation") or {}).get("trailing_pe"))
+        item["dividend"] = profile
+        if profile is None or not profile["ttm"] or not profile["consistent"]:
+            item["dividend_reason"] = (
+                "ดึงประวัติปันผลไม่สำเร็จ" if profile is None
+                else "ไม่จ่ายปันผลใน 12 เดือน" if not profile["ttm"]
+                else "จ่ายปันผลไม่ต่อเนื่อง")
+            watch_candidates.append(item)
+            continue
         candidates.append(item)
 
     # Compare valuation only when the screened list has at least three names
@@ -2463,6 +2476,10 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         item["fundamental"].get("valuation_concern")
         if item["fundamental"].get("valuation_concern") is not None else 99,
         int(item["fundamental"].get("quality_penalty", 0) or 0),
+        1 if ((item.get("dividend") or {}).get("payout") or 0) > 1 else 0,
+        # Prefer higher yield, capped at 8% so an unusually high (often
+        # unsustainable) yield does not dominate the ranking.
+        -min(((item.get("dividend") or {}).get("yield") or 0.0), 0.08),
         item.get("sector_valuation_ratio")
         if item.get("sector_valuation_ratio") is not None else 99,
         item.get("portfolio_correlation")
@@ -2476,11 +2493,12 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     if not candidates:
         watch_lines = []
         if watch_candidates:
-            watch_lines = ["หุ้นเฝ้าดูที่แนวโน้มผ่าน แต่ข้อมูลงบยังไม่ครบเกณฑ์:"]
+            watch_lines = ["หุ้นเฝ้าดูที่แนวโน้มผ่าน แต่งบหรือปันผลยังไม่ครบเกณฑ์:"]
             watch_lines.extend(
                 f"• {display_stock_symbol(item['symbol'])} — "
                 f"งบ {item['fundamental'].get('score') or 0}/"
                 f"{item['fundamental'].get('required', 5)}"
+                + (f" | {item['dividend_reason']}" if item.get("dividend_reason") else "")
                 for item in sorted(
                     watch_candidates,
                     key=lambda candidate: (
@@ -2492,7 +2510,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         return "\n".join(
             header
             + [
-                f"⚠️ ตรวจงบ {len(shortlist)} ตัวแล้ว ยังไม่มีหุ้นผ่านพื้นฐานครบ จึงงดแนะนำซื้อ",
+                f"⚠️ ตรวจงบ {len(shortlist)} ตัวแล้ว ยังไม่มีหุ้นผ่านพื้นฐานและเกณฑ์ปันผลครบ จึงงดแนะนำซื้อ",
                 "เงินสดคงไว้ก่อน; เรียกคำสั่งนี้ใหม่ได้เมื่อมีข้อมูลตลาดรอบถัดไป",
             ]
             + watch_lines
@@ -2593,6 +2611,7 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
         f"จำกัดมูลค่าหุ้นตัวนี้ไม่เกิน {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต",
         "งบ: " + concise_fundamental(item["fundamental"]),
         format_valuation_line(item["fundamental"]),
+        automation.format_dividend_line(item.get("dividend")),
         f"แนวโน้ม 6 เดือน {item['six_month_return'] * 100:+.1f}% "
         f"| สภาพคล่อง {item['liquidity_days']}/20 วัน",
     ]
@@ -3171,6 +3190,16 @@ def fetch_dividend_event(symbol):
     return automation.estimate_next_event(fetch_dividend_history(symbol), now_bkk().date())
 
 
+def dividend_profile_for(symbol, price=None, trailing_pe=None):
+    """Dividend profile, or None when the history lookup itself failed."""
+    try:
+        history = fetch_dividend_history(symbol)
+    except Exception as exc:
+        logger.warning("ดึงประวัติปันผลไม่สำเร็จ: %s %s", symbol, type(exc).__name__)
+        return None
+    return automation.dividend_profile(history, now_bkk().date(), price, trailing_pe)
+
+
 def collect_dividend_rows(portfolio, today):
     """Return (rows, failed_symbols)."""
     holdings = {s: h for s, h in portfolio.get("stocks", {}).items()
@@ -3334,7 +3363,7 @@ def automation_command(user_id, text):
             return "ยังไม่มีหุ้นที่บันทึกไว้"
         rows, failed = collect_dividend_rows(portfolio, now_bkk().date())
         return automation.format_dividend_calendar(rows, failed=failed)
-    if text == "ทบทวนพอร์ตปันผล":
+    if text in {"ทบทวนพอร์ตปันผล", "ปันผลคาดการณ์"}:
         if not get_portfolio(user_id).get("stocks"):
             return "ยังไม่มีหุ้นที่บันทึกไว้ในแผนปันผล"
         try:
@@ -3552,6 +3581,15 @@ def build_dividend_portfolio_review(portfolio):
             lines += ["", title] + groups[key]
     if unvalued:
         lines += ["", "❔ ประเมินไม่ได้"] + unvalued
+    income_rows = [
+        (symbol, int(info["shares"]), close,
+         dividend_profile_for(symbol, close,
+                              ((fundamentals.get(symbol) or {}).get("valuation") or {}).get("trailing_pe")))
+        for symbol, info, _frame, close in rows
+    ]
+    goal = portfolio.get("dividend_goal") or {}
+    income_text, _total = automation.income_projection(income_rows, goal.get("monthly_net"))
+    lines += ["", income_text]
     lines += ["", "🛒 ซื้อเพิ่มได้ (ถือต่อ อยู่ในกรอบซื้อ และน้ำหนักไม่เกินเพดาน)"]
     if can_add:
         lines += can_add
@@ -3832,7 +3870,7 @@ def help_text():
         "ตั้งวันเตือนเติมเงิน 25 — วันที่เริ่มเตือนทุกเดือน\n"
         "ปฏิทินปันผล — หุ้นที่ถืออยู่ที่จะขึ้น XD ใน 14 วัน\n"
         "สรุปรายเดือน — เติมเงิน ปันผล และรายการซื้อขายของเดือนนี้\n"
-        "ทบทวนพอร์ตปันผล — รวมผล ถือต่อ/ทบทวน/พิจารณาขาย/ซื้อเพิ่มได้ ในข้อความเดียว\n"
+        "ทบทวนพอร์ตปันผล (หรือ ปันผลคาดการณ์) — ถือต่อ/ทบทวน/พิจารณาขาย/ซื้อเพิ่มได้ และปันผลที่พอร์ตน่าจะให้\n"
         "ตั้งเพดานหุ้น 8 — จำนวนหุ้นสูงสุดในแผนปันผล (ค่าเริ่มต้น 8 ตัว)\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
