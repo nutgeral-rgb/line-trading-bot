@@ -274,6 +274,15 @@ def _chart_frame(payload: dict) -> pd.DataFrame | None:
     return frame if not frame.empty else None
 
 
+def _equal_weight_benchmark(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Synthetic index: average daily return of the universe, rebased to 1000."""
+    closes = pd.DataFrame({s: f["Close"] for s, f in frames.items() if s != INDEX_SYMBOL})
+    returns = closes.sort_index().pct_change(fill_method=None).mean(axis=1).fillna(0.0)
+    level = 1000.0 * (1.0 + returns).cumprod()
+    return pd.DataFrame({"Open": level, "High": level, "Low": level, "Close": level,
+                         "Volume": 0.0}, index=level.index)
+
+
 def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFrame]:
     """Fetch each symbol from Yahoo's chart endpoint (the path the bot also uses;
     yfinance's bulk download is often rate-limited from shared hosts)."""
@@ -433,8 +442,14 @@ def main() -> None:
     warmup_days = max(90, args.sma * 3)
     download_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warmup_days)).date().isoformat()
     frames = _download(download_start, args.end, symbols)
-    if INDEX_SYMBOL not in frames:
-        raise SystemExit(f"Could not download benchmark {INDEX_SYMBOL}")
+    lengths = sorted(len(f) for s, f in frames.items() if s != INDEX_SYMBOL)
+    typical = lengths[len(lengths) // 2] if lengths else 0
+    index_rows = len(frames.get(INDEX_SYMBOL, ()))
+    print(f"Downloaded {len(frames)} series; median rows {typical}; {INDEX_SYMBOL} rows {index_rows}")
+    if index_rows < max(args.sma + 2, typical // 2):
+        print(f"{INDEX_SYMBOL} history is too short; using an equal-weight SET100 average "
+              "as the market calendar and benchmark instead (index comparison is approximate)")
+        frames[INDEX_SYMBOL] = _equal_weight_benchmark(frames)
 
     curve, metrics = backtest(
         frames,
