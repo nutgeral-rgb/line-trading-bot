@@ -25,7 +25,8 @@ from flask import Flask, abort, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (FileMessage, MessageAction, MessageEvent, QuickReply,
-                            QuickReplyButton, TextMessage, TextSendMessage)
+                            QuickReplyButton, RichMenu, RichMenuArea, RichMenuBounds,
+                            RichMenuSize, TextMessage, TextSendMessage)
 import numpy as np
 import pandas as pd
 import psycopg
@@ -3331,6 +3332,44 @@ def send_dividend_alerts():
             logger.exception("เตือนปันผลหนึ่งรายการไม่สำเร็จ")
 
 
+RICH_MENU_NAME = "portfolio-main-v1"
+RICH_MENU_IMAGE = Path(__file__).with_name("assets") / "richmenu.png"
+# Same order as BUTTONS in tools/make_richmenu.py (3 columns x 2 rows).
+RICH_MENU_BUTTONS = [
+    ("ทบทวนพอร์ต", "ทบทวนพอร์ตปันผล"), ("แนะนำหุ้นสะสม", "แนะนำหุ้นสะสม"),
+    ("ดูพอร์ต", "ดูพอร์ต"), ("แผนหมุนเวียน", "แผนหมุนเวียน"),
+    ("ดูถุงหมุนเวียน", "ดูถุงหมุนเวียน"), ("เมนูคำสั่ง", "เมนู"),
+]
+
+
+def setup_rich_menu(api=None, image_path=RICH_MENU_IMAGE):
+    """Create the button menu, upload its image and make it every user's default.
+
+    Replaces an earlier copy with the same name so re-running is safe.
+    """
+    api = api or line_bot_api
+    for menu in api.get_rich_menu_list():
+        if getattr(menu, "name", None) == RICH_MENU_NAME:
+            api.delete_rich_menu(menu.rich_menu_id)
+    width, height, cols = 2500, 843, 3
+    cell_w, cell_h = width // cols, height // 2
+    areas = [
+        RichMenuArea(
+            bounds=RichMenuBounds(x=(i % cols) * cell_w, y=(i // cols) * cell_h,
+                                  width=cell_w if i % cols < cols - 1 else width - (cols - 1) * cell_w,
+                                  height=cell_h if i < cols else height - cell_h),
+            action=MessageAction(label=label, text=text))
+        for i, (label, text) in enumerate(RICH_MENU_BUTTONS)
+    ]
+    menu_id = api.create_rich_menu(RichMenu(
+        size=RichMenuSize(width=width, height=height), selected=True,
+        name=RICH_MENU_NAME, chat_bar_text="เมนูพอร์ต", areas=areas))
+    with open(image_path, "rb") as image:
+        api.set_rich_menu_image(menu_id, "image/png", image)
+    api.set_default_rich_menu(menu_id)
+    return menu_id
+
+
 def automation_command(user_id, text):
     """Commands for the reminder features; None when `text` is not one of them."""
     if text == "เติมเงินตามแผน":
@@ -3363,6 +3402,13 @@ def automation_command(user_id, text):
             return "ยังไม่มีหุ้นที่บันทึกไว้"
         rows, failed = collect_dividend_rows(portfolio, now_bkk().date())
         return automation.format_dividend_calendar(rows, failed=failed)
+    if text == "ตั้งเมนูปุ่ม":
+        try:
+            setup_rich_menu()
+        except Exception:
+            logger.exception("ตั้งเมนูปุ่ม LINE ไม่สำเร็จ")
+            return "ตั้งเมนูปุ่มไม่สำเร็จ ตรวจสิทธิ์ของ Channel แล้วลองใหม่"
+        return "ตั้งเมนูปุ่มแล้ว ถ้ายังไม่เห็น ให้ปิดแล้วเปิดแชตใหม่ (เมนูอยู่ด้านล่างแชต กด เมนูพอร์ต)"
     if text in {"ทบทวนพอร์ตปันผล", "ปันผลคาดการณ์"}:
         if not get_portfolio(user_id).get("stocks"):
             return "ยังไม่มีหุ้นที่บันทึกไว้ในแผนปันผล"
@@ -3872,6 +3918,7 @@ def help_text():
         "สรุปรายเดือน — เติมเงิน ปันผล และรายการซื้อขายของเดือนนี้\n"
         "ทบทวนพอร์ตปันผล (หรือ ปันผลคาดการณ์) — ถือต่อ/ทบทวน/พิจารณาขาย/ซื้อเพิ่มได้ และปันผลที่พอร์ตน่าจะให้\n"
         "ตั้งเพดานหุ้น 8 — จำนวนหุ้นสูงสุดในแผนปันผล (ค่าเริ่มต้น 8 ตัว)\n"
+        "ตั้งเมนูปุ่ม — สร้างเมนูปุ่มด้านล่างแชตสำหรับคำสั่งที่ใช้บ่อย\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
         "🗓 แผนรายวัน\n"

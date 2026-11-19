@@ -264,3 +264,27 @@ class DividendReviewTests(unittest.TestCase):
 
     def test_warrant_does_not_take_a_position_slot(self):
         self.assertTrue(bot.is_unvaluable_holding("BTS-W8.BK", {}))
+
+
+class RichMenuTests(unittest.TestCase):
+    def test_setup_replaces_old_menu_and_maps_buttons_to_real_commands(self):
+        from unittest.mock import MagicMock
+        api = MagicMock()
+        old = MagicMock(rich_menu_id="old", name=None)
+        old.name = bot.RICH_MENU_NAME
+        api.get_rich_menu_list.return_value = [old]
+        api.create_rich_menu.return_value = "new"
+        self.assertEqual(bot.setup_rich_menu(api), "new")
+        api.delete_rich_menu.assert_called_once_with("old")
+        api.set_default_rich_menu.assert_called_once_with("new")
+        self.assertEqual(api.set_rich_menu_image.call_args[0][:2], ("new", "image/png"))
+        menu = api.create_rich_menu.call_args[0][0]
+        self.assertEqual(len(menu.areas), 6)
+        self.assertEqual(sum(a.bounds.width * a.bounds.height for a in menu.areas), 2500 * 843)
+        for area in menu.areas:
+            self.assertLessEqual(len(area.action.label), 20)
+        self.assertTrue(bot.RICH_MENU_IMAGE.exists())
+
+    def test_every_button_is_a_known_command(self):
+        for _label, text in bot.RICH_MENU_BUTTONS:
+            self.assertIn(text, bot.help_text() + "เมนู")
