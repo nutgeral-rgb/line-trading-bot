@@ -237,6 +237,9 @@ class DividendReviewTests(unittest.TestCase):
         with patch.object(bot, "get_market_frames", return_value=frames), \
                 patch.object(bot, "analyze_fundamentals",
                              side_effect=lambda s: failing if s == "WEAK.BK" else passing), \
+                patch.object(bot, "dividend_profile_for",
+                             return_value={"ttm": 2.0, "yield": 0.025, "consistent": True,
+                                           "payout": 0.5, "years": []}), \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 18, 10, 0)):
             text = bot.build_dividend_portfolio_review(portfolio)
         self.assertIn("✅ ถือต่อ\n• GOOD", text)
@@ -245,6 +248,8 @@ class DividendReviewTests(unittest.TestCase):
         self.assertIn("OLD: ราคาล่าสุด", text)
         self.assertIn("BTS-W8: วอร์แรนต์", text)
         self.assertIn("ถือ 4 ตัวจากเพดาน 8 ตัว", text)
+        self.assertIn("💰 ปันผลคาดการณ์", text)
+        self.assertIn("รวม ≈ 54 บาท/ปี", text)  # 3 valued holdings x 10 shares x 2.0 x 0.9
         added = text.split("🛒")[1]
         self.assertIn("GOOD ราคา 80.50 อยู่ในกรอบ", added)
         self.assertNotIn("WEAK", added)

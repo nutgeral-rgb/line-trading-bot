@@ -216,3 +216,57 @@ def format_monthly_summary(s):
     lines.append(f"💵 เงินสดในบอต {s['cash']:,.2f} บาท" + (" — ยังไม่ได้นำไปลงทุน" if s["cash"] >= 1000 else ""))
     lines.append("ปันผลเดือนเดียวไม่ใช่ค่าเฉลี่ย ดูรายได้ย้อนหลัง 12 เดือนด้วย รายได้ปันผล")
     return "\n".join(lines)
+
+
+def dividend_profile(history, today, price=None, trailing_pe=None):
+    """Trailing-12-month dividend facts from (ex-date, amount) history.
+
+    `consistent` means a payment in each of the two previous calendar years.
+    Payout uses P/E: DPS / EPS = DPS * P/E / price. All of it describes the
+    past; companies can cut, skip or raise future dividends.
+    """
+    window_start = today.toordinal() - 365
+    ttm = sum(_number(a) for d, a in history if window_start < d.toordinal() <= today.toordinal())
+    years = {d.year for d, a in history if _number(a) > 0}
+    consistent = {today.year - 1, today.year - 2} <= years
+    dividend_yield = ttm / price if ttm and price and price > 0 else None
+    payout = (ttm * trailing_pe / price
+              if ttm and trailing_pe and trailing_pe > 0 and price and price > 0 else None)
+    return {"ttm": ttm, "yield": dividend_yield, "consistent": consistent,
+            "payout": payout, "years": sorted(years)}
+
+
+def format_dividend_line(profile):
+    if profile is None:
+        return "ปันผล: ดึงประวัติไม่สำเร็จ"
+    if not profile["ttm"]:
+        return "ปันผล: ไม่พบการจ่ายใน 12 เดือน"
+    text = f"ปันผล 12 เดือน {profile['ttm']:.2f} บาท/หุ้น"
+    if profile["yield"] is not None:
+        text += f" (อัตรา {profile['yield'] * 100:.1f}%)"
+    text += " | จ่ายต่อเนื่อง 2 ปีก่อน" if profile["consistent"] else " | จ่ายไม่ต่อเนื่อง"
+    if profile["payout"] is not None:
+        text += f" | payout {profile['payout'] * 100:.0f}%"
+        if profile["payout"] > 1:
+            text += " ⚠️ จ่ายเกินกำไร"
+    return text
+
+
+def income_projection(rows, goal_monthly=None):
+    """rows: [(symbol, shares, price, profile|None)] -> formatted section."""
+    lines = ["💰 ปันผลคาดการณ์ (จากที่จ่ายจริง 12 เดือน หักภาษี 10%)"]
+    total = 0.0
+    for symbol, shares, price, profile in rows:
+        name = symbol.removesuffix(".BK")
+        if profile is None:
+            lines.append(f"• {name}: ดึงประวัติปันผลไม่สำเร็จ")
+            continue
+        net = shares * profile["ttm"] * (1 - DIVIDEND_TAX_RATE)
+        total += net
+        rate = f" อัตรา {profile['yield'] * 100:.1f}%" if profile["yield"] is not None else ""
+        lines.append(f"• {name}: {profile['ttm']:.2f} บาท/หุ้น{rate} → ≈ {net:,.0f} บาท/ปี")
+    lines.append(f"รวม ≈ {total:,.0f} บาท/ปี ≈ {total / 12:,.0f} บาท/เดือน")
+    if goal_monthly:
+        lines.append(f"เป้า {goal_monthly:,.0f} บาท/เดือน → ได้ราว {total / 12 / goal_monthly * 100:.1f}% ของเป้า")
+    lines.append("อิงปันผลในอดีต ไม่รับประกันอนาคต REIT อาจรวมเงินคืนทุน ข้อมูลจาก Yahoo อาจไม่ครบ")
+    return "\n".join(lines), total

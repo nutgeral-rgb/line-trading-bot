@@ -61,6 +61,26 @@ class AutomationLogicTests(unittest.TestCase):
         self.assertIn("KBANK XD 2026-11-20", text)
         self.assertIn("ไม่พบ", automation.format_dividend_calendar([]))
 
+    def test_dividend_profile_ttm_consistency_payout_and_projection(self):
+        today = date(2026, 11, 19)
+        history = [(date(2024, 4, 1), 1.0), (date(2025, 4, 1), 1.2), (date(2025, 9, 1), 0.5),
+                   (date(2026, 4, 1), 1.3)]
+        p = automation.dividend_profile(history, today, price=20.0, trailing_pe=10.0)
+        self.assertAlmostEqual(p["ttm"], 1.3)          # 2025-09-01 is outside 365 days
+        self.assertAlmostEqual(p["yield"], 0.065)
+        self.assertTrue(p["consistent"])
+        self.assertAlmostEqual(p["payout"], 0.65)
+        self.assertFalse(automation.dividend_profile([(date(2026, 4, 1), 1.0)], today)["consistent"])
+        self.assertIn("จ่ายเกินกำไร", automation.format_dividend_line(dict(p, payout=1.4)))
+        text, total = automation.income_projection(
+            [("KBANK.BK", 10, 250.0, dict(p, ttm=12.0, **{"yield": 0.048})),
+             ("BANPU.BK", 38, 14.0, None)], goal_monthly=10000)
+        self.assertAlmostEqual(total, 108.0)
+        self.assertIn("KBANK: 12.00 บาท/หุ้น อัตรา 4.8% → ≈ 108 บาท/ปี", text)
+        self.assertIn("BANPU: ดึงประวัติปันผลไม่สำเร็จ", text)
+        self.assertIn("≈ 9 บาท/เดือน", text)
+        self.assertIn("0.1% ของเป้า", text)
+
     def test_estimate_projects_last_year_and_skips_paid_or_new(self):
         today = date(2026, 11, 16)
         history = [(date(2025, 11, 20), 2.0), (date(2025, 5, 5), 1.5)]
@@ -283,6 +303,44 @@ class BotAutomationTests(unittest.TestCase):
         self.assertNotIn("ไม่นับในมูลค่าพอร์ต (ไม่มีราคา", text)
         self.assertNotIn("ประเมินหุ้นในพอร์ตได้ไม่ครบ", text)
 
+    PAYER = {"ttm": 2.0, "yield": 0.025, "consistent": True, "payout": 0.5, "years": [2024, 2025, 2026]}
+
+    def _flat_plan(self, profile, cap=8):
+        import numpy as np
+        import pandas as pd
+        days = pd.bdate_range(end="2026-11-16", periods=260)
+        px = np.concatenate([np.linspace(50, 80, 235), np.linspace(80.0, 80.5, 25)])
+        flat = pd.DataFrame({"Open": px, "High": px * 1.01, "Low": px * .99, "Close": px,
+                             "Adj Close": px, "Volume": [5e6] * 260}, index=days)
+        portfolio = {"cash": 9000.0, "stocks": {},
+                     "investment_strategy": {"style": "LONG_TERM", "max_positions": cap}}
+        passing = {"score": 5, "available": 5, "required": 5, "checks": {}, "valuation": {},
+                   "valuation_concern": None, "quality_warnings": [], "quality_penalty": 0,
+                   "sector": None, "summary": "", "statement_age_days": 30}
+        with patch.object(bot, "get_market_frames", return_value={s: flat for s in bot.UNIVERSE}), \
+                patch.object(bot, "set100_universe_warning", return_value=None), \
+                patch.object(bot, "analyze_fundamentals", return_value=passing), \
+                patch.object(bot, "dividend_profile_for", side_effect=profile), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 9, 0)):
+            return bot.build_long_term_accumulation_plan(portfolio, [])
+
+    def test_screen_excludes_non_payers_and_shows_dividend_line(self):
+        none_paid = dict(self.PAYER, ttm=0.0, yield_=None)
+        text = self._flat_plan(lambda s, *a: none_paid)
+        self.assertIn("ไม่จ่ายปันผลใน 12 เดือน", text)
+        self.assertNotIn("✅ ทยอยสะสม", text)
+        text = self._flat_plan(lambda s, *a: dict(self.PAYER, consistent=False))
+        self.assertIn("จ่ายปันผลไม่ต่อเนื่อง", text)
+        text = self._flat_plan(lambda s, *a: None)
+        self.assertIn("ดึงประวัติปันผลไม่สำเร็จ", text)
+
+    def test_screen_prefers_higher_yield_and_prints_it(self):
+        def profile(symbol, *a):
+            return dict(self.PAYER, **{"yield": 0.06 if symbol == "BBL.BK" else 0.02})
+        text = self._flat_plan(profile)
+        self.assertIn("เริ่มสะสม BBL", text)
+        self.assertIn("ปันผล 12 เดือน 2.00 บาท/หุ้น (อัตรา 6.0%)", text)
+
     def test_position_cap_is_named_instead_of_blaming_budget(self):
         import numpy as np
         import pandas as pd
@@ -302,6 +360,7 @@ class BotAutomationTests(unittest.TestCase):
         with patch.object(bot, "get_market_frames", return_value=frames), \
                 patch.object(bot, "set100_universe_warning", return_value=None), \
                 patch.object(bot, "analyze_fundamentals", return_value=passing), \
+                patch.object(bot, "dividend_profile_for", return_value=self.PAYER), \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 9, 0)):
             text = bot.build_long_term_accumulation_plan(portfolio, [])
         self.assertIn("ถือหุ้น 6 ตัว ครบเพดาน 5 ตัว", text)

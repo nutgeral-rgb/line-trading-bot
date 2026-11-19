@@ -1,0 +1,50 @@
+name: Backtest rotation strategy
+
+on:
+  workflow_dispatch:
+    inputs:
+      cash:
+        description: "Starting cash in baht"
+        default: "12000"
+      commission:
+        description: "Commission rate per side (0.0025 = 0.25%)"
+        default: "0.0025"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run scenarios
+        env:
+          CASH: ${{ inputs.cash }}
+          COMMISSION: ${{ inputs.commission }}
+        run: |
+          set -o pipefail
+          today=$(date -u +%F)
+          {
+            echo "## Rotation backtest (cash $CASH, commission $COMMISSION per side)"
+            echo "Equal-weight top-N, breadth filter, next-open trades, costs included."
+            echo "No stops, board lots, holding limit or drawdown halt (sleeve rules are stricter)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for scenario in "2 5" "2 3" "5 5"; do
+            set -- $scenario
+            start=$(date -u -d "$today - $2 years" +%F)
+            echo "### top $1, $2 years ($start to $today)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            python backtest.py --top "$1" --start "$start" --cash "$CASH" \
+              --commission "$COMMISSION" --output "equity_top$1_$2y.csv" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: equity-curves
+          path: equity_*.csv
