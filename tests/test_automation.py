@@ -292,7 +292,7 @@ class BotAutomationTests(unittest.TestCase):
                              "Adj Close": px, "Volume": [5e6] * 260}, index=days)
         held = [f"ZZ{i}.BK" for i in range(6)]  # six holdings outside SET100 -> cap reached
         frames = {s: flat for s in list(bot.UNIVERSE) + held}
-        portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM"},
+        portfolio = {"cash": 6000.0, "investment_strategy": {"style": "LONG_TERM", "max_positions": 5},
                      "stocks": {s: {"shares": 100, "avg_price": 70.0} for s in held}}
         passing = {"score": 5, "available": 5, "required": 5,
                    "checks": {k: True for k in ("earnings", "revenue_growth", "operating_cashflow",
@@ -304,7 +304,7 @@ class BotAutomationTests(unittest.TestCase):
                 patch.object(bot, "analyze_fundamentals", return_value=passing), \
                 patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 17, 9, 0)):
             text = bot.build_long_term_accumulation_plan(portfolio, [])
-        self.assertIn("ถือหุ้น 6 ตัว เกินเพดาน 5 ตัว", text)
+        self.assertIn("ถือหุ้น 6 ตัว ครบเพดาน 5 ตัว", text)
         self.assertIn("ถือครบ 5 ตัวแล้ว", text)
         self.assertNotIn("งบ/ล็อตยังไม่พอ", text)
 

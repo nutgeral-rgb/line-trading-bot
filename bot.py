@@ -376,6 +376,9 @@ def export_portfolio_backup(user_id):
                         "monthly_contribution_baht": portfolio.get(
                             "investment_strategy", {}
                         ).get("monthly_contribution_baht", 500.0),
+                        "max_positions": long_term_max_positions(
+                            portfolio.get("investment_strategy")),
+                        "reminder_day": automation.reminder_day(portfolio),
                     }
                     if isinstance(portfolio.get("investment_strategy"), dict)
                     and portfolio.get("investment_strategy", {}).get("style") == "LONG_TERM"
@@ -514,6 +517,8 @@ def validate_portfolio_backup(raw_text):
             "monthly_contribution_baht": float(contribution),
             "market_scope": "TH",
             "review_frequency": "on_demand",
+            "max_positions": long_term_max_positions(strategy),
+            "reminder_day": automation.reminder_day({"investment_strategy": strategy}),
         }
     try:
         json.dumps(restored, ensure_ascii=False, allow_nan=False)
@@ -1963,6 +1968,17 @@ def handle_backup_file(event):
 
 
 MAX_EXCLUDED_UNPRICED_COST_SHARE = 0.10
+LONG_TERM_DEFAULT_MAX_POSITIONS = 8
+LONG_TERM_MAX_POSITIONS_RANGE = (3, 15)
+
+
+def long_term_max_positions(strategy):
+    """Per-user cap on distinct tradable holdings in the dividend plan."""
+    value = strategy.get("max_positions") if isinstance(strategy, dict) else None
+    low, high = LONG_TERM_MAX_POSITIONS_RANGE
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        return LONG_TERM_DEFAULT_MAX_POSITIONS
+    return value
 
 
 def trim_to_completed_sessions(frames, cutoff_day):
@@ -2108,13 +2124,16 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
     remaining_target = max(0.0, target_equity - current_equity_value)
     budget = min(cash, remaining_target)
     max_position_value = total_value * MAX_LONG_TERM_POSITION_PCT
+    position_cap = long_term_max_positions(strategy)
+    # Warrants and suspended securities cannot be bought or sold on the board,
+    # so they do not occupy one of the plan's position slots.
     active_holdings = {
         symbol for symbol, info in holdings.items()
-        if int(info.get("shares", 0) or 0) > 0
+        if int(info.get("shares", 0) or 0) > 0 and not is_unvaluable_holding(symbol, info)
     }
 
     def purchase_limit(symbol):
-        if symbol not in active_holdings and len(active_holdings) >= MAX_POSITIONS:
+        if symbol not in active_holdings and len(active_holdings) >= position_cap:
             return 0.0
         return min(
             budget,
@@ -2198,10 +2217,10 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             f"{MAX_EXCLUDED_UNPRICED_COST_SHARE:.0%}): " + ", ".join(excluded_unpriced[:5])
             + " สัดส่วนหุ้นอื่นอาจสูงกว่าจริงเล็กน้อย ตรวจราคากับโบรกเกอร์"
         )
-    if len(active_holdings) > MAX_POSITIONS:
+    if len(active_holdings) >= position_cap:
         header.append(
-            f"ℹ️ ถือหุ้น {len(active_holdings)} ตัว เกินเพดาน {MAX_POSITIONS} ตัวของแผนนี้ "
-            "บอตจึงไม่เสนอหุ้นตัวใหม่ (ปรับเพดานได้ที่ MAX_POSITIONS)"
+            f"ℹ️ ถือหุ้น {len(active_holdings)} ตัว ครบเพดาน {position_cap} ตัวของแผนนี้ "
+            "บอตจึงไม่เสนอหุ้นตัวใหม่ (ปรับด้วย ตั้งเพดานหุ้น 10)"
         )
     if lagging_holdings:
         header.append(
@@ -2531,8 +2550,8 @@ def build_long_term_accumulation_plan(portfolio, recommendation_snapshots=None):
             elif candidate["close"] < band[0]:
                 status = "ต่ำกว่ากรอบ ให้ทบทวนแนวโน้ม"
             elif (candidate["symbol"] not in active_holdings
-                  and len(active_holdings) >= MAX_POSITIONS):
-                status = (f"อยู่ในกรอบ แต่ถือครบ {MAX_POSITIONS} ตัวแล้ว "
+                  and len(active_holdings) >= position_cap):
+                status = (f"อยู่ในกรอบ แต่ถือครบ {position_cap} ตัวแล้ว "
                           "บอตเสนอเพิ่มได้เฉพาะหุ้นที่ถืออยู่")
             else:
                 status = "อยู่ในกรอบ แต่งบ/ล็อตยังไม่พอ"
@@ -3315,6 +3334,31 @@ def automation_command(user_id, text):
             return "ยังไม่มีหุ้นที่บันทึกไว้"
         rows, failed = collect_dividend_rows(portfolio, now_bkk().date())
         return automation.format_dividend_calendar(rows, failed=failed)
+    if text == "ทบทวนพอร์ตปันผล":
+        if not get_portfolio(user_id).get("stocks"):
+            return "ยังไม่มีหุ้นที่บันทึกไว้ในแผนปันผล"
+        try:
+            started = queue_dividend_review(user_id)
+        except Exception:
+            logger.exception("เริ่มทบทวนพอร์ตปันผลไม่ได้")
+            return "ยังเริ่มทบทวนไม่ได้ โปรดลองใหม่ภายหลัง"
+        return ("กำลังทบทวนพอร์ตปันผล (ถือต่อ/ทบทวน/พิจารณาขาย/ซื้อเพิ่มได้) เมื่อเสร็จจะส่งในแชตนี้"
+                if started else "กำลังทบทวนอยู่ เมื่อเสร็จจะส่งในแชตนี้")
+    if text.startswith("ตั้งเพดานหุ้น"):
+        parts = text.split()
+        low, high = LONG_TERM_MAX_POSITIONS_RANGE
+        if len(parts) != 2 or not parts[1].isdigit() or not low <= int(parts[1]) <= high:
+            return f"รูปแบบ: ตั้งเพดานหุ้น 8 (จำนวน {low}–{high} ตัว)"
+        cap = int(parts[1])
+
+        def set_cap(p):
+            strategy = p.get("investment_strategy")
+            if not isinstance(strategy, dict) or strategy.get("style") != "LONG_TERM":
+                return "เปิดแผนก่อนด้วยคำสั่ง ตั้งแผนลงทุนระยะยาว"
+            strategy["max_positions"] = cap
+            return (f"ตั้งเพดานหุ้นในแผนปันผลเป็น {cap} ตัวแล้ว (ไม่นับวอร์แรนต์/หุ้นพักซื้อขาย และไม่รวมถุงหมุนเวียน) "
+                    f"เพดานต่อตัวยังเป็น {MAX_LONG_TERM_POSITION_PCT:.0%} ของพอร์ต")
+        return mutate_portfolio(user_id, set_cap)
     if text == "สรุปรายเดือน":
         today = now_bkk().date()
         return automation.format_monthly_summary(
@@ -3418,6 +3462,140 @@ def queue_rotation_plan(user_id):
     except Exception:
         with _on_demand_lock:
             _rotation_users.discard(user_id)
+        raise
+    return True
+
+
+def holding_entry_band(frame):
+    """(low, high) buy band from SMA20/SMA50/ATR14, as the accumulation plan uses."""
+    try:
+        bars = frame[["High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+    except KeyError:
+        return None
+    if len(bars) < 50:
+        return None
+    closes = bars["Close"]
+    sma20, sma50 = float(closes.tail(20).mean()), float(closes.tail(50).mean())
+    recent = bars.tail(15)
+    prior = recent["Close"].shift(1)
+    true_range = pd.concat([recent["High"] - recent["Low"], (recent["High"] - prior).abs(),
+                            (recent["Low"] - prior).abs()], axis=1).max(axis=1).dropna()
+    if len(true_range) < 14:
+        return None
+    atr = float(true_range.tail(14).mean())
+    if not all(np.isfinite(v) for v in (sma20, sma50, atr)) or atr <= 0:
+        return None
+    low, high = max(sma50, sma20 - atr), sma20 + 0.5 * atr
+    return (low, high) if low <= high else None
+
+
+def build_dividend_portfolio_review(portfolio):
+    """One message: hold / watch / consider selling / can add, for the dividend plan."""
+    holdings = {s: h for s, h in portfolio.get("stocks", {}).items()
+                if int(h.get("shares", 0) or 0) > 0}
+    if not holdings:
+        return "ยังไม่มีหุ้นที่บันทึกไว้ในแผนปันผล"
+    expected = latest_completed_set_session(now_bkk())
+    previous = latest_completed_set_session(datetime.combine(expected, datetime.min.time()))
+    allowed = {expected.isoformat(), previous.isoformat()}
+    frames = trim_to_completed_sessions(
+        get_market_frames(sorted(holdings), period="1y"), expected.isoformat())
+    cash = max(0.0, float(portfolio.get("cash", 0) or 0))
+    groups = {"ถือต่อ": [], "ทบทวนใกล้ชิด": [], "พิจารณาขาย/ลด": [], "ข้อมูลไม่พอ": []}
+    rows, unvalued = [], []
+    for symbol, info in holdings.items():
+        name = display_stock_symbol(symbol)
+        if is_unvaluable_holding(symbol, info):
+            unvalued.append(f"• {name}: วอร์แรนต์/พักการซื้อขาย ไม่นับเป็นตำแหน่ง ตรวจสิทธิกับโบรกเกอร์")
+            continue
+        frame = frames.get(symbol)
+        last_day = frame.index[-1].strftime("%Y-%m-%d") if frame is not None else None
+        if last_day not in allowed:
+            unvalued.append(f"• {name}: ราคาล่าสุด {last_day or 'ไม่มี'} ประเมินไม่ได้ ตรวจราคากับโบรกเกอร์")
+            continue
+        rows.append((symbol, info, frame, float(frame["Close"].iloc[-1])))
+    total = cash + sum(int(i["shares"]) * close for _s, i, _f, close in rows)
+    fundamentals = {}
+    if rows:
+        with ThreadPoolExecutor(max_workers=min(2, len(rows))) as executor:
+            fundamentals = dict(zip([r[0] for r in rows],
+                                    executor.map(analyze_fundamentals, [r[0] for r in rows])))
+    can_add = []
+    for symbol, info, frame, close in rows:
+        name = display_stock_symbol(symbol)
+        review = assess_holding(frame, fundamentals.get(symbol) or {}, info.get("avg_price"))
+        status = review["status"] if review["status"] in groups else "ข้อมูลไม่พอ"
+        weight = int(info["shares"]) * close / total if total > 0 else None
+        pnl = review.get("pnl_pct")
+        line = (f"• {name} | ราคา {close:.2f}"
+                + (f" | เทียบต้นทุน {pnl * 100:+.1f}%" if pnl is not None else "")
+                + (f" | {weight * 100:.0f}% ของพอร์ต" if weight is not None else "")
+                + " — " + ", ".join(review["reasons"]))
+        if instrument_type(symbol, info) == "REIT":
+            line += "\n  REIT: เกณฑ์กำไรสุทธิของหุ้นทั่วไปอาจไม่เหมาะ ตรวจ DPU/NAV/ผลประกอบการกองทุนเอง"
+        if weight is not None and weight > MAX_LONG_TERM_POSITION_PCT:
+            line += f"\n  น้ำหนักเกิน {MAX_LONG_TERM_POSITION_PCT:.0%}: ไม่ควรซื้อเพิ่ม"
+        groups[status].append(line)
+        band = holding_entry_band(frame)
+        if (status == "ถือต่อ" and band and band[0] <= close <= band[1]
+                and (weight is None or weight < MAX_LONG_TERM_POSITION_PCT)):
+            can_add.append(f"• {name} ราคา {close:.2f} อยู่ในกรอบ {band[0]:.2f}–{band[1]:.2f}")
+    cap = long_term_max_positions(portfolio.get("investment_strategy"))
+    titles = {"ถือต่อ": "✅ ถือต่อ", "ทบทวนใกล้ชิด": "👀 ทบทวนใกล้ชิด",
+              "พิจารณาขาย/ลด": "⚠️ พิจารณาขาย/ลด", "ข้อมูลไม่พอ": "❔ ข้อมูลไม่พอ"}
+    lines = ["📋 ทบทวนพอร์ตปันผล",
+             f"ราคาปิดถึง {expected.isoformat()} | เงินสดพอร์ตหลัก {cash:,.2f} บาท | "
+             f"ถือ {sum(not is_unvaluable_holding(s, h) for s, h in holdings.items())} ตัว"
+             f"จากเพดาน {cap} ตัว"]
+    for key, title in titles.items():
+        if groups[key]:
+            lines += ["", title] + groups[key]
+    if unvalued:
+        lines += ["", "❔ ประเมินไม่ได้"] + unvalued
+    lines += ["", "🛒 ซื้อเพิ่มได้ (ถือต่อ อยู่ในกรอบซื้อ และน้ำหนักไม่เกินเพดาน)"]
+    if can_add:
+        lines += can_add
+        if cash < 1000:
+            lines.append("เงินสดพอร์ตหลักยังน้อย รอเงินเติมก่อน หรือโอนออกจากถุงหมุนเวียน")
+    else:
+        lines.append("ยังไม่มีตัวที่อยู่ในกรอบซื้อรอบนี้")
+    lines += ["หุ้นตัวใหม่: พิมพ์ แนะนำหุ้นสะสม (บอตเสนอทีละ 1 รายการ ตามเกณฑ์งบ แนวโน้ม และมูลค่า)",
+              "", "เป็นสัญญาณให้ตรวจงบและราคาอีกครั้ง ไม่ใช่คำสั่งซื้อขาย ไม่รวมภาษีหรือเงื่อนไขส่วนตัว"]
+    return "\n".join(lines)
+
+
+_dividend_review_users = set()
+
+
+def _send_dividend_review(user_id):
+    try:
+        _push_portfolio_report(user_id, build_dividend_portfolio_review(get_portfolio(user_id)))
+    except Exception:
+        logger.exception("จัดทำทบทวนพอร์ตปันผลไม่สำเร็จ")
+        try:
+            _push_portfolio_report(user_id, "⚠️ ทบทวนพอร์ตปันผลยังไม่สำเร็จ ข้อมูลเดิมยังอยู่ โปรดลองใหม่")
+        except Exception:
+            logger.exception("แจ้งข้อผิดพลาดทบทวนพอร์ตปันผลไม่ได้")
+    finally:
+        with _on_demand_lock:
+            _dividend_review_users.discard(user_id)
+
+
+def queue_dividend_review(user_id):
+    ensure_scheduler()
+    with _on_demand_lock:
+        if user_id in _dividend_review_users:
+            return False
+        _dividend_review_users.add(user_id)
+    try:
+        scheduler.add_job(_send_dividend_review, "date",
+                          run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
+                          args=[user_id],
+                          id="dividend-review-" + hashlib.sha256(user_id.encode()).hexdigest()[:20],
+                          replace_existing=True, max_instances=1)
+    except Exception:
+        with _on_demand_lock:
+            _dividend_review_users.discard(user_id)
         raise
     return True
 
@@ -3654,6 +3832,8 @@ def help_text():
         "ตั้งวันเตือนเติมเงิน 25 — วันที่เริ่มเตือนทุกเดือน\n"
         "ปฏิทินปันผล — หุ้นที่ถืออยู่ที่จะขึ้น XD ใน 14 วัน\n"
         "สรุปรายเดือน — เติมเงิน ปันผล และรายการซื้อขายของเดือนนี้\n"
+        "ทบทวนพอร์ตปันผล — รวมผล ถือต่อ/ทบทวน/พิจารณาขาย/ซื้อเพิ่มได้ ในข้อความเดียว\n"
+        "ตั้งเพดานหุ้น 8 — จำนวนหุ้นสูงสุดในแผนปันผล (ค่าเริ่มต้น 8 ตัว)\n"
         "ตรวจพอร์ตระยะยาว — ดูสัดส่วนและผลกำไร/ขาดทุน\n"
         "ดูแนวทางลงทุน — ดูเป้าหมายที่ตั้งไว้\n\n"
         "🗓 แผนรายวัน\n"

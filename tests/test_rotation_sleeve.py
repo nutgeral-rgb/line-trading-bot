@@ -205,3 +205,57 @@ class PlanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DividendReviewTests(unittest.TestCase):
+    def setUp(self):
+        CommandTests.setUp(self)
+
+    def test_review_groups_holdings_and_lists_addable(self):
+        days = pd.bdate_range(end="2026-11-17", periods=260)
+
+        def frame(px, last=None):
+            f = pd.DataFrame({"Open": px, "High": px * 1.01, "Low": px * .99, "Close": px,
+                              "Adj Close": px, "Volume": [5e6] * len(px)}, index=days[:len(px)])
+            return f
+        good = np.concatenate([np.linspace(50, 80, 235), np.linspace(80.0, 80.5, 25)])
+        weak = np.concatenate([np.linspace(50, 80, 200), np.linspace(80, 40, 60)])
+        frames = {"GOOD.BK": frame(good), "WEAK.BK": frame(weak), "QHBREIT.BK": frame(good),
+                  "OLD.BK": frame(good[:150])}
+        passing = {"score": 5, "available": 5, "required": 5,
+                   "checks": {k: True for k in ("earnings", "revenue_growth", "operating_cashflow",
+                                                "leverage", "financial_freshness")},
+                   "valuation": {}, "quality_warnings": [], "summary": ""}
+        failing = dict(passing, score=3, checks=dict(passing["checks"], earnings=False,
+                                                     operating_cashflow=False))
+        portfolio = {"cash": 5000.0, "investment_strategy": {"style": "LONG_TERM"},
+                     "stocks": {"GOOD.BK": {"shares": 10, "avg_price": 70.0},
+                                "WEAK.BK": {"shares": 10, "avg_price": 70.0},
+                                "QHBREIT.BK": {"shares": 10, "avg_price": 70.0},
+                                "OLD.BK": {"shares": 10, "avg_price": 70.0},
+                                "BTS-W8.BK": {"shares": 60, "avg_price": 0.0}}}
+        with patch.object(bot, "get_market_frames", return_value=frames), \
+                patch.object(bot, "analyze_fundamentals",
+                             side_effect=lambda s: failing if s == "WEAK.BK" else passing), \
+                patch.object(bot, "now_bkk", return_value=bot.datetime(2026, 11, 18, 10, 0)):
+            text = bot.build_dividend_portfolio_review(portfolio)
+        self.assertIn("✅ ถือต่อ\n• GOOD", text)
+        self.assertIn("⚠️ พิจารณาขาย/ลด\n• WEAK", text)
+        self.assertIn("REIT: เกณฑ์กำไรสุทธิ", text)
+        self.assertIn("OLD: ราคาล่าสุด", text)
+        self.assertIn("BTS-W8: วอร์แรนต์", text)
+        self.assertIn("ถือ 4 ตัวจากเพดาน 8 ตัว", text)
+        added = text.split("🛒")[1]
+        self.assertIn("GOOD ราคา 80.50 อยู่ในกรอบ", added)
+        self.assertNotIn("WEAK", added)
+
+    def test_cap_command_and_default(self):
+        self.assertEqual(bot.long_term_max_positions({}), 8)
+        self.assertIn("3–15", bot.command_reply(self.user, "ตั้งเพดานหุ้น 40"))
+        self.assertIn("10 ตัว", bot.command_reply(self.user, "ตั้งเพดานหุ้น 10"))
+        self.assertEqual(bot.get_portfolio(self.user)["investment_strategy"]["max_positions"], 10)
+        restored = bot.validate_portfolio_backup(bot.export_portfolio_backup(self.user))
+        self.assertEqual(restored["investment_strategy"]["max_positions"], 10)
+
+    def test_warrant_does_not_take_a_position_slot(self):
+        self.assertTrue(bot.is_unvaluable_holding("BTS-W8.BK", {}))
