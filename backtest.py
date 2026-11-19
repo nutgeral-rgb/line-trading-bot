@@ -253,33 +253,61 @@ def backtest(
     return result, metrics
 
 
+def _chart_frame(payload: dict) -> pd.DataFrame | None:
+    """Adjusted daily OHLCV from a Yahoo chart response (auto_adjust style)."""
+    result = (payload.get("chart") or {}).get("result") or []
+    if not result or not result[0].get("timestamp"):
+        return None
+    result = result[0]
+    quote = result["indicators"]["quote"][0]
+    adjusted = (result["indicators"].get("adjclose") or [{}])[0].get("adjclose")
+    frame = pd.DataFrame(
+        {"Open": quote.get("open"), "High": quote.get("high"), "Low": quote.get("low"),
+         "Close": quote.get("close"), "Volume": quote.get("volume")},
+        index=pd.to_datetime(result["timestamp"], unit="s").normalize(),
+    ).apply(pd.to_numeric, errors="coerce")
+    if adjusted is not None:
+        factor = pd.Series(adjusted, index=frame.index, dtype="float64") / frame["Close"]
+        for column in ("Open", "High", "Low", "Close"):
+            frame[column] = frame[column] * factor
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+    return frame if not frame.empty else None
+
+
 def _download(start: str, end: str, symbols: list[str]) -> dict[str, pd.DataFrame]:
-    import yfinance as yf
+    """Fetch each symbol from Yahoo's chart endpoint (the path the bot also uses;
+    yfinance's bulk download is often rate-limited from shared hosts)."""
+    import time
+    from urllib.parse import quote as url_quote
 
-    raw = yf.download(
-        tickers=symbols,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        group_by="ticker",
-        progress=False,
-        threads=True,
-    )
-    if raw.empty:
-        raise ValueError("No price data returned. Check the symbols and date range.")
+    import requests
 
+    period1 = int(pd.Timestamp(start).timestamp())
+    period2 = int(pd.Timestamp(end).timestamp())
     frames: dict[str, pd.DataFrame] = {}
+    missing = []
     for symbol in symbols:
-        try:
-            frame = raw[symbol].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
-        except (KeyError, TypeError):
-            continue
-        frame.columns = [str(col).title() for col in frame.columns]
-        frame.index = pd.to_datetime(frame.index).tz_localize(None)
-        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
-        frame = frame.dropna(subset=["Close"])
-        if not frame.empty:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{url_quote(symbol, safe='')}"
+               f"?period1={period1}&period2={period2}&interval=1d&events=div%2Csplit")
+        frame = None
+        for attempt in range(3):
+            try:
+                response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+                if response.status_code == 200:
+                    frame = _chart_frame(response.json())
+                    break
+            except (requests.RequestException, ValueError, KeyError, IndexError):
+                pass
+            time.sleep(2 * (attempt + 1))
+        if frame is None:
+            missing.append(symbol)
+        else:
             frames[symbol] = frame
+        time.sleep(0.3)
+    if missing:
+        print(f"No data for {len(missing)} symbols: {', '.join(missing[:10])}")
+    if not frames:
+        raise ValueError("No price data returned. Check the symbols and date range.")
     return frames
 
 
